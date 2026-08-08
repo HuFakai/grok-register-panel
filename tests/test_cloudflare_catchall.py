@@ -37,17 +37,22 @@ def test_sign_cloudflare_address_jwt_format():
 def test_catchall_email_and_token():
     old = dict(app.config)
     try:
-        app.config["defaultDomains"] = "email.example.com"
+        app.config["defaultDomains"] = "example.com"
         app.config["cloudflare_jwt_secret"] = "secret-abc"
         addr, jwt = app.cloudflare_catchall_email_and_token("secret-abc")
-        assert addr.endswith("@email.example.com"), f"域名错误: {addr}"
+        # 随机账号 + 随机子域：user@sub.example.com（不局限于单一子域）
+        assert addr.count("@") == 1
+        local, domain = addr.split("@")
+        assert local, "随机账号不能为空"
+        assert domain.endswith(".example.com"), f"应为根域下随机子域: {addr}"
+        assert domain != "example.com", "应带随机子域，而非根域"
         assert jwt.startswith("eyJ")  # JWT 头
         payload = _decode_payload(jwt)
         assert payload["address"] == addr
         assert payload["address_id"] == 0
-        # 指定域名优先
-        addr2, _ = app.cloudflare_catchall_email_and_token("secret-abc", domain="mail.example.com")
-        assert addr2.endswith("@mail.example.com")
+        # 连续两次生成应得到不同子域（随机性）
+        addr2, _ = app.cloudflare_catchall_email_and_token("secret-abc")
+        assert addr2.split("@")[1] != domain, "子域应随机变化"
     finally:
         app.config.clear()
         app.config.update(old)

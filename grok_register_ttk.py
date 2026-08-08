@@ -41,6 +41,7 @@ from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
 from email_providers.common import pick_list_payload as _pick_list
+from email_providers.common import random_subdomain_domain as _random_subdomain_domain
 
 import browser_session as _bs
 import register_flow as _rf
@@ -1153,15 +1154,16 @@ def _sign_cloudflare_address_jwt(secret: str, address: str, address_id: int = 0)
 
 
 def cloudflare_catchall_email_and_token(jwt_secret: str, domain: str = "") -> tuple[str, str]:
-    """catch-all 免建号：生成随机地址，用服务端 JWT_SECRET 自签收信 JWT。
+    """catch-all 免建号：随机账号 + 随机子域名，用服务端 JWT_SECRET 自签收信 JWT。
 
-    要求服务端开启 catch-all（任意 xxx@域名 可直接收信），不调用建号 API。
-    返回 (address, jwt)。
+    要求服务端开启 *.根域 全子域 catch-all（任意 user@sub.根域 可直接收信），
+    不调用建号 API。返回 (address, jwt)。
     """
     base_domain = str(domain or "").strip() or cloudflare_next_default_domain()
     if not base_domain:
         raise Exception("Cloudflare catch-all 未配置收信域名（defaultDomains）")
-    address = f"{generate_username(10)}@{base_domain}"
+    # 随机子域：user@<随机label>.根域，不局限于单一子域
+    address = f"{generate_username(10)}@{_random_subdomain_domain(base_domain)}"
     jwt = _sign_cloudflare_address_jwt(jwt_secret, address, 0)
     return address, jwt
 
