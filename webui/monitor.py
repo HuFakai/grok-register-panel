@@ -906,8 +906,7 @@ def snapshot():
     done = ok + fail
     pct = round(100.0 * ok / target, 2) if target else 0
     # 任务级进度（整个任务，而非当前批次）：总数 = target_cpa - base_cpa，
-    # 已完成 = 注册成功数增量（与是否写 CPA 无关；base_ok 为任务启动时的
-    # 累计成功数基线）。旧任务无 base_ok 时回退 CPA 口径。
+    # 已完成 = 总注册成功数（累计，不减去 base_ok），不超过目标。
     task_total = 0
     task_done = 0
     try:
@@ -915,11 +914,7 @@ def snapshot():
         target_c = int(control.get("target_cpa") or 0)
         if target_c > base_c:
             task_total = target_c - base_c
-            if control.get("base_ok") is not None:
-                base_ok = int(control.get("base_ok") or 0)
-                task_done = max(0, min(task_total, ok_count() - base_ok))
-            else:
-                task_done = max(0, min(task_total, cpa - base_c))
+            task_done = max(0, min(task_total, ok_count()))
     except (TypeError, ValueError):
         pass
     eta = None
