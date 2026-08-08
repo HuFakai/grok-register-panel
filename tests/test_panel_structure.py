@@ -61,7 +61,7 @@ def test_reference_motion_and_reduced_motion():
     assert 'background-size: 40px 40px;' in mon
     assert '@keyframes panel-enter' in mon
     assert 'main > :not(.help-view)' in mon
-    assert 'animation: panel-enter 520ms' in mon
+    assert 'animation: panel-enter 400ms' in mon
     assert '@media (prefers-reduced-motion: reduce)' in mon
     assert 'animation-iteration-count: 1 !important;' in mon
 

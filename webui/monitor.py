@@ -680,19 +680,32 @@ def _parse_etime(s):
 
 
 def kill_all():
-    """Stop orchestrator and batch process groups under this project root."""
-    killed = terminate_managed_processes(
-        ROOT,
-        ("run_until_100.py", "run_batch_headless.py"),
-        grace_seconds=8.0,
-    )
+    """Stop orchestrator and batch process groups under this project root.
+
+    优雅停止：后台线程发 SIGTERM 触发各层让进行中的注册跑完当前槽位后
+    自然退出（SIGKILL 仅在长超时后兜底）；HTTP 立即返回，进程退出由
+    面板轮询体现。
+    """
+    def _graceful_stop():
+        try:
+            terminate_managed_processes(
+                ROOT,
+                ("run_until_100.py", "run_batch_headless.py"),
+                grace_seconds=8.0,
+                graceful=True,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_graceful_stop, daemon=True).start()
     remaining = process_running()
     return {
-        "ok": not remaining.get("running"),
-        "killed": killed,
+        "ok": True,
+        "killed": [],
         "remaining": remaining,
+        "stopping": bool(remaining.get("running")),
         "error": (
-            "任务进程仍未退出，请重试停止或检查进程权限"
+            "已请求优雅停止：进行中的注册将跑完当前任务后退出（可能需等待数分钟）"
             if remaining.get("running")
             else ""
         ),
@@ -1172,6 +1185,25 @@ HTML = r"""<!DOCTYPE html>
   }
   @media (hover: hover) {
     .card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+    .chip:hover { border-color: var(--border-strong); background: var(--surface-raised); }
+    .rate-item:hover,
+    .proxy-summary-item:hover,
+    .domain-summary-item:hover { background: var(--surface-raised); }
+    .proxy-state:hover,
+    .domain-state:hover { background: var(--surface-soft); }
+    .domain-advanced > summary:hover .domain-advanced-title,
+    .log-summary:hover,
+    .faq-item summary:hover { color: var(--text-secondary); }
+    .faq-item[open] summary:hover { color: var(--accent); }
+  }
+  .proxy-select:focus-visible,
+  .proxy-toggle:focus-visible,
+  .domain-toggle:focus-visible,
+  .domain-advanced > summary:focus-visible,
+  .log-summary:focus-visible,
+  .faq-item summary:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
   }
   .panel { margin-top: 14px; }
   .panel.no-margin { margin-top: 0; }
@@ -1228,7 +1260,7 @@ HTML = r"""<!DOCTYPE html>
     height: 20px;
     flex: 0 0 auto;
     border: 1px solid var(--border-strong);
-    background: var(--surface-strong);
+    background: var(--surface-deep);
     position: relative;
     transition: background .16s ease, border-color .16s ease;
   }
@@ -1617,6 +1649,7 @@ HTML = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--border);
   }
   .mail-provider-toolbar .field { max-width: 520px; }
+  .mail-provider-toolbar h2 { margin: 0; color: var(--text); font-size: 15px; font-weight: 620; }
   .mail-provider-status { display: flex; align-items: center; gap: 8px; min-height: 38px; }
   .mail-provider-status-label { color: var(--muted); font-size: 11px; }
   .mail-provider-fields {
@@ -1835,17 +1868,14 @@ HTML = r"""<!DOCTYPE html>
   .faq-empty { margin: 16px 0 2px; color: var(--muted); font-size: 12px; }
   footer { margin-top: 16px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
   main > :not(.help-view) {
-    animation: panel-enter 520ms cubic-bezier(.16, 1, .3, 1) both;
+    animation: panel-enter 400ms cubic-bezier(.16, 1, .3, 1) both;
   }
-  main > :nth-child(2) { animation-delay: 45ms; }
-  main > :nth-child(3) { animation-delay: 90ms; }
-  main > :nth-child(4) { animation-delay: 135ms; }
-  main > :nth-child(5) { animation-delay: 180ms; }
-  main > :nth-child(6) { animation-delay: 225ms; }
-  main > :nth-child(7) { animation-delay: 270ms; }
-  main > :nth-child(8) { animation-delay: 315ms; }
-  main > :nth-child(9) { animation-delay: 360ms; }
-  main > :nth-child(n + 10) { animation-delay: 405ms; }
+  main > :nth-child(2) { animation-delay: 15ms; }
+  main > :nth-child(3) { animation-delay: 30ms; }
+  main > :nth-child(4) { animation-delay: 45ms; }
+  main > :nth-child(5) { animation-delay: 60ms; }
+  main > :nth-child(6) { animation-delay: 75ms; }
+  main > :nth-child(n + 7) { animation-delay: 90ms; }
   @keyframes panel-enter {
     from { opacity: 0; transform: translateY(12px); }
     to { opacity: 1; transform: translateY(0); }
@@ -2105,11 +2135,11 @@ HTML = r"""<!DOCTYPE html>
     <div class="mail-provider-toolbar">
       <div>
         <div class="mail-source-kicker">Config backup</div>
-        <h2 style="margin:0;font-size:15px" id="config-backup-label">配置备份（一键导出/导入）</h2>
+        <h2 id="config-backup-label">配置备份（一键导出/导入）</h2>
         <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
           导出全部配置（config.json / 代理池 / 邮箱域名池 / 邮箱多配置档 / 控制参数 / IP 使用限制），
           换环境（如重新 clone 仓库）后导入即可直接启动。
-          <span style="color:var(--fail, #e5484d)">导出文件含代理密码与邮箱密钥等敏感凭据，请妥善保管。</span>
+          <span class="fail">导出文件含代理密码与邮箱密钥等敏感凭据，请妥善保管。</span>
         </p>
       </div>
       <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
@@ -2280,7 +2310,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="proxy-table-wrap">
           <table class="proxy-table">
             <thead><tr><th><input class="proxy-select" id="proxy-select-page" type="checkbox" aria-label="全选本页" onchange="toggleProxyPageSelection(this.checked)"/></th><th>状态</th><th>代理端点</th><th>出口 / ASN</th><th>使用次数</th><th>延迟</th><th>最近状态</th><th>启用</th><th>操作</th></tr></thead>
-            <tbody id="proxy-body"><tr><td colspan="8" class="proxy-empty">正在读取代理池</td></tr></tbody>
+            <tbody id="proxy-body"><tr><td colspan="9" class="proxy-empty">正在读取代理池</td></tr></tbody>
           </table>
         </div>
         <div class="proxy-pagination">
@@ -2394,7 +2424,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
           <div>
             <div class="mail-source-kicker">Multiple configs</div>
-            <h2 style="margin:0;font-size:15px" id="email-profiles-label">多配置档（自动轮流使用）</h2>
+            <h2 id="email-profiles-label">多配置档（自动轮流使用）</h2>
             <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">启用多个配置档时，注册自动按顺序轮流使用；验证码取信始终用建号时的同一档。没有配置档时使用上方的单配置。</p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
@@ -3156,8 +3186,8 @@ function renderIpUsage(data) {
       <td class="mono">${esc(count)}</td>
       <td style="min-width:160px">
         <div style="display:flex;align-items:center;gap:8px">
-          <div class="bar-wrap" style="flex:1;min-width:90px"><div class="bar" style="width:${pct}%;${over ? "background:var(--danger, #e5484d)" : ""}"></div></div>
-          <span class="mono" style="color:${over ? "var(--danger, #e5484d)" : "var(--muted)"}">${eff > 0 ? pct + "%" : "--"}</span>
+          <div class="bar-wrap" style="flex:1;min-width:90px"><div class="bar" style="width:${pct}%;${over ? "background:var(--fail)" : ""}"></div></div>
+          <span class="mono" style="color:${over ? "var(--fail)" : "var(--muted)"}">${eff > 0 ? pct + "%" : "--"}</span>
         </div>
       </td>
       <td>
@@ -3764,8 +3794,11 @@ async function doStop() {
   document.getElementById("btn-stop").disabled = true;
   try {
     const j = await api("/api/stop", { method: "POST", body: "{}" });
-    const count = (j.killed || []).length;
-    setMsg("ctrl-msg", count ? ("任务已停止，共结束 " + count + " 个主进程") : "当前没有运行中的任务", "ok");
+    if (j.stopping) {
+      setMsg("ctrl-msg", "已请求优雅停止：进行中的注册将跑完当前任务后退出，不再开新任务（可能需等待数分钟）", "ok");
+    } else {
+      setMsg("ctrl-msg", "当前没有运行中的任务", "ok");
+    }
     await refresh();
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
   document.getElementById("btn-stop").disabled = false;

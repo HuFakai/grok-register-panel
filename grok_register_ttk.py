@@ -4094,13 +4094,28 @@ class SharedSlotPool:
 
 
 class CliStopController:
+    """两级停止语义：
+
+    - stop_requested：槽位边界生效——当前槽位跑完后不再领新槽位；
+    - abort_requested：流程内生效——强制中断正在进行的槽位（第二次停止信号）。
+    优雅停止（第一次信号）只置 stop，让进行中的注册跑完。
+    """
+
     def __init__(self):
         self.stop_requested = False
+        self.abort_requested = False
 
     def should_stop(self):
         return self.stop_requested
 
+    def should_abort(self):
+        return self.abort_requested
+
     def stop(self):
+        self.stop_requested = True
+
+    def abort(self):
+        self.abort_requested = True
         self.stop_requested = True
 
 
@@ -4134,6 +4149,28 @@ def run_registration_cli(count):
         cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
 
     signal.signal(signal.SIGINT, _on_sigint)
+
+    # SIGTERM/SIGHUP：面板/编排器停止时发送。第一次优雅停止（进行中的
+    # 槽位跑完），第二次强制中断（abort）。
+    _term_handlers = {}
+    for _signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if _signum is None:
+            continue
+        _term_handlers[_signum] = signal.getsignal(_signum)
+
+        def _on_term(signum, frame, _s=_signum):
+            if controller.should_abort():
+                # 第二次：恢复默认让内核终止，作为强制兜底
+                signal.signal(_s, _term_handlers.get(_s, signal.SIG_DFL))
+                return
+            if controller.should_stop():
+                controller.abort()
+                cli_log("[!] 再次收到停止信号，强制中断当前任务")
+                return
+            controller.stop()
+            cli_log("[!] 收到停止信号，当前任务跑完后停止（再按一次强制中断）")
+
+        signal.signal(_signum, _on_term)
     success_count = 0
     fail_count = 0
     fail_stats = empty_fail_stats()
@@ -4369,11 +4406,19 @@ def run_registration_cli(count):
                         return
                 active_ip = get_exit_ip() or ""
                 ip_started_at = time.monotonic()
-                rotate_idx, active_ip, ip_started_at, used_on_ip = claim_or_rotate(
-                    rotate_idx,
-                    active_ip,
-                    ip_started_at,
-                )
+                try:
+                    rotate_idx, active_ip, ip_started_at, used_on_ip = claim_or_rotate(
+                        rotate_idx,
+                        active_ip,
+                        ip_started_at,
+                    )
+                except RegistrationCancelled:
+                    # 停止请求在槽位开始前的 IP 配额核验期到达：优雅退出，
+                    # 不领新槽位（剩余槽位保持未领取，由 supervisor 判定进度）
+                    cli_log(
+                        f"[W{wid+1}] [*] 停止请求已收到，IP 配额核验阶段退出"
+                    )
+                    return
                 cli_log(
                     f"[W{wid+1}] [*] [IP策略] 本轮出口={active_ip or '?'}，"
                     f"全局配额 {used_on_ip}/"
@@ -4394,27 +4439,29 @@ def run_registration_cli(count):
                         i = claimed
                     slot_start_i = i
                     try:
+                        # 流程内 cancel 用 should_abort：优雅停止（stop）不中断
+                        # 当前槽位，让它跑完；仅强制中断（abort）才抛异常
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                            cancel_callback=controller.should_abort,
                         )
                         email, dev_token = fill_email_and_submit(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                            cancel_callback=controller.should_abort,
                         )
                         code = fill_code_and_submit(
                             email,
                             dev_token,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                            cancel_callback=controller.should_abort,
                         )
                         profile = fill_profile_and_submit(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                            cancel_callback=controller.should_abort,
                         )
                         sso = wait_for_sso_cookie(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
+                            cancel_callback=controller.should_abort,
                             **get_sso_wait_policy(),
                         )
                         ensure_sso_oauth_eligible(
