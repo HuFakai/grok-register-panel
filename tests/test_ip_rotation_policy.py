@@ -232,6 +232,116 @@ def test_ip_quota_limit_zero_means_unlimited():
     assert quota.claim(1, "1.1.1.1")[0] is True
 
 
+def test_precheck_proxy_exit_blacklist_and_limit():
+    """启动前预检：黑名单/累计上限跳过，探测失败/正常放行。"""
+    originals = {
+        "resolve": app._bs._resolve_proxy_exit_ip,
+        "blocked": app._bs.is_blocked_exit_ip,
+        "usage": app.get_ip_usage,
+        "limit": app.get_ip_usage_limit,
+    }
+    try:
+        # 正常出口：放行并带回 IP
+        app._bs._resolve_proxy_exit_ip = lambda proxy: "203.0.113.10"
+        app._bs.is_blocked_exit_ip = lambda ip: (False, {})
+        app.get_ip_usage = lambda ip: 3
+        app.get_ip_usage_limit = lambda ip: 20
+        usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+        assert usable is True and ip == "203.0.113.10" and reason == ""
+
+        # 命中黑名单：跳过
+        app._bs.is_blocked_exit_ip = lambda ip: (True, "AS7922 blocked")
+        usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+        assert usable is False
+        assert "黑名单" in reason
+
+        # 累计使用达到上限：跳过
+        app._bs.is_blocked_exit_ip = lambda ip: (False, {})
+        app.get_ip_usage = lambda ip: 20
+        app.get_ip_usage_limit = lambda ip: 20
+        usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+        assert usable is False
+        assert "已到上限" in reason
+
+        # 探测失败（拿不到 IP）：放行，不误杀
+        app._bs._resolve_proxy_exit_ip = lambda proxy: ""
+        usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+        assert usable is True and ip == "" and reason == ""
+
+        # 探测抛异常：放行
+        def boom(_proxy):
+            raise RuntimeError("network down")
+
+        app._bs._resolve_proxy_exit_ip = boom
+        usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+        assert usable is True
+
+        # 空代理：放行
+        assert app.precheck_proxy_exit("") == (True, "", "")
+    finally:
+        for name, value in originals.items():
+            if name == "resolve":
+                app._bs._resolve_proxy_exit_ip = value
+            elif name == "blocked":
+                app._bs.is_blocked_exit_ip = value
+            elif name == "usage":
+                app.get_ip_usage = value
+            else:
+                app.get_ip_usage_limit = value
+
+
+def test_rotate_skips_precheck_failed_exit_without_starting_browser():
+    """rotate 换口时预检失败 → 不启动浏览器，继续换下一个出口。"""
+    originals = {
+        name: getattr(app, name)
+        for name in (
+            "proxy_count_for_worker",
+            "pick_proxy_for_worker",
+            "set_thread_proxy",
+            "stop_browser",
+            "start_browser",
+            "get_exit_ip",
+            "precheck_proxy_exit",
+        )
+    }
+    started = []
+    try:
+        app.proxy_count_for_worker = lambda worker_id: 3
+        app.pick_proxy_for_worker = (
+            lambda worker_id, rotate_idx: f"http://proxy:{10000 + rotate_idx}"
+        )
+        app.set_thread_proxy = lambda proxy: None
+        app.stop_browser = lambda: None
+        # 只有预检通过的出口才会真正启动浏览器并取到出口 IP
+        app.get_exit_ip = lambda: "9.9.9.3"
+
+        def fake_precheck(proxy):
+            idx = int(proxy.rsplit(":", 1)[1]) - 10000
+            # 第 1、2 个出口预检失败，第 3 个通过
+            if idx in (1, 2):
+                return False, f"9.9.9.{idx}", "累计使用 20/20 已到上限"
+            return True, "9.9.9.3", ""
+
+        def fake_start(log_callback=None):
+            started.append(True)
+            return (None, None)
+
+        app.precheck_proxy_exit = fake_precheck
+        app.start_browser = fake_start
+
+        idx, ip, _ = app.rotate_browser_to_new_exit(
+            0, 0, "1.1.1.1", app.time.monotonic(),
+            log_callback=lambda m: None, cancel_callback=lambda: False,
+        )
+        # 前两个出口预检失败未启动浏览器，第三个通过并启动
+        assert idx == 3
+        assert ip == "9.9.9.3"
+        assert started == [True], "应只对通过的出口启动一次浏览器"
+    finally:
+        for name, value in originals.items():
+            setattr(app, name, value)
+
+
 if __name__ == "__main__":
     test_rotation_policy_defaults_and_bounds()
     test_failure_threshold_bounds()
@@ -243,4 +353,6 @@ if __name__ == "__main__":
     test_worker_proxy_assignments_do_not_collide_during_rotation()
     test_ip_quota_is_shared_and_exclusive_across_workers()
     test_ip_quota_limit_zero_means_unlimited()
+    test_precheck_proxy_exit_blacklist_and_limit()
+    test_rotate_skips_precheck_failed_exit_without_starting_browser()
     print("OK ip_rotation_policy")

@@ -195,6 +195,8 @@ def save_control(updates: dict) -> dict:
         "mode",
         "base_cpa",
         "target_cpa",
+        # 任务启动时的累计成功数基线（本次任务增量 = ok_count - base_ok）
+        "base_ok",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -2303,6 +2305,20 @@ HTML = r"""<!DOCTYPE html>
           <tbody id="ip-usage-body"><tr><td colspan="7" class="proxy-empty">正在读取</td></tr></tbody>
         </table>
       </div>
+      <div class="proxy-pagination">
+        <span class="proxy-job mono" id="ip-page-status">第 1 / 1 页</span>
+        <div class="proxy-page-controls">
+          <label for="ip-page-size" class="proxy-job">每页</label>
+          <select id="ip-page-size" onchange="changeIpPageSize(this.value)">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+          </select>
+          <button id="ip-page-prev" onclick="changeIpPage(-1)">上一页</button>
+          <button id="ip-page-next" onclick="changeIpPage(1)">下一页</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -3012,6 +3028,8 @@ function changeProxyPageSize(value) {
   refreshProxies(false);
 }
 let ipUsageData = null;
+let ipPage = 1;
+let ipPageSize = 50;
 async function refreshIpUsage(silent = true) {
   try {
     const data = await api("/api/ip-usage" + (silent ? "" : "?_=" + Date.now()));
@@ -3020,6 +3038,19 @@ async function refreshIpUsage(silent = true) {
   } catch (e) {
     if (!silent) setMsg("ip-usage-limit-msg", String(e.message || e), "err");
   }
+}
+function changeIpPage(delta) {
+  const total = (ipUsageData && ipUsageData.items || []).length;
+  const pages = Math.max(1, Math.ceil(total / ipPageSize));
+  const next = Math.max(1, Math.min(pages, ipPage + Number(delta || 0)));
+  if (next === ipPage) return;
+  ipPage = next;
+  renderIpUsage(ipUsageData || {});
+}
+function changeIpPageSize(value) {
+  ipPageSize = Math.max(10, Math.min(200, Number(value || 50)));
+  ipPage = 1;
+  renderIpUsage(ipUsageData || {});
 }
 function renderIpUsage(data) {
   const items = (data.items || []).slice();
@@ -3042,7 +3073,19 @@ function renderIpUsage(data) {
   ).join("");
   const limitInput = document.getElementById("ip-usage-limit-page");
   if (limitInput && document.activeElement !== limitInput) limitInput.value = limit;
-  document.getElementById("ip-usage-body").innerHTML = items.length ? items.map(it => {
+  // 客户端分页：全量计算 summary，表格只渲染当前页
+  const pages = Math.max(1, Math.ceil(items.length / ipPageSize));
+  ipPage = Math.max(1, Math.min(pages, ipPage));
+  const pageItems = items.slice((ipPage - 1) * ipPageSize, ipPage * ipPageSize);
+  const pageStatus = document.getElementById("ip-page-status");
+  if (pageStatus) {
+    pageStatus.textContent = "第 " + ipPage + " / " + pages + " 页，共 " + items.length + " 条";
+  }
+  const pagePrev = document.getElementById("ip-page-prev");
+  const pageNext = document.getElementById("ip-page-next");
+  if (pagePrev) pagePrev.disabled = ipPage <= 1;
+  if (pageNext) pageNext.disabled = ipPage >= pages;
+  document.getElementById("ip-usage-body").innerHTML = pageItems.length ? pageItems.map(it => {
     const ip = String(it.ip || "");
     const count = Number(it.count) || 0;
     const eff = Number(it.limit_effective) || 0;

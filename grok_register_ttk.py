@@ -851,6 +851,38 @@ def get_ip_usage_limit(ip: str = "") -> int:
     return max(0, min(usage_limit, 100000))
 
 
+def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
+    """启动浏览器前预检代理出口：轻量探测出口 IP，检查黑名单与累计上限。
+
+    返回 (usable, ip, reason)。探测失败/拿不到 IP 时返回可用（放行，
+    不误杀好代理），由 start_browser 内部原有探测兜底。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return True, "", ""
+    try:
+        exit_ip = _bs._resolve_proxy_exit_ip(proxy)
+    except Exception:
+        return True, "", ""
+    exit_ip = str(exit_ip or "").strip()
+    if not exit_ip:
+        return True, "", ""
+    try:
+        blocked, reason = _bs.is_blocked_exit_ip(exit_ip)
+        if blocked:
+            return False, exit_ip, f"出口IP命中黑名单: {reason or exit_ip}"
+    except Exception:
+        pass
+    try:
+        limit = get_ip_usage_limit(exit_ip)
+        used = get_ip_usage(exit_ip)
+        if limit > 0 and used >= limit:
+            return False, exit_ip, f"累计使用 {used}/{limit} 已到上限"
+    except Exception:
+        pass
+    return True, exit_ip, ""
+
+
 def ip_rotation_reason_after_slot(
     *,
     used_on_ip: int,
@@ -909,6 +941,13 @@ def rotate_browser_to_new_exit(
         log_callback(
             f"[*] [IP策略] 切换 sticky #{rotate_idx}: {redact_proxy(proxy)}"
         )
+        # 启动前预检：探测出口 IP + 黑名单 + 累计上限；不通过则不启动浏览器
+        _usable, _pre_ip, _pre_reason = precheck_proxy_exit(proxy)
+        if not _usable:
+            log_callback(
+                f"[!] [IP策略] 预检跳过 {_pre_ip or '?'}：{_pre_reason}，换下一个出口"
+            )
+            continue
         try:
             start_browser(log_callback=log_callback)
         except Exception as exc:
@@ -4075,10 +4114,19 @@ def run_registration_cli(count):
                 set_thread_proxy(px)
                 cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
                 try:
+                    # 启动前预检：先探测出口 IP，检查黑名单/累计上限，
+                    # 避免超限/黑名单出口白白启动一次完整浏览器
+                    _usable, _pre_ip, _pre_reason = precheck_proxy_exit(px)
+                    if not _usable:
+                        cli_log(
+                            f"[W{wid+1}] [*] [IP策略] 预检跳过 {_pre_ip or '?'}："
+                            f"{_pre_reason}"
+                        )
+                        raise RuntimeError(f"出口IP预检不通过: {_pre_reason}")
                     start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
                     record_proxy_boot_failure(px, boot_exc)
-                    # 黑名单/死代理：多换几条 sticky 再放弃
+                    # 黑名单/死代理/预检不通过：多换几条 sticky 再放弃
                     booted = False
                     last_boot = boot_exc
                     for _try in range(1, 12):
@@ -4088,6 +4136,7 @@ def run_registration_cli(count):
                             or "无法解析出口 IP" in msgb
                             or "代理不可用或过慢" in msgb
                             or "Failed to get IP" in msgb
+                            or "出口IP预检不通过" in msgb
                         ):
                             break
                         rotate_idx += 1
