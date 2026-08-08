@@ -126,7 +126,7 @@ def _account_records() -> dict[str, str]:
     # 递归扫描：根目录历史账号 + tasks/<任务>/ 下各任务账号
     for path in sorted(ACCOUNTS_DIR.rglob("*.txt")):
         if path.name in (
-            {"mail_credentials.txt", "sso_risk_rejected.txt"}
+            {"mail_credentials.txt", "sso_risk_rejected.txt", "sso_bfs_flagged.txt"}
             | GENERATED_EXPORT_FILENAMES
         ):
             continue
