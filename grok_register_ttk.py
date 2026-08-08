@@ -249,6 +249,9 @@ DEFAULT_CONFIG = {
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
     "cloudflare_custom_auth": "",
+    # 建号时是否把域名随机化成随机子域（默认否：多数服务端只接受已配置域名，
+    # 子域匹配需服务端开启 ENABLE_CREATE_ADDRESS_SUBDOMAIN_MATCH）
+    "cloudflare_randomize_subdomain": False,
     "cloudflare_path_domains": "/api/domains",
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
@@ -1109,7 +1112,9 @@ def cloudflare_create_temp_address(api_base, domain=""):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
-        randomize_subdomain=not bool(domain),
+        # 默认不随机子域（多数服务端只接受已配置域名）；需随机时在
+        # config 开启 cloudflare_randomize_subdomain
+        randomize_subdomain=bool(config.get("cloudflare_randomize_subdomain", False)),
     )
 
 

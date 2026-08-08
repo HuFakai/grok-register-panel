@@ -8,6 +8,7 @@
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
   "cloudflare_custom_auth": "",
+  "cloudflare_randomize_subdomain": false,
   "cloudflare_path_domains": "/api/domains",
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
