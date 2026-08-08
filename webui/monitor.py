@@ -2095,6 +2095,29 @@ HTML = r"""<!DOCTYPE html>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
   </section>
 
+  <section class="mail-provider-panel" aria-labelledby="config-backup-label" style="margin:12px 0 0">
+    <div class="mail-provider-toolbar">
+      <div>
+        <div class="mail-source-kicker">Config backup</div>
+        <h2 style="margin:0;font-size:15px" id="config-backup-label">配置备份（一键导出/导入）</h2>
+        <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
+          导出全部配置（config.json / 代理池 / 邮箱域名池 / 邮箱多配置档 / 控制参数 / IP 使用限制），
+          换环境（如重新 clone 仓库）后导入即可直接启动。
+          <span style="color:var(--fail, #e5484d)">导出文件含代理密码与邮箱密钥等敏感凭据，请妥善保管。</span>
+        </p>
+      </div>
+      <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+        <button class="primary" onclick="exportConfig()">导出配置</button>
+        <label class="proxy-job" style="display:inline-flex;align-items:center;gap:6px">
+          导入
+          <input type="file" id="config-import-file" accept=".json,application/json" style="max-width:220px"
+                 onchange="importConfigFile(this.files[0])"/>
+        </label>
+      </div>
+    </div>
+    <div class="msg" id="config-backup-msg" role="status" aria-live="polite"></div>
+  </section>
+
   <section class="help-view" id="help-view" aria-labelledby="help-view-title" hidden>
     <div class="help-view-inner">
       <div class="help-view-heading">
@@ -3155,6 +3178,43 @@ async function saveIpUsageLimit() {
     setMsg("ip-usage-limit-msg", String(e.message || e), "err");
   }
 }
+async function exportConfig() {
+  setMsg("config-backup-msg", "正在导出…", "");
+  try {
+    const data = await api("/api/config/export?_=" + Date.now());
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    const date = new Date().toISOString().slice(0, 10);
+    a.download = "grok-register-config-" + date + ".json";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    setMsg("config-backup-msg", "已导出（含敏感凭据，请妥善保管）", "ok");
+  } catch (e) {
+    setMsg("config-backup-msg", String(e.message || e), "err");
+  }
+}
+async function importConfigFile(file) {
+  if (!file) return;
+  if (!confirm("导入配置将覆盖当前 config.json、代理池、邮箱域名池、邮箱多配置档、控制参数与 IP 使用限制，确定继续？")) {
+    document.getElementById("config-import-file").value = "";
+    return;
+  }
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const j = await api("/api/config/import", { method: "POST", body: text });
+    const msg = "导入完成：" + (j.written || []).join("、")
+      + (j.skipped && j.skipped.length ? "；跳过：" + j.skipped.join("、") : "")
+      + "。请重启面板/注册进程生效。";
+    setMsg("config-backup-msg", msg, "ok");
+  } catch (e) {
+    setMsg("config-backup-msg", "导入失败：" + String(e.message || e), "err");
+  } finally {
+    document.getElementById("config-import-file").value = "";
+  }
+}
 async function setProxyEnabled(id, enabled) {
   try {
     await api("/api/proxies/" + id, { method: "PATCH", body: JSON.stringify({ enabled }) });
@@ -4093,7 +4153,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-profiles", "/api/email-domains"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4217,6 +4277,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/config/export":
+            try:
+                from webui.config_backup import export_all
+
+                # 导出含敏感凭据，返回完整配置 JSON；由前端下载为备份文件
+                self._json(200, export_all())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/email-provider":
             try:
                 self._json(200, read_email_provider_config())
@@ -4296,6 +4365,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, save_control(body))
             except Exception as e:
                 self._json(500, {"error": str(e)})
+            return
+        if u.path == "/api/config/import":
+            try:
+                from webui.config_backup import import_all
+
+                self._json(200, import_all(body))
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/start":
             try:
