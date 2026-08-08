@@ -5,6 +5,7 @@ venv/
 .env
 .env.monitor
 config.json
+config.json.lock
 accounts/*
 !accounts/.gitkeep
 cpa_auth/*
@@ -22,3 +23,7 @@ stickies*.txt
 *.bak*
 *.fixed-keep
 .DS_Store
+
+# 本地 IDE / 计划 / 个人笔记（不上传）
+.zcode/
+wen端启动.md
