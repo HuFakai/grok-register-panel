@@ -41,6 +41,7 @@ from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
 from email_providers.common import pick_list_payload as _pick_list
+from email_providers.common import random_subdomain_domain as _random_subdomain_domain
 
 import browser_session as _bs
 import register_flow as _rf
@@ -51,7 +52,7 @@ from account_exports import (
     consolidate_account_exports,
     save_account_record,
 )
-from ip_usage_store import get_ip_usage, record_ip_usage
+from ip_usage_store import get_ip_usage, get_per_ip_limit, record_ip_usage
 from batch_supervisor import mark_slot_completed
 from secure_files import (
     append_private_text,
@@ -249,6 +250,12 @@ DEFAULT_CONFIG = {
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
     "cloudflare_custom_auth": "",
+    # catch-all 免建号：配置服务端 JWT_SECRET 后，注册直接用随机地址 +
+    # 自签地址 JWT 收信，跳过 /admin/new_address 建号；留空则走 admin 建号
+    "cloudflare_jwt_secret": "",
+    # 建号时是否把域名随机化成随机子域（默认否：多数服务端只接受已配置域名，
+    # 子域匹配需服务端开启 ENABLE_CREATE_ADDRESS_SUBDOMAIN_MATCH）
+    "cloudflare_randomize_subdomain": False,
     "cloudflare_path_domains": "/api/domains",
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
@@ -831,13 +838,56 @@ def get_ip_rotation_mode() -> int:
     return max(1, min(failure_threshold, 20))
 
 
-def get_ip_usage_limit() -> int:
-    """Return bounded per-IP cumulative usage limit (0..100000)；0=不限。"""
+def get_ip_usage_limit(ip: str = "") -> int:
+    """Return bounded per-IP cumulative usage limit (0..100000)；0=不限。
+
+    每 IP 单独覆盖（ip_usage.json limits）优先，未设置时回退全局 config。
+    """
+    ip = str(ip or "").strip()
+    if ip:
+        try:
+            per = get_per_ip_limit(ip)
+        except Exception:
+            per = None
+        if per is not None:
+            return max(0, min(int(per), 100000))
     try:
         usage_limit = int(config.get("ip_usage_limit", 0) or 0)
     except (TypeError, ValueError):
         usage_limit = 0
     return max(0, min(usage_limit, 100000))
+
+
+def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
+    """启动浏览器前预检代理出口：轻量探测出口 IP，检查黑名单与累计上限。
+
+    返回 (usable, ip, reason)。探测失败/拿不到 IP 时返回可用（放行，
+    不误杀好代理），由 start_browser 内部原有探测兜底。
+    """
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return True, "", ""
+    try:
+        exit_ip = _bs._resolve_proxy_exit_ip(proxy)
+    except Exception:
+        return True, "", ""
+    exit_ip = str(exit_ip or "").strip()
+    if not exit_ip:
+        return True, "", ""
+    try:
+        blocked, reason = _bs.is_blocked_exit_ip(exit_ip)
+        if blocked:
+            return False, exit_ip, f"出口IP命中黑名单: {reason or exit_ip}"
+    except Exception:
+        pass
+    try:
+        limit = get_ip_usage_limit(exit_ip)
+        used = get_ip_usage(exit_ip)
+        if limit > 0 and used >= limit:
+            return False, exit_ip, f"累计使用 {used}/{limit} 已到上限"
+    except Exception:
+        pass
+    return True, exit_ip, ""
 
 
 def ip_rotation_reason_after_slot(
@@ -898,6 +948,13 @@ def rotate_browser_to_new_exit(
         log_callback(
             f"[*] [IP策略] 切换 sticky #{rotate_idx}: {redact_proxy(proxy)}"
         )
+        # 启动前预检：探测出口 IP + 黑名单 + 累计上限；不通过则不启动浏览器
+        _usable, _pre_ip, _pre_reason = precheck_proxy_exit(proxy)
+        if not _usable:
+            log_callback(
+                f"[!] [IP策略] 预检跳过 {_pre_ip or '?'}：{_pre_reason}，换下一个出口"
+            )
+            continue
         try:
             start_browser(log_callback=log_callback)
         except Exception as exc:
@@ -983,29 +1040,29 @@ def _apply_mail_direct(url, request_kwargs: dict) -> dict:
 
 
 def get_duckmail_api_base():
-    return duckmail_provider.normalize_base(str(config.get("duckmail_api_base", "") or ""))
+    return duckmail_provider.normalize_base(str(_profile_value("duckmail_api_base") or ""))
 
 
 def get_duckmail_api_key():
-    return config.get("duckmail_api_key", "")
+    return _profile_value("duckmail_api_key", "")
 
 
 
 def get_cloudflare_api_base():
-    return str(config.get("cloudflare_api_base", "") or "").rstrip("/")
+    return str(_profile_value("cloudflare_api_base") or "").rstrip("/")
 
 
 def get_cloudflare_api_key():
-    return config.get("cloudflare_api_key", "")
+    return _profile_value("cloudflare_api_key", "")
 
 
 def get_cloudflare_auth_mode():
-    return str(config.get("cloudflare_auth_mode", "none") or "none").lower()
+    return str(_profile_value("cloudflare_auth_mode", "none") or "none").lower()
 
 
 def get_cloudflare_custom_auth():
     """全局访问密码（cloudflare_temp_email 的 PASSWORDS）。"""
-    return str(config.get("cloudflare_custom_auth", "") or "").strip()
+    return str(_profile_value("cloudflare_custom_auth") or "").strip()
 
 
 def cloudflare_apply_custom_auth(headers):
@@ -1013,7 +1070,9 @@ def cloudflare_apply_custom_auth(headers):
 
 
 def get_cloudflare_path(key, default_path):
-    return cloudflare_provider.path_from_config(config, key, default_path)
+    return cloudflare_provider.path_from_config(
+        {**config, **_profile_fields()}, key, default_path
+    )
 
 
 def cloudflare_build_headers(content_type=False):
@@ -1033,7 +1092,7 @@ def cloudflare_apply_auth_params(params=None):
 
 def cloudflare_next_default_domain():
     global _cf_domain_index
-    domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
+    domains = [x.strip() for x in str(_profile_value("defaultDomains") or "").split(",") if x.strip()]
     domain, _cf_domain_index = cloudflare_provider.next_default_domain(domains, _cf_domain_index)
     return domain
 
@@ -1057,8 +1116,56 @@ def cloudflare_create_temp_address(api_base, domain=""):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
-        randomize_subdomain=not bool(domain),
+        # 默认不随机子域（多数服务端只接受已配置域名）；需随机时在
+        # config 开启 cloudflare_randomize_subdomain
+        randomize_subdomain=bool(config.get("cloudflare_randomize_subdomain", False)),
     )
+
+
+def get_cloudflare_jwt_secret() -> str:
+    """服务端 JWT_SECRET（catch-all 免建号时用于自签地址 JWT）。"""
+    return str(_profile_value("cloudflare_jwt_secret") or "").strip()
+
+
+def _sign_cloudflare_address_jwt(secret: str, address: str, address_id: int = 0) -> str:
+    """按服务端格式自签地址 JWT：HS256，payload={address, address_id}。
+
+    仅用标准库实现（base64/hashlib/hmac），不依赖 pyjwt。
+    """
+    import base64
+    import hashlib
+    import hmac
+
+    def _b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+    payload = _b64url(
+        json.dumps(
+            {"address": str(address), "address_id": int(address_id or 0)},
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    signing = f"{header}.{payload}".encode("utf-8")
+    signature = _b64url(
+        hmac.new(str(secret).encode("utf-8"), signing, hashlib.sha256).digest()
+    )
+    return f"{header}.{payload}.{signature}"
+
+
+def cloudflare_catchall_email_and_token(jwt_secret: str, domain: str = "") -> tuple[str, str]:
+    """catch-all 免建号：随机账号 + 随机子域名，用服务端 JWT_SECRET 自签收信 JWT。
+
+    要求服务端开启 *.根域 全子域 catch-all（任意 user@sub.根域 可直接收信），
+    不调用建号 API。返回 (address, jwt)。
+    """
+    base_domain = str(domain or "").strip() or cloudflare_next_default_domain()
+    if not base_domain:
+        raise Exception("Cloudflare catch-all 未配置收信域名（defaultDomains）")
+    # 随机子域：user@<随机label>.根域，不局限于单一子域
+    address = f"{generate_username(10)}@{_random_subdomain_domain(base_domain)}"
+    jwt = _sign_cloudflare_address_jwt(jwt_secret, address, 0)
+    return address, jwt
 
 
 MAILNEST_API_BASE = mailnest_provider.API_BASE
@@ -1066,14 +1173,14 @@ MAILNEST_DEFAULT_PROJECT_CODE = mailnest_provider.DEFAULT_PROJECT_CODE
 
 
 def get_mailnest_api_key():
-    key = str(config.get("mailnest_api_key", "") or "").strip()
+    key = str(_profile_value("mailnest_api_key") or "").strip()
     if not key:
         raise Exception(f"请在配置文件中配置 mailnest_api_key | 注册网址：{MAILNEST_API_BASE}")
     return key
 
 
 def get_mailnest_project_code():
-    code = str(config.get("mailnest_project_code", "") or "").strip()
+    code = str(_profile_value("mailnest_project_code") or "").strip()
     return code or MAILNEST_DEFAULT_PROJECT_CODE
 
 
@@ -1554,15 +1661,15 @@ YYDS_API_BASE = yyds_provider.API_BASE
 
 
 def get_yyds_api_key():
-    return config.get("yyds_api_key", "")
+    return _profile_value("yyds_api_key", "")
 
 
 def get_yyds_jwt():
-    return config.get("yyds_jwt", "")
+    return _profile_value("yyds_jwt", "")
 
 
 def get_yyds_default_domain():
-    return str(config.get("yyds_default_domain", "") or "").strip()
+    return str(_profile_value("yyds_default_domain") or "").strip()
 
 
 def yyds_get_domains(api_key=None, jwt=None):
@@ -1660,15 +1767,15 @@ def pick_domain(api_key=None):
 
 
 def get_cloudmail_url():
-    return str(os.environ.get("CLOUDMAIL_URL") or config.get("cloudmail_url", "") or "").strip().rstrip("/")
+    return str(os.environ.get("CLOUDMAIL_URL") or _profile_value("cloudmail_url") or "").strip().rstrip("/")
 
 
 def get_cloudmail_admin_email():
-    return str(os.environ.get("CLOUDMAIL_ADMIN_EMAIL") or config.get("cloudmail_admin_email", "") or "").strip()
+    return str(os.environ.get("CLOUDMAIL_ADMIN_EMAIL") or _profile_value("cloudmail_admin_email") or "").strip()
 
 
 def get_cloudmail_password():
-    return str(os.environ.get("CLOUDMAIL_PASSWORD") or config.get("cloudmail_password", "") or "")
+    return str(os.environ.get("CLOUDMAIL_PASSWORD") or _profile_value("cloudmail_password") or "")
 
 
 def cloudmail_get_email_and_token(domain=""):
@@ -1676,7 +1783,7 @@ def cloudmail_get_email_and_token(domain=""):
     if selected_domain:
         domains = [selected_domain]
     else:
-        raw_domains = str(config.get("defaultDomains", "") or "")
+        raw_domains = str(_profile_value("defaultDomains") or "")
         domains = [
             item.strip()
             for item in re.split(r"[,，\s]+", raw_domains)
@@ -1696,8 +1803,8 @@ def get_moemail_api_base():
     raw = (
         os.environ.get("MOEMAIL_API_BASE")
         or os.environ.get("MOEMAIL_API_URL")
-        or config.get("moemail_api_base")
-        or config.get("moemail_api_url")
+        or _profile_value("moemail_api_base")
+        or _profile_value("moemail_api_url")
         or ""
     )
     return moemail_provider.normalize_base(str(raw))
@@ -1706,17 +1813,17 @@ def get_moemail_api_base():
 def get_moemail_api_key():
     return str(
         os.environ.get("MOEMAIL_API_KEY")
-        or config.get("moemail_api_key", "")
+        or _profile_value("moemail_api_key")
         or ""
     ).strip()
 
 
 def get_moemail_domain():
-    return str(config.get("moemail_domain", "") or "").strip().lstrip("@")
+    return str(_profile_value("moemail_domain") or "").strip().lstrip("@")
 
 
 def get_moemail_expiry_ms():
-    raw = config.get("moemail_expiry_ms", moemail_provider.DEFAULT_EXPIRY_MS)
+    raw = _profile_value("moemail_expiry_ms", moemail_provider.DEFAULT_EXPIRY_MS)
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -1794,6 +1901,71 @@ def get_email_provider():
     return str(config.get("email_provider", "cloudflare") or "cloudflare").strip().lower()
 
 
+# ---------------------------------------------------------------------------
+# 邮箱多配置档（profiles）运行时轮换：多个启用的邮箱配置并存时，建号前按
+# round-robin 选一档；验证码取信按 email→profile 映射用同一档。
+# 无启用档时全部回退顶层 config 单配置（兼容旧逻辑）。
+# ---------------------------------------------------------------------------
+
+_email_profile_lock = threading.Lock()
+_email_profile_rr_idx = 0
+_email_active_profile: dict | None = None  # 当前线程正在使用的配置档
+_email_to_profile: dict[str, str] = {}  # email -> profile id（取验证码用同一档）
+
+
+def _profile_fields() -> dict:
+    """当前生效配置档的字段（无配置档 → 空 dict，回退顶层 config）。"""
+    profile = _email_active_profile
+    if isinstance(profile, dict) and isinstance(profile.get("fields"), dict):
+        return profile["fields"]
+    return {}
+
+
+def _profile_value(name: str, default=""):
+    """优先取当前配置档字段，未设置时回退顶层 config（与旧逻辑一致）。"""
+    fields = _profile_fields()
+    if name in fields:
+        return fields[name]
+    return config.get(name, default)
+
+
+def _pick_email_profile() -> dict | None:
+    """round-robin 选取下一个启用的配置档并设为当前生效档；无则回退 None。"""
+    global _email_profile_rr_idx, _email_active_profile
+    try:
+        from webui.email_provider_store import get_enabled_email_profiles
+
+        profiles = get_enabled_email_profiles()
+    except Exception:
+        profiles = []
+    if not profiles:
+        _email_active_profile = None
+        return None
+    with _email_profile_lock:
+        idx = _email_profile_rr_idx % len(profiles)
+        _email_profile_rr_idx += 1
+        selected = profiles[idx]
+    _email_active_profile = selected
+    return selected
+
+
+def _use_email_profile(profile_id: str) -> None:
+    """按 profile id 恢复生效档（取验证码用同一档）；不存在则回退顶层。"""
+    global _email_active_profile
+    _email_active_profile = None
+    if not profile_id:
+        return
+    try:
+        from webui.email_provider_store import get_enabled_email_profiles
+
+        for profile in get_enabled_email_profiles():
+            if profile.get("id") == profile_id:
+                _email_active_profile = profile
+                return
+    except Exception:
+        pass
+
+
 def _managed_domain_for_provider(provider: str) -> str:
     if provider not in _MANAGED_EMAIL_DOMAIN_PROVIDERS:
         return ""
@@ -1843,50 +2015,78 @@ def _record_email_domain_rejected(email: str, message: str = "") -> str:
 
 
 def get_email_and_token(api_key=None):
+    # 有启用的多配置档时，round-robin 选一档建号（无档时回退顶层单配置）
+    picked = _pick_email_profile()
     provider = get_email_provider()
     managed_domain = _managed_domain_for_provider(provider)
     if provider == "yyds":
-        return yyds_get_email_and_token(
+        result = yyds_get_email_and_token(
             api_key=api_key,
             jwt=get_yyds_jwt(),
             domain=managed_domain,
         )
-    if provider == "cloudmail":
-        return cloudmail_get_email_and_token(domain=managed_domain)
-    if provider == "moemail":
-        return moemail_get_email_and_token(domain=managed_domain)
-    if provider == "cloudflare":
+    elif provider == "cloudmail":
+        result = cloudmail_get_email_and_token(domain=managed_domain)
+    elif provider == "moemail":
+        result = moemail_get_email_and_token(domain=managed_domain)
+    elif provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base, domain=managed_domain)
-        except Exception as primary_exc:
+
+        def _admin_create():
+            """admin 建号 + fallback（catch-all 不可用时的回退路径）。"""
             try:
-                return cloudflare_provider.create_mailbox_fallback(
-                    http_get,
-                    http_post,
-                    api_base,
-                    domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
-                    accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
-                    token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
-                    api_key=api_key or get_cloudflare_api_key(),
-                    auth_mode=get_cloudflare_auth_mode(),
-                    custom_auth=get_cloudflare_custom_auth(),
-                    domain=managed_domain,
+                # cloudflare_temp_email 专用模式
+                return cloudflare_create_temp_address(api_base, domain=managed_domain)
+            except Exception as primary_exc:
+                try:
+                    return cloudflare_provider.create_mailbox_fallback(
+                        http_get,
+                        http_post,
+                        api_base,
+                        domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
+                        accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
+                        token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
+                        api_key=api_key or get_cloudflare_api_key(),
+                        auth_mode=get_cloudflare_auth_mode(),
+                        custom_auth=get_cloudflare_custom_auth(),
+                        domain=managed_domain,
+                    )
+                except Exception:
+                    raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+
+        # catch-all 免建号优先：配置了 JWT_SECRET 时用随机地址 + 自签 JWT
+        # 收信，跳过建号 API；任何异常回退 admin 建号
+        jwt_secret = get_cloudflare_jwt_secret()
+        if jwt_secret:
+            try:
+                result = cloudflare_catchall_email_and_token(
+                    jwt_secret, domain=managed_domain
                 )
             except Exception:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-    if provider == "mailnest":
-        return mailnest_buy_email(), "_"
-    return duckmail_provider.create_mailbox(
-        http_get,
-        http_post,
-        get_duckmail_api_base(),
-        api_key=api_key or get_duckmail_api_key(),
-        expires_in=0,
-    )
+                result = _admin_create()
+        else:
+            result = _admin_create()
+    elif provider == "mailnest":
+        result = mailnest_buy_email(), "_"
+    else:
+        result = duckmail_provider.create_mailbox(
+            http_get,
+            http_post,
+            get_duckmail_api_base(),
+            api_key=api_key or get_duckmail_api_key(),
+            expires_in=0,
+        )
+    if picked:
+        try:
+            email = str((result or ("", ""))[0] or "").strip()
+            if email:
+                with _email_profile_lock:
+                    _email_to_profile[email] = picked["id"]
+        except Exception:
+            pass
+    return result
 
 
 def get_oai_code(
@@ -1898,6 +2098,8 @@ def get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
+    # 验证码必须用建号时同一配置档取信：email→profile 映射优先，其次当前档
+    _use_email_profile(_email_to_profile.get(str(email or "").strip() or ""))
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_oai_code(
@@ -2010,7 +2212,31 @@ def cloudflare_get_oai_code(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
         resend_callback=resend_callback,
+        # 验证码提取成功后即删除该邮件（admin 凭证；失败仅记日志，不阻塞）
+        on_code_mail=lambda mid: cloudflare_delete_mail(mid, log_callback=log_callback),
     )
+
+
+def cloudflare_delete_mail(mail_id, *, log_callback=None):
+    """删除 Cloudflare 单封邮件（管理员凭证，DELETE /admin/mails/{id}）。
+
+    验证码已提取后调用，清理收件箱；失败仅日志提示，不影响注册流程。
+    """
+    try:
+        result = cloudflare_provider.delete_mail(
+            http_delete,
+            get_cloudflare_api_base(),
+            mail_id,
+            admin_auth=get_cloudflare_api_key(),
+            custom_auth=get_cloudflare_custom_auth(),
+        )
+        if log_callback:
+            log_callback(f"[*] 已删除验证码邮件 id={mail_id}")
+        return result
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 删除验证码邮件失败 id={mail_id}: {exc}")
+        return None
 
 
 def generate_random_birthdate():
@@ -3921,6 +4147,28 @@ def run_registration_cli(count):
                 current_started_at: float,
             ) -> tuple[int, str, float, int]:
                 while not controller.should_stop():
+                    # 持久化累计上限预检：跨任务累计达到上限的 IP 直接视为
+                    # 不可用换口（进程内 quota 只查每 IP 账号配额，不查历史
+                    # 累计；换口后的新 IP 会在下一轮 claim 前再次预检）
+                    if current_ip:
+                        persisted_limit = get_ip_usage_limit(current_ip)
+                        persisted_used = get_ip_usage(current_ip)
+                        if persisted_limit > 0 and persisted_used >= persisted_limit:
+                            cli_log(
+                                f"[W{wid+1}] [*] [IP策略] 跳过出口 {current_ip}："
+                                f"累计使用 {persisted_used}/{persisted_limit} 已到上限"
+                            )
+                            current_rotate_idx, current_ip, current_started_at = (
+                                rotate_browser_to_new_exit(
+                                    wid,
+                                    current_rotate_idx,
+                                    current_ip,
+                                    current_started_at,
+                                    log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                    cancel_callback=controller.should_stop,
+                                )
+                            )
+                            continue
                     claimed, used, reason = ip_quota.claim(wid, current_ip)
                     if claimed:
                         return (
@@ -3961,10 +4209,19 @@ def run_registration_cli(count):
                 set_thread_proxy(px)
                 cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
                 try:
+                    # 启动前预检：先探测出口 IP，检查黑名单/累计上限，
+                    # 避免超限/黑名单出口白白启动一次完整浏览器
+                    _usable, _pre_ip, _pre_reason = precheck_proxy_exit(px)
+                    if not _usable:
+                        cli_log(
+                            f"[W{wid+1}] [*] [IP策略] 预检跳过 {_pre_ip or '?'}："
+                            f"{_pre_reason}"
+                        )
+                        raise RuntimeError(f"出口IP预检不通过: {_pre_reason}")
                     start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
                     record_proxy_boot_failure(px, boot_exc)
-                    # 黑名单/死代理：多换几条 sticky 再放弃
+                    # 黑名单/死代理/预检不通过：多换几条 sticky 再放弃
                     booted = False
                     last_boot = boot_exc
                     for _try in range(1, 12):
@@ -3974,6 +4231,7 @@ def run_registration_cli(count):
                             or "无法解析出口 IP" in msgb
                             or "代理不可用或过慢" in msgb
                             or "Failed to get IP" in msgb
+                            or "出口IP预检不通过" in msgb
                         ):
                             break
                         rotate_idx += 1
@@ -4260,11 +4518,12 @@ def run_registration_cli(count):
                                     )
                             reason = ""
                             if slot_completed:
+                                # 上限取该出口的生效值：每 IP 覆盖优先，回退全局
                                 reason = ip_rotation_reason_after_slot(
                                     used_on_ip=used_on_ip,
                                     accounts_per_ip=accounts_per_ip,
                                     ip_usage=get_ip_usage(active_ip),
-                                    ip_usage_limit=ip_usage_limit,
+                                    ip_usage_limit=get_ip_usage_limit(active_ip),
                                     consecutive_failures=consecutive_failures,
                                     failure_threshold=failure_rotate_threshold,
                                 )

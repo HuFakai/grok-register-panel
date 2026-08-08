@@ -412,6 +412,38 @@ python sso_to_auth_json.py \
 5. 「资料填写失败」有时是资料页人机未过，不一定是姓名密码写不进  
 6. 链式代理在客户端配，不在注册机 Python 里写死  
 
+## 数据存储方案（数据库评估结论）
+
+**当前规模下不需要引入 SQLite/数据库，文件 + 原子写 + 文件锁方案继续使用。**
+
+评估依据（2026-08）：
+
+| 数据 | 存储 | 规模量级 | 并发模型 |
+|------|------|----------|----------|
+| 注册结果 | `log/register_results.jsonl`（>5MB 自动轮转归档，`results_store.py` 累计摘要） | 数千行 | 追加写 + 文件锁 |
+| IP 使用统计 | `log/ip_usage.json`（counts/limits/meta 原子写） | 数十个 IP | 文件锁 |
+| 邮箱多配置档 | `log/email_provider_profiles.json`（原子写） | ≤50 档 | 文件锁 |
+| 代理池 / 域名池 / 黑名单 / 控制状态 | `log/*.json` 原子写 + 锁 | 数百项 | 文件锁 |
+| 账号输出 | `accounts/tasks/<taskID>/` 按任务目录 + 任务级聚合 | 千级 | 追加写 |
+
+为什么文件方案够用：
+
+1. **写放大极低**：写入都是"追加一行"或"单键更新"，没有跨表事务；
+2. **并发模型简单**：单进程注册 worker + 面板进程，`exclusive_file_lock` 已保证原子性，
+   与 SQLite 的 `BEGIN IMMEDIATE` 没有本质差别；
+3. **可读可审计**：JSONL/JSON 可直接 tail/grep，故障恢复无需导出；
+4. **SQLite 的收益场景这里都不存在**：无复杂聚合查询（统计是流式计数）、
+   无多表 JOIN、无高并发随机读写（写并发 ≤ 24 worker 且可被文件锁串行化）。
+
+**触发升级的阈值**（满足其一再考虑 SQLite / 服务化数据库）：
+
+- 单表数据量超过 10 万行，或 jsonl 轮转周期短于 1 天；
+- 需要跨数据集的复杂聚合 / 报表（当前 `results_store` 计数摘要已覆盖）；
+- 需要多进程高并发随机读写（当前文件锁可串行化，worker 数上限 24）。
+
+如触发升级，推荐顺序：SQLite（WAL 模式，零运维）→ Postgres（多机/远程面板场景），
+迁移路径为各 `*_store.py` 的 `_load/_save` 收口到统一 DAO，面板 API 层不变。
+
 ## 目录结构
 
 ```text
@@ -425,12 +457,16 @@ python sso_to_auth_json.py \
 ├── run_batch_headless.py      # 无头批量（包根 Path 后 chdir）
 ├── run_until_100.py           # 编排器
 ├── notify_push.py             # 任务完成推送提醒（3 次重试，间隔 5 秒）
+├── results_store.py           # 注册结果 jsonl 统计 / 轮转归档 / 累计摘要
+├── ip_usage_store.py          # IP 使用次数、每 IP 上限与元数据持久化
+├── account_exports.py         # 账号按任务目录输出与任务级聚合
 ├── webui/
 │   ├── monitor.py             # Live 面板 HTTP 服务
 │   ├── security_utils.py      # redact / token 校验
 │   ├── blacklist_store.py     # 锁保护的 JSON 黑名单状态
 │   ├── proxy_store.py         # 外部代理池、探活、冷却与脱敏视图
 │   ├── email_domain_store.py  # 邮箱域名池、拒绝阈值与轮换状态
+│   ├── email_provider_store.py# 邮箱服务商单配置 + 多配置档（profiles）
 │   ├── process_utils.py       # 当前项目实例的进程发现 / 停止
 │   ├── recovery_ops.py        # SSO / accounts 异步补录
 │   └── blacklist_ops.py       # 面板黑名单接口

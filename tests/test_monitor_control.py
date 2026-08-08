@@ -86,7 +86,31 @@ def test_batch_and_add_count_have_no_upper_bound():
             monitor.CONTROL_FILE = previous
 
 
+def test_base_ok_persists_through_save_control():
+    """base_ok 必须落盘：snapshot 依赖它计算本次任务增量（ok_count - base_ok）。"""
+    previous = monitor.CONTROL_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
+        try:
+            saved = monitor.save_control(
+                {
+                    "add_count": 1800,
+                    "base_cpa": 0,
+                    "target_cpa": 1800,
+                    "base_ok": 1633,
+                }
+            )
+            assert saved.get("base_ok") == 1633, "save_control 丢掉了 base_ok"
+            loaded = monitor.load_control()
+            assert loaded.get("base_ok") == 1633, "base_ok 未落盘，面板会回退 CPA 口径"
+            assert loaded.get("target_cpa") == 1800
+            assert loaded.get("add_count") == 1800
+        finally:
+            monitor.CONTROL_FILE = previous
+
+
 if __name__ == "__main__":
     test_ip_policy_control_round_trip_and_bounds()
     test_batch_and_add_count_have_no_upper_bound()
+    test_base_ok_persists_through_save_control()
     print("OK monitor_control")

@@ -21,9 +21,13 @@ tests=(
   tests/test_proxy_store.py
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
+  tests/test_email_profile_rotation.py
+  tests/test_cloudflare_catchall.py
   tests/test_ip_rotation_policy.py
   tests/test_shared_slot_pool.py
   tests/test_ip_usage_store.py
+  tests/test_results_store.py
+  tests/test_config_backup.py
   tests/test_email_domain_store.py
   tests/test_email_domain_worker_integration.py
   tests/test_star_history.py

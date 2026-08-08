@@ -1878,8 +1878,9 @@ def wait_for_sso_cookie(
     final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 8
-    # 短 hold：给 Set-Cookie 留窗口，又不拖慢成功路径
-    accounts_hold_seconds = 3
+    # 长 hold：给 accounts.x.ai 的 Set-Cookie 链留足完成窗口（20 秒），
+    # 避免过早跳转 grok.com 打断 redirect / Set-Cookie。
+    accounts_hold_seconds = 20
     max_grok_nudges = max(0, int(retry_count or 2))
     nudge_gap = max(2.0, float(retry_interval or 6))
     poll_gap = max(0.1, float(poll_interval or 0.5))

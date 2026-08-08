@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -473,6 +475,298 @@ def test_email_provider_config(
         "ok": bool(ok),
         "provider": normalized_provider,
         "provider_label": PROVIDER_LABELS[normalized_provider],
+        "detail": redact_log_line(str(detail))[:300],
+        "checked_at": _utc_now(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 邮箱多配置档（profiles）：多个服务商配置并存，注册时自动轮流使用。
+# 无 profiles 时完全回退上面的顶层单配置逻辑（兼容旧调用）。
+# 数据落盘到 log/email_provider_profiles.json：
+#   {"profiles": [{id, provider, name, enabled, fields, created_at, updated_at}]}
+# ---------------------------------------------------------------------------
+
+PROFILES_PATH = Path(
+    os.environ.get(
+        "EMAIL_PROVIDER_PROFILES_FILE", str(ROOT / "log" / "email_provider_profiles.json")
+    )
+)
+PROFILES_LOCK_PATH = PROFILES_PATH.with_suffix(PROFILES_PATH.suffix + ".lock")
+MAX_PROFILES = 50
+
+
+def _load_profiles_unlocked() -> list[dict]:
+    try:
+        data = json.loads(PROFILES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    raw = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    profiles = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            continue
+        profile_id = str(item.get("id") or "").strip()
+        if not profile_id:
+            continue
+        fields = item.get("fields")
+        if not isinstance(fields, dict):
+            continue
+        profiles.append(
+            {
+                "id": profile_id,
+                "provider": provider,
+                "name": str(item.get("name") or "")[:80],
+                "enabled": bool(item.get("enabled", True)),
+                "fields": {str(k): v for k, v in fields.items() if k in FIELD_DEFINITIONS},
+                "created_at": str(item.get("created_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+            }
+        )
+    profiles.sort(key=lambda p: p["created_at"])
+    return profiles
+
+
+def _save_profiles_unlocked(profiles: list[dict]) -> None:
+    PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        PROFILES_PATH,
+        {
+            "profiles": [
+                {
+                    "id": p["id"],
+                    "provider": p["provider"],
+                    "name": p["name"],
+                    "enabled": p["enabled"],
+                    "fields": p["fields"],
+                    "created_at": p["created_at"],
+                    "updated_at": p["updated_at"],
+                }
+                for p in profiles
+            ],
+            "updated_at": _utc_now(),
+        },
+    )
+
+
+def _profile_public(profile: dict) -> dict:
+    """公开视图：secret 字段隐藏值，只标是否已配置。"""
+    values = _merged(profile["fields"])
+    public_values = {
+        name: "" if name in SECRET_FIELDS else values.get(name, definition.get("default", ""))
+        for name, definition in FIELD_DEFINITIONS.items()
+    }
+    return {
+        "id": profile["id"],
+        "provider": profile["provider"],
+        "provider_label": PROVIDER_LABELS[profile["provider"]],
+        "name": profile["name"],
+        "enabled": profile["enabled"],
+        "configured": _is_configured(profile["provider"], values),
+        "values": public_values,
+        "secret_configured": {
+            name: bool(values.get(name)) for name in SECRET_FIELDS
+        },
+        "created_at": profile["created_at"],
+        "updated_at": profile["updated_at"],
+    }
+
+
+def _has_legacy_config() -> bool:
+    """顶层 config.json 是否仍配置着旧单配置（profiles 为空时的回退来源）。"""
+    with exclusive_file_lock(LOCK_PATH):
+        raw, error = _read_unlocked()
+    if error:
+        return False
+    if raw.get("email_provider"):
+        return True
+    return any(_is_configured(provider, _merged(raw)) for provider in SUPPORTED_PROVIDERS)
+
+
+def list_email_profiles() -> dict:
+    """Web 面板展示：profile 公开列表 + 启用/总数统计。"""
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+    enabled = sum(1 for p in profiles if p["enabled"])
+    return {
+        "ok": True,
+        "profiles": [_profile_public(p) for p in profiles],
+        "summary": {"total": len(profiles), "enabled": enabled},
+        "has_legacy_config": _has_legacy_config(),
+        "updated_at": _utc_now(),
+    }
+
+
+def get_enabled_email_profiles() -> list[dict]:
+    """运行时使用：返回所有启用的 profile（含真实字段值），按启用顺序。
+
+    无启用 profile 时返回空列表，调用方回退顶层单配置。
+    """
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+    return [
+        {
+            "id": p["id"],
+            "provider": p["provider"],
+            "name": p["name"],
+            "fields": dict(p["fields"]),
+        }
+        for p in profiles
+        if p["enabled"]
+    ]
+
+
+def save_email_profile(
+    provider: object,
+    fields: object,
+    *,
+    name: object = "",
+    enabled: object = True,
+    profile_id: object = None,
+    clear_secrets: object = None,
+) -> dict:
+    """新建或更新一个邮箱配置档。
+
+    fields 中留空的 secret 字段表示保留原值（更新场景）；clear_secrets 显式清空。
+    返回该 profile 的公开视图。
+    """
+    normalized_provider = _provider(provider)
+    if not isinstance(fields, dict):
+        raise EmailProviderConfigError("fields 必须是 JSON 对象")
+    allowed = set(PROVIDER_FIELDS[normalized_provider])
+    unknown = sorted(set(fields) - allowed)
+    if unknown:
+        raise EmailProviderConfigError(f"包含不支持的配置字段: {unknown[0]}")
+    if clear_secrets is None:
+        clear = set()
+    elif isinstance(clear_secrets, list):
+        clear = {str(item or "").strip() for item in clear_secrets}
+    else:
+        raise EmailProviderConfigError("clear_secrets 必须是数组")
+    if not clear <= (allowed & SECRET_FIELDS):
+        raise EmailProviderConfigError("包含不支持的密钥清除字段")
+
+    candidate_id = str(profile_id or "").strip()
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+        if candidate_id:
+            existing = next((p for p in profiles if p["id"] == candidate_id), None)
+            if existing is None:
+                raise EmailProviderConfigError("配置档不存在")
+        else:
+            if len(profiles) >= MAX_PROFILES:
+                raise EmailProviderConfigError(f"配置档数量已达上限 {MAX_PROFILES}")
+            existing = None
+
+        normalized = dict(existing["fields"]) if existing else {}
+        if existing and existing["provider"] != normalized_provider:
+            # 更换服务商：清掉旧服务商字段，避免残留干扰
+            normalized = {}
+        for field_name, value in fields.items():
+            if field_name in SECRET_FIELDS and not str(value or ""):
+                continue
+            normalized[field_name] = _normalize_value(field_name, value)
+        for field_name in clear:
+            normalized[field_name] = ""
+
+        now = _utc_now()
+        if existing:
+            existing["provider"] = normalized_provider
+            existing["fields"] = normalized
+            existing["updated_at"] = now
+            if name is not None:
+                existing["name"] = str(name or "").strip()[:80]
+            if enabled is not None:
+                existing["enabled"] = bool(enabled)
+            profile = existing
+        else:
+            label = str(name or "").strip()[:80] or f"{PROVIDER_LABELS[normalized_provider]} 配置"
+            profile = {
+                "id": uuid.uuid4().hex[:20],
+                "provider": normalized_provider,
+                "name": label,
+                "enabled": bool(enabled),
+                "fields": normalized,
+                "created_at": now,
+                "updated_at": now,
+            }
+            profiles.append(profile)
+        _save_profiles_unlocked(profiles)
+    return {"ok": True, "profile": _profile_public(profile)}
+
+
+def delete_email_profile(profile_id: object) -> bool:
+    """删除配置档，返回是否删除成功。"""
+    target = str(profile_id or "").strip()
+    if not target:
+        return False
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+        remaining = [p for p in profiles if p["id"] != target]
+        if len(remaining) == len(profiles):
+            return False
+        _save_profiles_unlocked(remaining)
+    return True
+
+
+def set_email_profile_enabled(profile_id: object, enabled: object) -> dict:
+    """启用/停用配置档；返回更新后的公开视图。"""
+    target = str(profile_id or "").strip()
+    if not target:
+        raise EmailProviderConfigError("缺少 profile_id")
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+        profile = next((p for p in profiles if p["id"] == target), None)
+        if profile is None:
+            raise EmailProviderConfigError("配置档不存在")
+        profile["enabled"] = bool(enabled)
+        profile["updated_at"] = _utc_now()
+        _save_profiles_unlocked(profiles)
+    return {"ok": True, "profile": _profile_public(profile)}
+
+
+def test_email_profile(
+    profile_id: object,
+    *,
+    http_get=None,
+    http_post=None,
+) -> dict:
+    """对某个配置档做连通性测试（不改动存储）。"""
+    target = str(profile_id or "").strip()
+    if not target:
+        raise EmailProviderConfigError("缺少 profile_id")
+    with exclusive_file_lock(PROFILES_LOCK_PATH):
+        profiles = _load_profiles_unlocked()
+    profile = next((p for p in profiles if p["id"] == target), None)
+    if profile is None:
+        raise EmailProviderConfigError("配置档不存在")
+    candidate = _merged(profile["fields"])
+    candidate["email_provider"] = profile["provider"]
+    normalized_provider = _provider(profile["provider"])
+    if http_get is None or http_post is None:
+        import requests
+
+        http_get = http_get or requests.get
+        http_post = http_post or requests.post
+    import connectivity
+
+    _, ok, detail = connectivity.check_email_api(
+        normalized_provider,
+        candidate,
+        http_get,
+        http_post,
+    )
+    return {
+        "ok": bool(ok),
+        "provider": normalized_provider,
+        "provider_label": PROVIDER_LABELS[normalized_provider],
+        "profile_id": target,
+        "profile_name": profile["name"],
         "detail": redact_log_line(str(detail))[:300],
         "checked_at": _utc_now(),
     }

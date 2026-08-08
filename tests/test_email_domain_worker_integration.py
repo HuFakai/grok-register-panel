@@ -19,6 +19,7 @@ def test_managed_domains_reach_all_supported_provider_adapters():
         for key in (
             "email_provider",
             "cloudflare_api_base",
+            "cloudflare_jwt_secret",
             "cloudmail_url",
             "cloudmail_admin_email",
             "cloudmail_password",
@@ -42,6 +43,8 @@ def test_managed_domains_reach_all_supported_provider_adapters():
         register.config.update(
             {
                 "cloudflare_api_base": "https://cloudflare.example.com",
+                # 清空免建号密钥：本测试验证域名池到达 admin 建号 adapter
+                "cloudflare_jwt_secret": "",
                 "cloudmail_url": "https://cloudmail.example.com",
                 "cloudmail_admin_email": "admin@example.com",
                 "cloudmail_password": "not-used-in-test",

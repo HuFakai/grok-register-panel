@@ -92,7 +92,13 @@ def create_temp_address(
             payload["domain"] = domain
         headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
     resp = http_post(url, json=payload, headers=headers)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        body = ""
+        try:
+            body = str(getattr(resp, "text", "") or "")[:300]
+        except Exception:
+            pass
+        raise Exception(f"Cloudflare {path} HTTP {resp.status_code}: {body}".strip())
     try:
         data = resp.json()
     except Exception:
@@ -143,7 +149,13 @@ def create_account(
         headers=headers,
         params=params,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        body = ""
+        try:
+            body = str(getattr(resp, "text", "") or "")[:300]
+        except Exception:
+            pass
+        raise Exception(f"Cloudflare {path} HTTP {resp.status_code}: {body}".strip())
     return resp.json()
 
 
@@ -166,7 +178,13 @@ def get_token(
         headers=headers,
         params=apply_auth_params({}, api_key, auth_mode),
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        body = ""
+        try:
+            body = str(getattr(resp, "text", "") or "")[:300]
+        except Exception:
+            pass
+        raise Exception(f"Cloudflare {path} HTTP {resp.status_code}: {body}".strip())
     data = resp.json()
     if isinstance(data, dict):
         if data.get("token"):
@@ -310,6 +328,7 @@ def wait_for_code(
     log_callback: Optional[Callable[[str], None]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     resend_callback: Optional[Callable[[], None]] = None,
+    on_code_mail: Optional[Callable[[object], None]] = None,
 ) -> str:
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
@@ -407,6 +426,13 @@ def wait_for_code(
             if code:
                 if log_callback:
                     log_callback(f"[*] Cloudflare 从邮件中提取到验证码: {code}")
+                # 验证码已到手，邮件不再需要：触发删除回调（失败不阻塞）
+                if on_code_mail is not None:
+                    try:
+                        on_code_mail(msg_id)
+                    except Exception as exc:
+                        if log_callback:
+                            log_callback(f"[Debug] Cloudflare 删除验证码邮件失败: {exc}")
                 return code
             if log_callback:
                 log_callback(
@@ -414,3 +440,26 @@ def wait_for_code(
                 )
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
+
+
+def delete_mail(
+    http_delete: Callable[..., Any],
+    api_base: str,
+    mail_id: object,
+    *,
+    admin_auth: str = "",
+    custom_auth: str = "",
+) -> dict:
+    """删除单封邮件（admin 凭证）。
+
+    文档：DELETE /admin/mails/{mail_id}，鉴权 x-admin-auth（管理员密码）。
+    返回服务端 JSON。
+    """
+    url = f"{str(api_base or '').rstrip('/')}/admin/mails/{int(mail_id)}"
+    headers = build_headers(admin_auth, "x-admin-auth", custom_auth)
+    resp = http_delete(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {"ok": True}
