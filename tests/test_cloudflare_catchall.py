@@ -106,8 +106,98 @@ def test_get_email_and_token_prefers_catchall_then_falls_back():
             setattr(app, name, value)
 
 
+def test_delete_mail_endpoint_and_auth():
+    """DELETE /admin/mails/{id} + x-admin-auth 管理员密码。"""
+    calls = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"success": True}
+
+    def fake_delete(url, **kwargs):
+        calls.append((url, kwargs))
+        return Resp()
+
+    result = app.cloudflare_provider.delete_mail(
+        fake_delete,
+        "http://mail.example.com",
+        42,
+        admin_auth="admin-pass",
+        custom_auth="",
+    )
+    assert result == {"success": True}
+    url, kwargs = calls[0]
+    assert url == "http://mail.example.com/admin/mails/42"
+    assert kwargs["headers"]["x-admin-auth"] == "admin-pass"
+    assert "Authorization" not in kwargs["headers"]
+
+
+def test_wait_for_code_triggers_on_code_mail():
+    """提取到验证码时回调删除（拿到 mail_id），失败不阻塞返回验证码。"""
+    import email_providers.cloudflare as cf
+
+    calls = []
+
+    class Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    def fake_get(url, **kwargs):
+        return Resp()
+
+    def no_sleep(*_a, **_k):
+        return None
+
+    def no_cancel():
+        return False
+
+    messages = [
+        {
+            "id": 7,
+            "address": "test@example.com",
+            "to": [{"address": "test@example.com"}],
+            "subject": "Verification",
+            "text": "Your verification code: ABC-123",
+        }
+    ]
+
+    def fake_messages(http_get, api_base, token, **kw):
+        return messages
+
+    original_get_messages = cf.get_messages
+    original_get_detail = cf.get_message_detail
+    cf.get_messages = fake_messages
+    cf.get_message_detail = lambda *a, **k: {"text": "Your verification code: ABC-123"}
+    try:
+        code = cf.wait_for_code(
+            fake_get,
+            "http://mail.example.com",
+            "tok",
+            "test@example.com",
+            timeout=2,
+            poll_interval=0.1,
+            raise_if_cancelled=lambda cb: None,
+            sleep_with_cancel=no_sleep,
+            cancel_callback=no_cancel,
+            on_code_mail=lambda mid: calls.append(mid),
+        )
+        assert code == "ABC-123"
+        assert calls == [7], f"on_code_mail 应收到 mail_id=7: {calls}"
+    finally:
+        cf.get_messages = original_get_messages
+        cf.get_message_detail = original_get_detail
+
+
 if __name__ == "__main__":
     test_sign_cloudflare_address_jwt_format()
     test_catchall_email_and_token()
     test_get_email_and_token_prefers_catchall_then_falls_back()
+    test_delete_mail_endpoint_and_auth()
+    test_wait_for_code_triggers_on_code_mail()
     print("OK cloudflare catchall")

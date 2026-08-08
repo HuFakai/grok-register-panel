@@ -2212,7 +2212,31 @@ def cloudflare_get_oai_code(
         log_callback=log_callback,
         cancel_callback=cancel_callback,
         resend_callback=resend_callback,
+        # 验证码提取成功后即删除该邮件（admin 凭证；失败仅记日志，不阻塞）
+        on_code_mail=lambda mid: cloudflare_delete_mail(mid, log_callback=log_callback),
     )
+
+
+def cloudflare_delete_mail(mail_id, *, log_callback=None):
+    """删除 Cloudflare 单封邮件（管理员凭证，DELETE /admin/mails/{id}）。
+
+    验证码已提取后调用，清理收件箱；失败仅日志提示，不影响注册流程。
+    """
+    try:
+        result = cloudflare_provider.delete_mail(
+            http_delete,
+            get_cloudflare_api_base(),
+            mail_id,
+            admin_auth=get_cloudflare_api_key(),
+            custom_auth=get_cloudflare_custom_auth(),
+        )
+        if log_callback:
+            log_callback(f"[*] 已删除验证码邮件 id={mail_id}")
+        return result
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 删除验证码邮件失败 id={mail_id}: {exc}")
+        return None
 
 
 def generate_random_birthdate():
