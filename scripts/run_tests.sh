@@ -15,6 +15,7 @@ tests=(
   tests/test_account_exports.py
   tests/test_sso_recovery.py
   tests/test_sso_wait.py
+  tests/test_bfs_detect.py
   tests/test_monitor_http.py
   tests/test_monitor_control.py
   tests/test_log_cleanup.py

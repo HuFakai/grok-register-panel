@@ -28,6 +28,7 @@ Based on [AaronL725/grok-register](https://github.com/AaronL725/grok-register) (
 | 反检测浏览器 | [Camoufox](https://camoufox.com/)（Gecko 层指纹） |
 | 出口预检 | 启动前解析出口 IP / ASN，命中黑名单直接换口 |
 | 风控早停 | `botFlagSource=1` + `policy=deny` 时跳过后续 OAuth，避免无效重试 |
+| BFS 检测 | access_token/SSO JWT 的 `bfs` 风控 claim 检测；注册自动标记 + 面板扫描 CPA/Grok2API 目录 |
 | 编排器 | 多轮 batch、风控满 N 暂停、ASN 自动扩黑；规则写入 JSON 状态，不修改源码 |
 | **Live 面板** | 启停、并发、再跑 N、黑名单、时段成功率和账号补录；操作 API 需 `MONITOR_TOKEN` |
 | 外部代理池 | 面板单条/批量导入、去重、探活、启停、删除；记录出口 IP、ASN、延迟和冷却状态 |
@@ -163,12 +164,13 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"
 **A. Web 面板（推荐）**
 
 ```bash
-export MONITOR_TOKEN='你的长随机串'   # 必设，否则点启动会 401
+source .venv/bin/activate         #非首次启动时先启动虚拟环境
+export MONITOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"   # 必设，否则点启动会 401
 export MONITOR_HOST=127.0.0.1         # 仅本机；局域网请改成具体网卡 IP
 export MONITOR_PORT=8787
 export CPA_AUTH_DIR=./cpa_auth
-# 可选：远程绑定时需要页面里看已脱敏日志尾
-# export PANEL_INCLUDE_TAIL=1
+
+echo "面板 Token: $MONITOR_TOKEN"   #将输出的字符填写到web页面的访问令牌处
 
 python webui/monitor.py
 # 浏览器打开 http://127.0.0.1:8787/

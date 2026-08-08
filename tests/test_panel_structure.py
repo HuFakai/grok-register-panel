@@ -94,10 +94,11 @@ def test_help_and_faq_module():
     assert 'body.help-view-open #dashboard-view > :not(#help-view) { display: none; }' in html
     assert 'role="tablist"' in html
     assert 'id="faq-search"' in html
-    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 13
+    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 14
     assert 'policy=deny' in html
     assert '账号补录' in html
     assert '成功项会从待补录队列移除' in html
+    assert 'bfs' in html.lower()
     assert 'permission-denied' in html
     assert 'function setAppView(view, options = {})' in mon
     assert 'function toggleAppView()' in mon
