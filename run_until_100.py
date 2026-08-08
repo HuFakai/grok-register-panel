@@ -16,6 +16,7 @@ from pathlib import Path
 from runtime_platform import batch_launch_command, popen_group_kwargs, runtime_python
 from secure_files import append_private_text, ensure_private_dir
 from notify_push import notify_task_done
+from results_store import ok_count
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
 from webui.process_utils import (
@@ -59,14 +60,13 @@ def apply_control() -> None:
             RISK_PAUSE = max(1, int(c["risk_pause"]))
         except Exception:
             pass
-    # 再跑 N 个：以当前 CPA 为基线
+    # 再跑 N 个：以当前累计成功数为基线（成功即建号，与是否写 CPA 无关）
     add_count = c.get("add_count")
     if add_count is not None and str(add_count).strip() != "":
         try:
             n = max(1, int(add_count))
-            now = len(list(AUTHS.glob("xai-*.json")))
-            BASE0 = now
-            TARGET_CPA = now + n
+            BASE0 = ok_count()
+            TARGET_CPA = BASE0 + n
             return
         except Exception:
             pass
@@ -77,7 +77,11 @@ def apply_control() -> None:
             pass
     if c.get("base_cpa") is not None:
         try:
-            BASE0 = int(c["base_cpa"])
+            # 优先累计成功数基线（成功即建号）；旧任务无 base_ok 时回退 CPA 口径
+            if c.get("base_ok") is not None:
+                BASE0 = int(c["base_ok"])
+            else:
+                BASE0 = int(c["base_cpa"])
         except Exception:
             pass
 
@@ -293,22 +297,22 @@ def main():
             signal.signal(signum, request_stop)
     apply_control()
     kill_batch()
-    log(f"ORCH fixed start cpa_now={cpa_count()} base0={BASE0} target={TARGET_CPA} need={TARGET_CPA - cpa_count()}")
-    need0 = TARGET_CPA - cpa_count()
+    log(f"ORCH fixed start ok_now={ok_count()} base0={BASE0} target={TARGET_CPA} need={TARGET_CPA - ok_count()}")
+    need0 = TARGET_CPA - ok_count()
     if need0 <= 0:
         log(f"TARGET already met (need={need0}). Set monitor add_count / target_cpa then restart.")
-        log(f"ORCH DONE cpa={cpa_count()} delta={cpa_count() - BASE0} target={TARGET_CPA} rounds=0")
+        log(f"ORCH DONE ok={ok_count()} delta={ok_count() - BASE0} target={TARGET_CPA} rounds=0")
         log(f"final blocklist={sorted(read_blocklist_asns())}")
         return
 
     log(f"rules: workers={WORKERS} pause_on_risk_only={RISK_PAUSE} SSO ignored block={sorted(read_blocklist_asns())}")
     
     round_i = 0
-    while cpa_count() < TARGET_CPA and round_i < MAX_ROUNDS:
+    while ok_count() < TARGET_CPA and round_i < MAX_ROUNDS:
         round_i += 1
-        need = TARGET_CPA - cpa_count()
+        need = TARGET_CPA - ok_count()
         batch_n = min(max(need + 8, 15), 40)
-        log(f"=== ROUND {round_i} need={need} batch_n={batch_n} cpa={cpa_count()} block={sorted(read_blocklist_asns())} ===")
+        log(f"=== ROUND {round_i} need={need} batch_n={batch_n} ok={ok_count()} block={sorted(read_blocklist_asns())} ===")
         try:
             pid, logpath = start_batch(batch_n)
         except Exception as e:
@@ -324,9 +328,9 @@ def main():
                 alive = False
             risks = count_risk(logpath)
             oks = count_ok(logpath)
-            delta = cpa_count() - BASE0
-            log(f"  mon ok={oks} risk={risks} cpa_delta={delta}/100 alive={alive}")
-            if cpa_count() >= TARGET_CPA:
+            delta = ok_count() - BASE0
+            log(f"  mon ok={oks} risk={risks} ok_delta={delta}/{TARGET_CPA - BASE0} alive={alive}")
+            if ok_count() >= TARGET_CPA:
                 log("TARGET reached")
                 kill_batch()
                 break
@@ -351,19 +355,19 @@ def main():
                 kill_batch()
                 break
         time.sleep(3)
-        if cpa_count() >= TARGET_CPA:
+        if ok_count() >= TARGET_CPA:
             break
 
-    final = cpa_count()
-    log(f"ORCH DONE cpa={final} delta={final - BASE0} target={TARGET_CPA} rounds={round_i}")
+    final = ok_count()
+    log(f"ORCH DONE ok={final} delta={final - BASE0} target={TARGET_CPA} rounds={round_i}")
     log(f"final blocklist={sorted(read_blocklist_asns())}")
-    print(f"SUMMARY delta={final - BASE0} cpa={final} log={ORCH_LOG}", flush=True)
+    print(f"SUMMARY delta={final - BASE0} ok={final} log={ORCH_LOG}", flush=True)
     # 任务完成推送提醒（3 次重试，间隔 5 秒）；失败不影响主流程
     notify_task_done(
         title="任务完成",
         content=(
             f"当前任务已完成，请尽快开始新的注册任务。\n"
-            f"CPA：{final} / 目标 {TARGET_CPA}，本轮新增 {final - BASE0} 个。"
+            f"成功：{final} / 目标 {TARGET_CPA}，本轮新增 {final - BASE0} 个。"
         ),
         log=log,
     )

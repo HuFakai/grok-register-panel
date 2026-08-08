@@ -29,6 +29,7 @@ from runtime_platform import (
 
 try:
     from webui.blacklist_store import read_blacklist as read_blacklist_state
+    from results_store import count_results, ok_count
     from webui.proxy_store import (
         delete_proxy,
         delete_proxies,
@@ -133,6 +134,9 @@ ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
 MAX_REQUEST_BODY = 64 * 1024
+# IP 元数据懒查询失败冷却：{ip: monotonic 截止时间}，地理 API 不可达时
+# 避免每轮轮询都重试同一批 IP 拖慢 /api/ip-usage
+_ip_usage_meta_fail_until: dict[str, float] = {}
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -560,15 +564,12 @@ def success_stats():
                     if day:
                         by_day.setdefault(day, {"ok": 0, "risk": 0, "fail": 0})
                     if st == "ok":
-                        jsonl_ok += 1
                         if day:
                             by_day[day]["ok"] += 1
                     elif st == "risk":
-                        jsonl_risk += 1
                         if day:
                             by_day[day]["risk"] += 1
                     elif st:
-                        jsonl_fail += 1
                         if day:
                             by_day[day]["fail"] += 1
 
@@ -591,6 +592,17 @@ def success_stats():
                                 bucket["total"] += 1
     except Exception:
         pass
+
+    # 全量计数（含归档摘要，轮转不丢数）
+    try:
+        totals = count_results()
+        jsonl_ok = totals.get("ok", 0)
+        jsonl_risk = totals.get("risk", 0)
+        jsonl_fail = totals.get("fail", 0)
+    except Exception:
+        jsonl_ok = jsonl_ok or 0
+        jsonl_risk = jsonl_risk or 0
+        jsonl_fail = jsonl_fail or 0
 
     # normalize window rates
     rates = {}
@@ -760,11 +772,13 @@ def _start_orch_unlocked():
     if add_count > 0:
         c["base_cpa"] = now
         c["target_cpa"] = now + add_count
+        c["base_ok"] = ok_count()
     elif target is None or target <= now:
         n = int(c.get("batch_count") or 40)
         c["add_count"] = n
         c["base_cpa"] = now
         c["target_cpa"] = now + n
+        c["base_ok"] = ok_count()
         add_count = n
     c = save_control(c)
     need = int(c.get("target_cpa") or 0) - now
@@ -830,6 +844,7 @@ def _start_batch_only_unlocked():
     now = cpa_count()
     c["base_cpa"] = now
     c["target_cpa"] = now + count
+    c["base_ok"] = ok_count()
     c = save_control(c)
     logname = LOG_DIR / f"batch-orch-{time.strftime('%Y%m%d-%H%M%S')}-n{count}.log"
     ensure_private_dir(LOG_DIR)
@@ -891,7 +906,8 @@ def snapshot():
     done = ok + fail
     pct = round(100.0 * ok / target, 2) if target else 0
     # 任务级进度（整个任务，而非当前批次）：总数 = target_cpa - base_cpa，
-    # 已完成 = 当前 CPA 相对基线的增量（与 run_until_100 的完成判定一致）。
+    # 已完成 = 注册成功数增量（与是否写 CPA 无关；base_ok 为任务启动时的
+    # 累计成功数基线）。旧任务无 base_ok 时回退 CPA 口径。
     task_total = 0
     task_done = 0
     try:
@@ -899,7 +915,11 @@ def snapshot():
         target_c = int(control.get("target_cpa") or 0)
         if target_c > base_c:
             task_total = target_c - base_c
-            task_done = max(0, min(task_total, cpa - base_c))
+            if control.get("base_ok") is not None:
+                base_ok = int(control.get("base_ok") or 0)
+                task_done = max(0, min(task_total, ok_count() - base_ok))
+            else:
+                task_done = max(0, min(task_total, cpa - base_c))
     except (TypeError, ValueError):
         pass
     eta = None
@@ -1494,6 +1514,16 @@ HTML = r"""<!DOCTYPE html>
   .proxy-table th:nth-child(6) { width: 180px; }
   .proxy-table th:nth-child(7) { width: 74px; }
   .proxy-table th:nth-child(8) { width: 160px; }
+  /* IP 使用统计表：7 列独立列宽（复用 proxy-table 的 fixed 布局，
+     但代理池的 nth-child 宽度不适用，需单独定义避免 IP/国家列重叠） */
+  .ip-usage-table { min-width: 920px; }
+  .ip-usage-table th:nth-child(1) { width: 220px; text-align: left; }
+  .ip-usage-table th:nth-child(2) { width: 110px; }
+  .ip-usage-table th:nth-child(3) { width: 76px; }
+  .ip-usage-table th:nth-child(4) { width: 86px; }
+  .ip-usage-table th:nth-child(5) { width: 170px; }
+  .ip-usage-table th:nth-child(6) { width: 150px; }
+  .ip-usage-table th:nth-child(7) { width: 76px; }
   .proxy-select { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-endpoint { overflow-wrap: anywhere; }
   .proxy-meta { margin-top: 3px; color: var(--muted); font-size: 10px; }
@@ -2264,9 +2294,12 @@ HTML = r"""<!DOCTYPE html>
       </section>
 
       <div class="table-scroll" style="margin-top:12px">
-        <table class="proxy-table">
-          <thead><tr><th>出口 IP</th><th>累计使用次数</th><th>上限占比</th></tr></thead>
-          <tbody id="ip-usage-body"><tr><td colspan="3" class="proxy-empty">正在读取</td></tr></tbody>
+        <table class="proxy-table ip-usage-table">
+          <thead><tr>
+            <th>出口 IP</th><th>国家</th><th>延迟</th>
+            <th>累计次数</th><th>上限占比</th><th>每IP上限</th><th>操作</th>
+          </tr></thead>
+          <tbody id="ip-usage-body"><tr><td colspan="7" class="proxy-empty">正在读取</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -2305,6 +2338,48 @@ HTML = r"""<!DOCTYPE html>
           <span class="mail-provider-meta mono" id="mail-provider-updated">尚未读取</span>
         </div>
         <div class="msg mail-provider-result" id="mail-provider-msg" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="mail-provider-panel" aria-labelledby="email-profiles-label" style="margin-top:12px">
+        <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div class="mail-source-kicker">Multiple configs</div>
+            <h2 style="margin:0;font-size:15px" id="email-profiles-label">多配置档（自动轮流使用）</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">启用多个配置档时，注册自动按顺序轮流使用；验证码取信始终用建号时的同一档。没有配置档时使用上方的单配置。</p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <span class="badge" id="email-profiles-summary">--</span>
+            <button id="email-profiles-refresh" onclick="refreshEmailProfiles(false)">刷新</button>
+            <button class="primary" onclick="openEmailProfileEditor(null)">新增配置档</button>
+          </div>
+        </div>
+        <div class="msg" id="email-profiles-msg" role="status" aria-live="polite"></div>
+        <div class="table-scroll" style="margin-top:8px">
+          <table class="proxy-table">
+            <thead><tr><th>启用</th><th>名称</th><th>提供商</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody id="email-profiles-body"><tr><td colspan="5" class="proxy-empty">正在读取</td></tr></tbody>
+          </table>
+        </div>
+        <div class="mail-provider-fields" id="email-profile-editor" hidden
+             style="margin-top:10px;border:1px solid var(--border);padding:12px;border-radius:2px">
+          <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+            <div class="field" style="flex:1;min-width:180px">
+              <label for="email-profile-name">配置名称</label>
+              <input id="email-profile-name" placeholder="如：CloudMail 主号" autocomplete="off" spellcheck="false"/>
+            </div>
+            <div class="field" style="flex:1;min-width:180px">
+              <label for="email-profile-provider">提供商</label>
+              <select id="email-profile-provider" onchange="renderEmailProfileEditorFields(this.value)">
+                <option value="">--</option>
+              </select>
+            </div>
+            <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+              <button class="primary" onclick="saveEmailProfile()">保存配置档</button>
+              <button onclick="closeEmailProfileEditor()">取消</button>
+            </div>
+          </div>
+          <div class="mail-provider-fields" id="email-profile-fields" style="margin-top:10px"></div>
+        </div>
       </section>
 
       <details class="domain-advanced" id="domain-advanced">
@@ -2593,6 +2668,7 @@ function setAppView(view, options = {}) {
   if (isDomains) {
     refreshEmailProvider();
     refreshEmailDomains();
+    refreshEmailProfiles();
   }
   if (isIpUsage) refreshIpUsage();
   if (options.focus) {
@@ -2945,37 +3021,82 @@ async function refreshIpUsage(silent = true) {
   }
 }
 function renderIpUsage(data) {
-  const counts = data.counts || {};
-  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const items = (data.items || []).slice();
   const limit = Number(data.limit) || 0;
   document.getElementById("ip-usage-heading-label").textContent =
     "共 " + (data.ip_count ?? 0) + " 个 IP / 累计 " + (data.total_usage ?? 0) + " 次"
     + (data.updated_at ? " / 更新 " + esc(data.updated_at) : "");
+  const overCount = items.filter(it => {
+    const eff = Number(it.limit_effective) || 0;
+    return eff > 0 && Number(it.count) >= eff;
+  }).length;
   const summaryValues = [
     ["使用过 IP 数", data.ip_count ?? 0, ""],
     ["累计使用次数", data.total_usage ?? 0, "ok"],
-    ["当前上限", limit > 0 ? limit : "不限", limit > 0 ? "accent" : ""],
-    ["超限 IP 数", limit > 0 ? entries.filter(([, n]) => n >= limit).length : 0, (limit > 0 && entries.some(([, n]) => n >= limit)) ? "fail" : ""],
+    ["全局上限", limit > 0 ? limit : "不限", limit > 0 ? "accent" : ""],
+    ["超限 IP 数", overCount, overCount > 0 ? "fail" : ""],
   ];
   document.getElementById("ip-usage-summary").innerHTML = summaryValues.map(([label, value, cls]) =>
     `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(label)}</div><div class="proxy-summary-value ${cls}">${esc(value)}</div></div>`
   ).join("");
   const limitInput = document.getElementById("ip-usage-limit-page");
   if (limitInput && document.activeElement !== limitInput) limitInput.value = limit;
-  document.getElementById("ip-usage-body").innerHTML = entries.length ? entries.map(([ip, count]) => {
-    const pct = limit > 0 ? Math.min(100, Math.round(100 * count / limit)) : 0;
-    const over = limit > 0 && count >= limit;
+  document.getElementById("ip-usage-body").innerHTML = items.length ? items.map(it => {
+    const ip = String(it.ip || "");
+    const count = Number(it.count) || 0;
+    const eff = Number(it.limit_effective) || 0;
+    const per = it.limit != null ? Number(it.limit) : 0;
+    const pct = eff > 0 ? Math.min(100, Math.round(100 * count / eff)) : 0;
+    const over = eff > 0 && count >= eff;
+    const meta = it.meta || {};
+    const latency = it.latency_ms != null ? it.latency_ms + " ms" : "--";
     return `<tr>
-      <td class="mono">${esc(ip)}</td>
+      <td class="mono">${esc(ip)}${over ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">超限</span>' : ""}</td>
+      <td>${esc(meta.country || "--")}</td>
+      <td class="mono">${esc(latency)}</td>
       <td class="mono">${esc(count)}</td>
-      <td style="min-width:180px">
+      <td style="min-width:160px">
         <div style="display:flex;align-items:center;gap:8px">
-          <div class="bar-wrap" style="flex:1;min-width:100px"><div class="bar" style="width:${pct}%;${over ? "background:var(--danger, #e5484d)" : ""}"></div></div>
-          <span class="mono" style="color:${over ? "var(--danger, #e5484d)" : "var(--muted)"}">${limit > 0 ? pct + "%" : "--"}</span>
+          <div class="bar-wrap" style="flex:1;min-width:90px"><div class="bar" style="width:${pct}%;${over ? "background:var(--danger, #e5484d)" : ""}"></div></div>
+          <span class="mono" style="color:${over ? "var(--danger, #e5484d)" : "var(--muted)"}">${eff > 0 ? pct + "%" : "--"}</span>
         </div>
       </td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          <input type="number" min="0" max="100000" value="${per}" style="width:86px"
+                 title="该 IP 单独上限（0=清除覆盖，使用全局上限）"
+                 data-ip-limit-input="${esc(ip)}"/>
+          <button onclick="savePerIpLimit('${esc(ip)}', this)">保存</button>
+        </div>
+      </td>
+      <td>
+        <button class="danger" onclick="deleteIpUsageItem('${esc(ip)}')" title="删除该 IP 的使用记录、上限与元数据">删除</button>
+      </td>
     </tr>`;
-  }).join("") : '<tr><td colspan="3" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+  }).join("") : '<tr><td colspan="7" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+}
+async function savePerIpLimit(ip, btn) {
+  const input = btn.closest("div").querySelector("input[data-ip-limit-input]");
+  const value = Math.max(0, Math.min(100000, Number(input.value || 0)));
+  try {
+    const j = await api("/api/ip-usage/limit", { method: "POST", body: JSON.stringify({ ip, limit: value }) });
+    setMsg("ip-usage-limit-msg", value > 0
+      ? `已设置 ${ip} 单独上限 ${value}（超出后自动换 IP）`
+      : `已清除 ${ip} 的单独上限，回退全局上限`, "ok");
+    await refreshIpUsage(false);
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  }
+}
+async function deleteIpUsageItem(ip) {
+  if (!confirm("删除 IP " + ip + " 的使用记录？其单独上限与元数据也会一并删除。")) return;
+  try {
+    const j = await api("/api/ip-usage/delete", { method: "POST", body: JSON.stringify({ ip }) });
+    setMsg("ip-usage-limit-msg", j.deleted ? `已删除 ${ip} 的使用记录` : `${ip} 没有使用记录`, j.deleted ? "ok" : "err");
+    await refreshIpUsage(false);
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  }
 }
 async function saveIpUsageLimit() {
   const input = document.getElementById("ip-usage-limit-page");
@@ -3132,6 +3253,138 @@ async function refreshEmailProvider(authHelp = false) {
     document.getElementById("mail-provider-heading-label").textContent = message.includes("令牌") ? "等待令牌" : "读取失败";
     setMsg("mail-provider-msg", message, "err");
   }
+}
+let emailProfilesData = null;
+let editingEmailProfileId = null;
+async function refreshEmailProfiles(authHelp = false) {
+  try {
+    const data = await api("/api/email-profiles?_=" + Date.now(), { authHelp });
+    emailProfilesData = data;
+    renderEmailProfiles(data);
+  } catch (e) {
+    const message = String(e.message || e);
+    document.getElementById("email-profiles-summary").textContent = "读取失败";
+    document.getElementById("email-profiles-body").innerHTML = '<tr><td colspan="5" class="proxy-empty">读取失败</td></tr>';
+    setMsg("email-profiles-msg", message, "err");
+  }
+}
+function renderEmailProfiles(data) {
+  const profiles = data.profiles || [];
+  const summary = data.summary || {};
+  document.getElementById("email-profiles-summary").textContent =
+    "共 " + (summary.total ?? 0) + " 档 / 启用 " + (summary.enabled ?? 0);
+  document.getElementById("email-profiles-body").innerHTML = profiles.length ? profiles.map(p => {
+    const configured = p.configured ? "已配置" : "缺字段";
+    const detail = p.configured
+      ? (Object.keys(p.values || {}).filter(n => p.values[n] !== "" && p.values[n] != null).length + " 项已填")
+      : (p.secret_configured && Object.values(p.secret_configured).some(Boolean) ? "密钥已存" : "未配置");
+    return `<tr>
+      <td><input class="domain-toggle" type="checkbox" aria-label="启用 ${esc(p.name)}" ${p.enabled ? "checked" : ""} onchange="setEmailProfileEnabled('${esc(p.id)}', this.checked)"/></td>
+      <td><div style="font-weight:560">${esc(p.name)}</div><div class="domain-meta">${esc(p.provider_label)} · ${esc(detail)}</div></td>
+      <td>${esc(p.provider_label)}</td>
+      <td><span class="badge ${p.configured ? "ok" : "warn"}">${esc(configured)}</span></td>
+      <td><div class="proxy-actions">
+        <button onclick="openEmailProfileEditor('${esc(p.id)}')">编辑</button>
+        <button onclick="testEmailProfile('${esc(p.id)}')">测试</button>
+        <button class="danger" onclick="deleteEmailProfile('${esc(p.id)}')">删除</button>
+      </div></td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="5" class="proxy-empty">暂无配置档（启用多个配置档后，注册自动轮流使用）</td></tr>';
+}
+function openEmailProfileEditor(profileId) {
+  editingEmailProfileId = profileId || null;
+  const editor = document.getElementById("email-profile-editor");
+  const select = document.getElementById("email-profile-provider");
+  select.innerHTML = (emailProviderData && emailProviderData.providers || []).map(p =>
+    `<option value="${esc(p.id)}">${esc(p.label)}</option>`
+  ).join("");
+  const profile = profileId ? (emailProfilesData && emailProfilesData.profiles || []).find(p => p.id === profileId) : null;
+  document.getElementById("email-profile-name").value = profile ? profile.name : "";
+  select.value = profile ? profile.provider : (emailProviderData && emailProviderData.provider || "");
+  renderEmailProfileEditorFields(select.value, profile);
+  editor.hidden = false;
+  editor.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function renderEmailProfileEditorFields(provider, profile) {
+  const definition = (emailProviderData && emailProviderData.providers || []).find(p => p.id === provider);
+  const container = document.getElementById("email-profile-fields");
+  if (!definition) { container.innerHTML = ""; return; }
+  const values = (profile && profile.values) || {};
+  const secretCfg = (profile && profile.secret_configured) || {};
+  container.innerHTML = (definition.fields || []).map(field => {
+    const name = field.name;
+    const value = values[name] ?? "";
+    const isSecret = field.secret === true;
+    const configured = isSecret && secretCfg[name];
+    let control;
+    if (field.type === "select") {
+      const options = (field.options || []).map(option => {
+        const optionValue = typeof option === "object" ? option.value : option;
+        const optionLabel = typeof option === "object" ? option.label : option;
+        return `<option value="${esc(optionValue)}" ${String(optionValue) === String(value) ? "selected" : ""}>${esc(optionLabel)}</option>`;
+      }).join("");
+      control = `<select id="profile-field-${esc(name)}" data-profile-field="${esc(name)}">${options}</select>`;
+    } else {
+      const placeholder = configured ? "已配置，留空保留" : (field.placeholder || "");
+      const type = isSecret ? "password" : (["url", "email"].includes(field.type) ? field.type : "text");
+      control = `<input id="profile-field-${esc(name)}" data-profile-field="${esc(name)}" type="${type}" value="${isSecret ? "" : esc(value)}" placeholder="${esc(placeholder)}" autocomplete="${isSecret ? "new-password" : "off"}" spellcheck="false"/>`;
+    }
+    return `<div class="field"><label for="profile-field-${esc(name)}">${esc(field.label)}</label>${control}</div>`;
+  }).join("") || '<div class="field"><label>该服务商没有可编辑字段</label></div>';
+}
+function collectEmailProfileFields() {
+  const fields = {};
+  document.querySelectorAll("#email-profile-fields [data-profile-field]").forEach(input => {
+    fields[input.dataset.profileField] = input.value;
+  });
+  return fields;
+}
+async function saveEmailProfile() {
+  const provider = document.getElementById("email-profile-provider").value;
+  if (!provider) { setMsg("email-profiles-msg", "请先选择提供商", "err"); return; }
+  try {
+    const result = await api("/api/email-profiles", { method: "POST", body: JSON.stringify({
+      provider,
+      name: document.getElementById("email-profile-name").value,
+      fields: collectEmailProfileFields(),
+      profile_id: editingEmailProfileId || undefined,
+    }) });
+    setMsg("email-profiles-msg", "配置档「" + result.profile.name + "」已保存", "ok");
+    closeEmailProfileEditor();
+    await refreshEmailProfiles(false);
+  } catch (e) { setMsg("email-profiles-msg", String(e.message || e), "err"); }
+}
+async function setEmailProfileEnabled(profileId, enabled) {
+  try {
+    await api("/api/email-profiles/enabled", { method: "POST", body: JSON.stringify({ profile_id: profileId, enabled }) });
+    setMsg("email-profiles-msg", enabled ? "配置档已启用" : "配置档已停用", "ok");
+    await refreshEmailProfiles(false);
+  } catch (e) {
+    setMsg("email-profiles-msg", String(e.message || e), "err");
+    await refreshEmailProfiles(false);
+  }
+}
+async function deleteEmailProfile(profileId) {
+  const p = (emailProfilesData && emailProfilesData.profiles || []).find(x => x.id === profileId);
+  if (!confirm("删除配置档「" + (p ? p.name : profileId) + "」？")) return;
+  try {
+    await api("/api/email-profiles/delete", { method: "POST", body: JSON.stringify({ profile_id: profileId }) });
+    setMsg("email-profiles-msg", "配置档已删除", "ok");
+    if (editingEmailProfileId === profileId) closeEmailProfileEditor();
+    await refreshEmailProfiles(false);
+  } catch (e) { setMsg("email-profiles-msg", String(e.message || e), "err"); }
+}
+async function testEmailProfile(profileId) {
+  const p = (emailProfilesData && emailProfilesData.profiles || []).find(x => x.id === profileId);
+  setMsg("email-profiles-msg", "正在测试「" + (p ? p.name : "") + "」…", "");
+  try {
+    const result = await api("/api/email-profiles/test", { method: "POST", body: JSON.stringify({ profile_id: profileId }) });
+    setMsg("email-profiles-msg", result.detail || "连接正常", result.ok ? "ok" : "err");
+  } catch (e) { setMsg("email-profiles-msg", String(e.message || e), "err"); }
+}
+function closeEmailProfileEditor() {
+  document.getElementById("email-profile-editor").hidden = true;
+  editingEmailProfileId = null;
 }
 async function saveEmailProviderConfig() {
   const button = document.getElementById("mail-provider-save");
@@ -3680,7 +3933,7 @@ refreshRecovery();
 setInterval(refreshRecovery, 5000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
-  if (document.body.classList.contains("domain-view-open")) refreshEmailDomains(false);
+  if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
   if (document.body.classList.contains("ip-usage-view-open")) refreshIpUsage(false);
 }, 3000);
 </script>
@@ -3796,7 +4049,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-domains"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-profiles", "/api/email-domains"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -3843,23 +4096,77 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/ip-usage":
             try:
-                from ip_usage_store import get_all_ip_usage, get_total_usage, usage_file_path
+                from ip_usage_store import (
+                    get_all_ip_usage_detail,
+                    get_total_usage,
+                    set_ip_usage_meta,
+                    usage_file_path,
+                )
+                from browser_session import lookup_exit_meta
 
-                counts = get_all_ip_usage()
                 control = load_control()
+                global_limit = int(control.get("ip_usage_limit", 0) or 0)
                 updated = ""
                 try:
                     data = json.loads(usage_file_path().read_text(encoding="utf-8"))
                     updated = str(data.get("updated_at") or "")
                 except Exception:
                     pass
+                items = get_all_ip_usage_detail()
+                # 延迟/服务商：优先复用代理池里该出口的探测结果
+                latency_by_ip: dict[str, int] = {}
+                isp_by_ip: dict[str, str] = {}
+                try:
+                    pool = read_proxy_pool(page_size=500)
+                    for item in pool.get("items") or []:
+                        ip = str(item.get("exit_ip") or "").strip()
+                        if not ip:
+                            continue
+                        if item.get("latency_ms") is not None:
+                            latency_by_ip[ip] = int(item["latency_ms"])
+                        if item.get("asn_org"):
+                            isp_by_ip.setdefault(ip, str(item["asn_org"]))
+                except Exception:
+                    pass
+                # 元数据懒查询：只查有次数、尚无 meta 且不在失败冷却期的 IP。
+                # 每轮最多 3 个，避免地理 API 不可达时拖垮轮询（失败 IP 记
+                # 10 分钟冷却；成功结果由 lookup_exit_meta 进程内缓存复用）。
+                lazy = 0
+                now_ts = time.monotonic()
+                for item in items:
+                    ip = item["ip"]
+                    meta = item.get("meta") or {}
+                    if not meta and item.get("count", 0) > 0 and lazy < 3:
+                        if _ip_usage_meta_fail_until.get(ip, 0) > now_ts:
+                            continue
+                        lazy += 1
+                        info = lookup_exit_meta(ip)
+                        if info.get("status") == "success":
+                            meta = {
+                                "country": str(info.get("country") or ""),
+                                "isp": str(info.get("isp") or ""),
+                                "org": str(info.get("org") or ""),
+                                "asn": str(info.get("as") or ""),
+                            }
+                            try:
+                                set_ip_usage_meta(ip, meta)
+                            except Exception:
+                                pass
+                        else:
+                            _ip_usage_meta_fail_until[ip] = now_ts + 600
+                    item["meta"] = meta
+                    item["latency_ms"] = latency_by_ip.get(ip)
+                    item["isp_label"] = isp_by_ip.get(ip) or meta.get("isp") or meta.get("org") or ""
+                    # 生效上限：该 IP 单独覆盖优先，否则回退全局
+                    per = item.get("limit")
+                    item["limit_effective"] = int(per) if per else global_limit
                 self._json(
                     200,
                     {
-                        "counts": counts,
-                        "ip_count": len(counts),
+                        "items": items,
+                        "ip_count": len(items),
                         "total_usage": get_total_usage(),
-                        "limit": int(control.get("ip_usage_limit", 0) or 0),
+                        "limit": global_limit,
                         "updated_at": updated,
                     },
                 )
@@ -3869,6 +4176,14 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/email-provider":
             try:
                 self._json(200, read_email_provider_config())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-profiles":
+            try:
+                from webui.email_provider_store import list_email_profiles
+
+                self._json(200, list_email_profiles())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -3892,6 +4207,45 @@ class Handler(BaseHTTPRequestHandler):
             return
         except ValueError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
+            return
+        if u.path == "/api/ip-usage/delete":
+            try:
+                from ip_usage_store import delete_ip_usage
+
+                ip = str((body or {}).get("ip") or "").strip()
+                if not ip:
+                    self._json(400, {"ok": False, "error": "缺少 ip 参数"})
+                    return
+                deleted = delete_ip_usage(ip)
+                self._json(200, {"ok": True, "deleted": deleted})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-usage/limit":
+            try:
+                from ip_usage_store import set_ip_usage_limit
+
+                ip = str((body or {}).get("ip") or "").strip()
+                if not ip:
+                    self._json(400, {"ok": False, "error": "缺少 ip 参数"})
+                    return
+                try:
+                    limit = max(0, min(100000, int((body or {}).get("limit") or 0)))
+                except (TypeError, ValueError):
+                    self._json(400, {"ok": False, "error": "limit 必须为 0..100000 的整数"})
+                    return
+                set_ip_usage_limit(ip, limit)
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "ip": ip,
+                        "limit": limit if limit > 0 else None,
+                        "note": "0=清除覆盖，回退全局上限",
+                    },
+                )
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/control":
             try:
@@ -3987,6 +4341,57 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("settings") or {},
                     clear_secrets=body.get("clear_secrets"),
                 )
+                self._json(200 if result.get("ok") else 424, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-profiles":
+            try:
+                from webui.email_provider_store import save_email_profile
+
+                result = save_email_profile(
+                    body.get("provider"),
+                    body.get("fields") or {},
+                    name=body.get("name"),
+                    enabled=body.get("enabled"),
+                    profile_id=body.get("profile_id"),
+                    clear_secrets=body.get("clear_secrets"),
+                )
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-profiles/delete":
+            try:
+                from webui.email_provider_store import delete_email_profile
+
+                deleted = delete_email_profile(body.get("profile_id"))
+                self._json(200, {"ok": True, "deleted": deleted})
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-profiles/enabled":
+            try:
+                from webui.email_provider_store import set_email_profile_enabled
+
+                result = set_email_profile_enabled(body.get("profile_id"), body.get("enabled"))
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/email-profiles/test":
+            try:
+                from webui.email_provider_store import test_email_profile
+
+                result = test_email_profile(body.get("profile_id"))
                 self._json(200 if result.get("ok") else 424, result)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})

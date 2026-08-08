@@ -557,6 +557,118 @@ def test_start_reports_unavailable_process_table():
             os.environ["MONITOR_TOKEN"] = previous_token
 
 
+def test_ip_usage_api_delete_and_per_ip_limit():
+    import browser_session
+    import ip_usage_store
+
+    token = "test-ip-usage-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = ip_usage_store._USAGE_FILE
+    previous_lookup = browser_session.lookup_exit_meta
+    previous_control = monitor.load_control
+    with tempfile.TemporaryDirectory() as temp:
+        ip_usage_store._USAGE_FILE = Path(temp) / "log" / "ip_usage.json"
+        browser_session.lookup_exit_meta = lambda ip: {
+            "status": "success",
+            "country": "美国",
+            "isp": "TEST ISP",
+            "org": "TEST ORG",
+            "as": "AS12345",
+        }
+        # 隔离全局上限：真实 control 文件可能设置了 ip_usage_limit
+        monitor.load_control = lambda: {"ip_usage_limit": 0}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            ip_usage_store.record_ip_usage("203.0.113.7", times=3)
+            ip_usage_store.record_ip_usage("203.0.113.8", times=1)
+
+            status, _, _ = request(base + "/api/ip-usage")
+            assert status == 401
+            status, _, body = request(base + "/api/ip-usage", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            items = {it["ip"]: it for it in payload["items"]}
+            assert payload["total_usage"] == 4
+            assert items["203.0.113.7"]["count"] == 3
+            assert items["203.0.113.7"]["meta"]["country"] == "美国"
+            assert items["203.0.113.7"]["meta"]["asn"] == "AS12345"
+            # 未设置覆盖 → limit None，生效值回退全局（0=不限）
+            assert items["203.0.113.7"]["limit"] is None
+            assert items["203.0.113.7"]["limit_effective"] == 0
+
+            # 每 IP 上限：设置 → 生效值优先；清除 → 回退全局
+            status, _, _ = request(
+                base + "/api/ip-usage/limit",
+                method="POST",
+                body=json.dumps({"ip": "203.0.113.7", "limit": 5}).encode("utf-8"),
+            )
+            assert status == 401
+            status, _, body = request(
+                base + "/api/ip-usage/limit",
+                token=token,
+                method="POST",
+                body=json.dumps({"ip": "203.0.113.7", "limit": 5}).encode("utf-8"),
+            )
+            assert status == 200
+            assert json.loads(body)["limit"] == 5
+            status, _, body = request(base + "/api/ip-usage", token=token)
+            items = {it["ip"]: it for it in json.loads(body)["items"]}
+            assert items["203.0.113.7"]["limit"] == 5
+            assert items["203.0.113.7"]["limit_effective"] == 5
+
+            # 删除单条
+            status, _, _ = request(
+                base + "/api/ip-usage/delete",
+                method="POST",
+                body=json.dumps({"ip": "203.0.113.7"}).encode("utf-8"),
+            )
+            assert status == 401
+            status, _, body = request(
+                base + "/api/ip-usage/delete",
+                token=token,
+                method="POST",
+                body=json.dumps({"ip": "203.0.113.7"}).encode("utf-8"),
+            )
+            assert status == 200
+            assert json.loads(body)["deleted"] is True
+            status, _, body = request(base + "/api/ip-usage", token=token)
+            payload = json.loads(body)
+            ips = [it["ip"] for it in payload["items"]]
+            assert "203.0.113.7" not in ips
+            assert "203.0.113.8" in ips
+
+            # 参数校验：缺 ip / 非法 limit
+            status, _, body = request(
+                base + "/api/ip-usage/delete",
+                token=token,
+                method="POST",
+                body=b"{}",
+            )
+            assert status == 400
+            status, _, body = request(
+                base + "/api/ip-usage/limit",
+                token=token,
+                method="POST",
+                body=json.dumps({"ip": "203.0.113.8", "limit": "abc"}).encode("utf-8"),
+            )
+            assert status == 400
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            ip_usage_store._USAGE_FILE = previous_file
+            browser_session.lookup_exit_meta = previous_lookup
+            monitor.load_control = previous_control
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
 if __name__ == "__main__":
     test_proxy_start_prerequisites()
     test_kill_all_verifies_process_exit()
@@ -567,4 +679,5 @@ if __name__ == "__main__":
     test_non_loopback_requires_token()
     test_log_cleanup_api_requires_auth_and_returns_summary()
     test_start_reports_unavailable_process_table()
+    test_ip_usage_api_delete_and_per_ip_limit()
     print("OK monitor http")

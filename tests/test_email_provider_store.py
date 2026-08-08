@@ -185,10 +185,150 @@ def test_cloudflare_connectivity_uses_configured_port():
     assert calls == [("mail.example.com", 8793)]
 
 
+class IsolatedProfiles:
+    """把 profiles 存储隔离到临时目录（不污染真实 log/）。"""
+
+    def __enter__(self):
+        self.temp = tempfile.TemporaryDirectory()
+        base = Path(self.temp.name)
+        self.previous = (
+            email_provider_store.PROFILES_PATH,
+            email_provider_store.PROFILES_LOCK_PATH,
+        )
+        email_provider_store.PROFILES_PATH = base / "log" / "email_provider_profiles.json"
+        email_provider_store.PROFILES_LOCK_PATH = email_provider_store.PROFILES_PATH.with_suffix(
+            ".lock"
+        )
+        return email_provider_store.PROFILES_PATH
+
+    def __exit__(self, exc_type, exc, tb):
+        email_provider_store.PROFILES_PATH, email_provider_store.PROFILES_LOCK_PATH = self.previous
+        self.temp.cleanup()
+
+
+def _cloudmail_fields(url="https://mail.example.com"):
+    return {
+        "cloudmail_url": url,
+        "cloudmail_admin_email": "admin@example.com",
+        "cloudmail_password": "secret-value",
+        "defaultDomains": "mail.example.com, inbox.example.net",
+    }
+
+
+def test_profiles_crud_enable_and_secret_preservation():
+    with IsolatedProfiles() as profiles_path:
+        # 初始为空
+        state = email_provider_store.list_email_profiles()
+        assert state["summary"] == {"total": 0, "enabled": 0}
+
+        first = email_provider_store.save_email_profile(
+            "cloudmail", _cloudmail_fields(), name="主号"
+        )
+        first_id = first["profile"]["id"]
+        assert first["profile"]["name"] == "主号"
+        assert first["profile"]["configured"] is True
+        assert first["profile"]["secret_configured"]["cloudmail_password"] is True
+        assert first["profile"]["values"]["cloudmail_password"] == ""
+
+        second = email_provider_store.save_email_profile(
+            "moemail",
+            {
+                "moemail_api_base": "https://mail-two.example.com",
+                "moemail_api_key": "key-two",
+            },
+            name="",
+        )
+        second_id = second["profile"]["id"]
+        assert second["profile"]["name"] == "MoeMail 配置"  # 名称缺省自动生成
+
+        state = email_provider_store.list_email_profiles()
+        assert state["summary"] == {"total": 2, "enabled": 2}
+
+        # 更新：留空 secret 保留原值；显式 clear_secrets 清除
+        email_provider_store.save_email_profile(
+            "cloudmail",
+            {"cloudmail_admin_email": "boss@example.com"},
+            profile_id=first_id,
+            name="主号改名",
+        )
+        state = email_provider_store.list_email_profiles()
+        profile = next(p for p in state["profiles"] if p["id"] == first_id)
+        assert profile["name"] == "主号改名"
+        assert profile["secret_configured"]["cloudmail_password"] is True
+        raw = json.loads(profiles_path.read_text(encoding="utf-8"))
+        stored = next(p for p in raw["profiles"] if p["id"] == first_id)
+        assert stored["fields"]["cloudmail_password"] == "secret-value"
+
+        email_provider_store.save_email_profile(
+            "cloudmail",
+            {},
+            profile_id=first_id,
+            clear_secrets=["cloudmail_password"],
+        )
+        state = email_provider_store.list_email_profiles()
+        profile = next(p for p in state["profiles"] if p["id"] == first_id)
+        assert profile["secret_configured"]["cloudmail_password"] is False
+        assert profile["configured"] is False
+
+        # 停用后运行时列表只返回启用的
+        email_provider_store.set_email_profile_enabled(second_id, False)
+        enabled = email_provider_store.get_enabled_email_profiles()
+        assert [p["id"] for p in enabled] == [first_id]
+        email_provider_store.set_email_profile_enabled(second_id, True)
+        enabled = email_provider_store.get_enabled_email_profiles()
+        assert [p["id"] for p in enabled] == [first_id, second_id]
+        assert enabled[1]["fields"]["moemail_api_key"] == "key-two"
+
+        # 删除
+        assert email_provider_store.delete_email_profile(first_id) is True
+        assert email_provider_store.delete_email_profile(first_id) is False
+        state = email_provider_store.list_email_profiles()
+        assert state["summary"]["total"] == 1
+
+        # 文件权限
+        if os.name == "posix":
+            assert stat.S_IMODE(profiles_path.stat().st_mode) == 0o600
+
+
+def test_profiles_validation_and_errors():
+    with IsolatedProfiles():
+        assert_config_error(
+            lambda: email_provider_store.save_email_profile(
+                "cloudflare", {"proxy": "http://not-allowed.example"}
+            )
+        )
+        assert_config_error(
+            lambda: email_provider_store.save_email_profile("unknown", {})
+        )
+        assert_config_error(
+            lambda: email_provider_store.delete_email_profile("missing-id")
+            or email_provider_store.set_email_profile_enabled("missing-id", True)
+        )
+        assert_config_error(
+            lambda: email_provider_store.test_email_profile("missing-id")
+        )
+
+
+def test_profiles_do_not_touch_legacy_config():
+    """profiles 操作不得改动顶层 config.json（旧单配置完全独立）。"""
+    with IsolatedProfiles():
+        with IsolatedConfig() as config_path:
+            email_provider_store.save_email_provider_config(
+                "cloudmail", _cloudmail_fields()
+            )
+            before = config_path.read_text(encoding="utf-8")
+            email_provider_store.save_email_profile("moemail", {"moemail_api_key": "k"})
+            assert config_path.read_text(encoding="utf-8") == before
+            assert email_provider_store.list_email_profiles()["has_legacy_config"] is True
+
+
 if __name__ == "__main__":
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
     test_validation_rejects_unknown_fields_and_unsafe_values()
     test_connectivity_uses_unsaved_form_and_preserves_saved_secret()
     test_cloudflare_connectivity_uses_configured_port()
+    test_profiles_crud_enable_and_secret_preservation()
+    test_profiles_validation_and_errors()
+    test_profiles_do_not_touch_legacy_config()
     print("OK email provider store")
