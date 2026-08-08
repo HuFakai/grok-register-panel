@@ -249,6 +249,9 @@ DEFAULT_CONFIG = {
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
     "cloudflare_custom_auth": "",
+    # catch-all 免建号：配置服务端 JWT_SECRET 后，注册直接用随机地址 +
+    # 自签地址 JWT 收信，跳过 /admin/new_address 建号；留空则走 admin 建号
+    "cloudflare_jwt_secret": "",
     # 建号时是否把域名随机化成随机子域（默认否：多数服务端只接受已配置域名，
     # 子域匹配需服务端开启 ENABLE_CREATE_ADDRESS_SUBDOMAIN_MATCH）
     "cloudflare_randomize_subdomain": False,
@@ -1118,6 +1121,51 @@ def cloudflare_create_temp_address(api_base, domain=""):
     )
 
 
+def get_cloudflare_jwt_secret() -> str:
+    """服务端 JWT_SECRET（catch-all 免建号时用于自签地址 JWT）。"""
+    return str(_profile_value("cloudflare_jwt_secret") or "").strip()
+
+
+def _sign_cloudflare_address_jwt(secret: str, address: str, address_id: int = 0) -> str:
+    """按服务端格式自签地址 JWT：HS256，payload={address, address_id}。
+
+    仅用标准库实现（base64/hashlib/hmac），不依赖 pyjwt。
+    """
+    import base64
+    import hashlib
+    import hmac
+
+    def _b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+    payload = _b64url(
+        json.dumps(
+            {"address": str(address), "address_id": int(address_id or 0)},
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    signing = f"{header}.{payload}".encode("utf-8")
+    signature = _b64url(
+        hmac.new(str(secret).encode("utf-8"), signing, hashlib.sha256).digest()
+    )
+    return f"{header}.{payload}.{signature}"
+
+
+def cloudflare_catchall_email_and_token(jwt_secret: str, domain: str = "") -> tuple[str, str]:
+    """catch-all 免建号：生成随机地址，用服务端 JWT_SECRET 自签收信 JWT。
+
+    要求服务端开启 catch-all（任意 xxx@域名 可直接收信），不调用建号 API。
+    返回 (address, jwt)。
+    """
+    base_domain = str(domain or "").strip() or cloudflare_next_default_domain()
+    if not base_domain:
+        raise Exception("Cloudflare catch-all 未配置收信域名（defaultDomains）")
+    address = f"{generate_username(10)}@{base_domain}"
+    jwt = _sign_cloudflare_address_jwt(jwt_secret, address, 0)
+    return address, jwt
+
+
 MAILNEST_API_BASE = mailnest_provider.API_BASE
 MAILNEST_DEFAULT_PROJECT_CODE = mailnest_provider.DEFAULT_PROJECT_CODE
 
@@ -1983,25 +2031,41 @@ def get_email_and_token(api_key=None):
         api_base = get_cloudflare_api_base()
         if not api_base:
             raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            result = cloudflare_create_temp_address(api_base, domain=managed_domain)
-        except Exception as primary_exc:
+
+        def _admin_create():
+            """admin 建号 + fallback（catch-all 不可用时的回退路径）。"""
             try:
-                result = cloudflare_provider.create_mailbox_fallback(
-                    http_get,
-                    http_post,
-                    api_base,
-                    domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
-                    accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
-                    token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
-                    api_key=api_key or get_cloudflare_api_key(),
-                    auth_mode=get_cloudflare_auth_mode(),
-                    custom_auth=get_cloudflare_custom_auth(),
-                    domain=managed_domain,
+                # cloudflare_temp_email 专用模式
+                return cloudflare_create_temp_address(api_base, domain=managed_domain)
+            except Exception as primary_exc:
+                try:
+                    return cloudflare_provider.create_mailbox_fallback(
+                        http_get,
+                        http_post,
+                        api_base,
+                        domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
+                        accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
+                        token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
+                        api_key=api_key or get_cloudflare_api_key(),
+                        auth_mode=get_cloudflare_auth_mode(),
+                        custom_auth=get_cloudflare_custom_auth(),
+                        domain=managed_domain,
+                    )
+                except Exception:
+                    raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+
+        # catch-all 免建号优先：配置了 JWT_SECRET 时用随机地址 + 自签 JWT
+        # 收信，跳过建号 API；任何异常回退 admin 建号
+        jwt_secret = get_cloudflare_jwt_secret()
+        if jwt_secret:
+            try:
+                result = cloudflare_catchall_email_and_token(
+                    jwt_secret, domain=managed_domain
                 )
             except Exception:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+                result = _admin_create()
+        else:
+            result = _admin_create()
     elif provider == "mailnest":
         result = mailnest_buy_email(), "_"
     else:
