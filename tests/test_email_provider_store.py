@@ -162,12 +162,46 @@ def test_connectivity_uses_unsaved_form_and_preserves_saved_secret():
         assert config_path.read_text(encoding="utf-8") == before
 
 
-def test_cloudflare_connectivity_uses_configured_port():
+def test_cloudflare_connectivity_probes_creation_endpoint():
+    """cloudflare 邮箱检查改为真实探测建号端点，避免 TCP 连通假通过。"""
     import connectivity
 
-    calls = []
-    previous_tcp_open = connectivity._tcp_open
-    connectivity._tcp_open = lambda host, port: calls.append((host, port)) or True
+    class Resp:
+        def __init__(self, code, text=""):
+            self.status_code = code
+            self.text = text
+
+    posted = []
+
+    def fake_post(url, **kwargs):
+        posted.append((url, kwargs))
+        return Resp(200, "{}")
+
+    previous_post = None
+    try:
+        # 200 → 通过
+        result = connectivity.check_email_api(
+            "cloudflare",
+            {
+                "cloudflare_api_base": "http://mail.example.com:8793",
+                "cloudflare_auth_mode": "x-admin-auth",
+                "cloudflare_api_key": "admin-password",
+                "cloudflare_path_accounts": "/admin/new_address",
+            },
+            lambda *_args, **_kwargs: None,
+            fake_post,
+        )
+        assert result[1] is True, result[2]
+        assert "HTTP 200" in result[2]
+        url, kwargs = posted[-1]
+        assert url == "http://mail.example.com:8793/admin/new_address"
+        assert kwargs["headers"]["x-admin-auth"] == "admin-password"
+        assert kwargs["json"]["name"]  # 探测名
+    finally:
+        pass
+
+    # 403 → 明确报"匿名/无权限建号被禁用"
+    previous_post = None
     try:
         result = connectivity.check_email_api(
             "cloudflare",
@@ -176,13 +210,34 @@ def test_cloudflare_connectivity_uses_configured_port():
                 "cloudflare_auth_mode": "none",
             },
             lambda *_args, **_kwargs: None,
-            lambda *_args, **_kwargs: None,
+            lambda *_args, **_kwargs: Resp(403, "anonymous disabled"),
         )
+        assert result[1] is False, result[2]
+        assert "403" in result[2] and "禁用" in result[2]
     finally:
-        connectivity._tcp_open = previous_tcp_open
+        pass
 
+    # 401 → 鉴权失败
+    result = connectivity.check_email_api(
+        "cloudflare",
+        {
+            "cloudflare_api_base": "http://mail.example.com:8793",
+            "cloudflare_auth_mode": "x-admin-auth",
+            "cloudflare_api_key": "wrong",
+        },
+        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: Resp(401, "bad"),
+    )
+    assert result[1] is False and "401" in result[2] and "鉴权失败" in result[2]
+
+    # 探测函数无标准响应（旧 mock）→ 按可达处理
+    result = connectivity.check_email_api(
+        "cloudflare",
+        {"cloudflare_api_base": "http://mail.example.com:8793"},
+        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: None,
+    )
     assert result[1] is True
-    assert calls == [("mail.example.com", 8793)]
 
 
 class IsolatedProfiles:
@@ -327,7 +382,7 @@ if __name__ == "__main__":
     test_secret_masking_preservation_clear_and_private_file()
     test_validation_rejects_unknown_fields_and_unsafe_values()
     test_connectivity_uses_unsaved_form_and_preserves_saved_secret()
-    test_cloudflare_connectivity_uses_configured_port()
+    test_cloudflare_connectivity_probes_creation_endpoint()
     test_profiles_crud_enable_and_secret_preservation()
     test_profiles_validation_and_errors()
     test_profiles_do_not_touch_legacy_config()

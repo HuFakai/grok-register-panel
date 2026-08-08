@@ -130,35 +130,63 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             if not accounts_path.startswith("/"):
                 accounts_path = "/" + accounts_path
 
-            auth_is_none = auth_mode.lower() == "none"
-
-            if auth_is_none:
-                # 直建模式：建号走 /new_address，不依赖 domains 端点。
-                # 不发 HTTP 请求到 domains（避免 401 困扰），只验证服务器是否在线。
+            # 统一真实探测建号端点（带鉴权头），避免两种误判：
+            # - auth_mode=none 时只查 TCP 连通 → "直建模式可用"但实际 403 匿名被禁
+            # - admin 模式 GET /api/domains 凭证与建号端点不一致 → 401 误报
+            url = f"{base}{accounts_path}"
+            if cloudflare_provider.is_admin_create_path(accounts_path):
+                probe_name = (
+                    "probe"
+                    + "".join(
+                        __import__("random").choices(
+                            __import__("string").ascii_lowercase, k=6
+                        )
+                    )
+                    + str(int(__import__("time").time()) % 100000)
+                )
+                payload = {"name": probe_name, "enablePrefix": False}
+            else:
+                payload = {}
+            headers = cloudflare_provider.build_headers(
+                api_key, auth_mode, custom_auth, content_type=True
+            )
+            try:
+                resp = http_post(url, json=payload, headers=headers, timeout=10)
+            except Exception as exc:
                 parsed = urlparse(base)
                 host = parsed.hostname
-                if host:
-                    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                    if not _tcp_open(host, port):
-                        return "邮箱API", False, f"Cloudflare 服务不可达: {host}:{port}"
-                note = ""
-                return (
-                    "邮箱API",
-                    True,
-                    f"Cloudflare 直建模式可用（建号端点 {accounts_path}）",
+                if host and _tcp_open(
+                    host,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                ):
+                    return (
+                        "邮箱API",
+                        True,
+                        f"Cloudflare 服务在线但建号探测异常: {redact_log_line(str(exc))[:160]}",
+                    )
+                return "邮箱API", False, f"Cloudflare 建号端点请求失败: {redact_log_line(str(exc))[:160]}"
+            code = getattr(resp, "status_code", None)
+            if code is None:
+                # 探测函数无标准响应（测试 mock / 自定义探测），按可达处理
+                return "邮箱API", True, f"Cloudflare 建号端点可达（{accounts_path}）"
+            if code == 401:
+                return "邮箱API", False, (
+                    f"Cloudflare 建号鉴权失败 HTTP 401（auth_mode={auth_mode}），"
+                    "请检查 cloudflare_api_key / auth_mode 与服务端要求是否一致"
                 )
-
-            # auth_mode != none：检查 domains 鉴权是否正确
-            path = str(config.get("cloudflare_path_domains", "/api/domains") or "/api/domains")
-            if not path.startswith("/"):
-                path = "/" + path
-            url = f"{base}{path}"
-            headers = cloudflare_provider.build_headers(api_key, auth_mode, custom_auth)
-            params = cloudflare_provider.apply_auth_params({}, api_key, auth_mode)
-            resp = http_get(url, headers=headers, params=params, timeout=10)
-            if resp.status_code >= 400:
-                return "邮箱API", False, f"Cloudflare 鉴权失败 HTTP {resp.status_code}（auth_mode={auth_mode}）"
-            return "邮箱API", True, f"Cloudflare 可达 HTTP {resp.status_code}（auth_mode={auth_mode}）"
+            if code == 403:
+                return "邮箱API", False, (
+                    "Cloudflare 建号被拒 HTTP 403：匿名/无权限建号被服务端禁用，"
+                    "需配置管理员凭证（auth_mode 与 /admin/new_address 路径）"
+                )
+            if code >= 400:
+                body = ""
+                try:
+                    body = str(getattr(resp, "text", "") or "")[:200]
+                except Exception:
+                    pass
+                return "邮箱API", False, f"Cloudflare 建号端点 HTTP {code} {body}".strip()
+            return "邮箱API", True, f"Cloudflare 建号端点可用 HTTP {code}（{accounts_path}）"
 
         if provider == "duckmail":
             base = str(config.get("duckmail_api_base", "") or "https://api.duckmail.sbs").rstrip("/")

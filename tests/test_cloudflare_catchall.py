@@ -20,7 +20,7 @@ def _decode_payload(jwt: str) -> dict:
 
 
 def test_sign_cloudflare_address_jwt_format():
-    secret = "d427bf9e533472c4d1fc175e0d29fbf7387a0b88ca0d4f508cc2a3026b5e78c0"
+    secret = "test-secret-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     jwt = app._sign_cloudflare_address_jwt(secret, "test@example.com", 7)
     parts = jwt.split(".")
     assert len(parts) == 3, "JWT 应为三段"
