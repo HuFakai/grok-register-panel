@@ -135,9 +135,6 @@ ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
 MAX_REQUEST_BODY = 64 * 1024
-# IP 元数据懒查询失败冷却：{ip: monotonic 截止时间}，地理 API 不可达时
-# 避免每轮轮询都重试同一批 IP 拖慢 /api/ip-usage
-_ip_usage_meta_fail_until: dict[str, float] = {}
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -1544,14 +1541,19 @@ HTML = r"""<!DOCTYPE html>
   .proxy-table th:nth-child(8) { width: 160px; }
   /* IP 使用统计表：7 列独立列宽（复用 proxy-table 的 fixed 布局，
      但代理池的 nth-child 宽度不适用，需单独定义避免 IP/国家列重叠） */
-  .ip-usage-table { min-width: 920px; }
+  .ip-usage-table { min-width: 720px; }
   .ip-usage-table th:nth-child(1) { width: 220px; text-align: left; }
-  .ip-usage-table th:nth-child(2) { width: 110px; }
-  .ip-usage-table th:nth-child(3) { width: 76px; }
-  .ip-usage-table th:nth-child(4) { width: 86px; }
-  .ip-usage-table th:nth-child(5) { width: 170px; }
-  .ip-usage-table th:nth-child(6) { width: 150px; }
-  .ip-usage-table th:nth-child(7) { width: 76px; }
+  .ip-usage-table th:nth-child(2) { width: 86px; }
+  .ip-usage-table th:nth-child(3) { width: 170px; }
+  .ip-usage-table th:nth-child(4) { width: 150px; }
+  .ip-usage-table th:nth-child(5) { width: 76px; }
+  .ip-pool-table { min-width: 700px; }
+  .ip-pool-table th:nth-child(1) { width: 220px; text-align: left; }
+  .ip-pool-table th:nth-child(2) { width: 86px; }
+  .ip-pool-table th:nth-child(3) { width: 76px; }
+  .ip-pool-table th:nth-child(4) { width: 110px; }
+  .ip-pool-table th:nth-child(5) { width: 110px; }
+  .ip-pool-table th:nth-child(6) { width: 90px; }
   .proxy-select { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-endpoint { overflow-wrap: anywhere; }
   .proxy-meta { margin-top: 3px; color: var(--muted); font-size: 10px; }
@@ -2331,6 +2333,34 @@ HTML = r"""<!DOCTYPE html>
 
       <div class="proxy-summary" id="ip-usage-summary"></div>
 
+      <section class="mail-provider-panel" aria-labelledby="ip-pool-label">
+        <div class="mail-provider-toolbar">
+          <div>
+            <div class="mail-source-kicker">Ready IP pool</div>
+            <h2 id="ip-pool-label">可用 IP 池（预筛可用出口，worker 优先取用）</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
+              面板后台批量探测 sticky 身份，筛出未超限出口写入池；注册 worker 换口时优先从这里取已确认可用的身份（不再随机碰运气）。身份在会话有效期（默认 10 分钟）内有效，过期自动清理并补充。
+            </p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <button class="primary" id="ip-pool-probe-btn" onclick="probeIpPool()">立即探测</button>
+            <span class="mail-provider-meta mono" id="ip-pool-status">--</span>
+          </div>
+        </div>
+        <div class="msg" id="ip-pool-msg" role="status" aria-live="polite"></div>
+        <details class="domain-advanced" id="ip-pool-details">
+          <summary><span class="domain-advanced-title" id="ip-pool-summary-label">查看池详情</span></summary>
+          <div class="table-scroll" style="margin-top:8px">
+            <table class="proxy-table ip-pool-table">
+              <thead><tr>
+                <th>出口 IP</th><th>累计次数</th><th>上限</th><th>状态</th><th>剩余有效期</th><th>占用</th>
+              </tr></thead>
+              <tbody id="ip-pool-body"><tr><td colspan="6" class="proxy-empty">暂无数据</td></tr></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
       <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
         <div class="mail-provider-toolbar">
           <div class="field">
@@ -2349,10 +2379,10 @@ HTML = r"""<!DOCTYPE html>
       <div class="table-scroll" style="margin-top:12px">
         <table class="proxy-table ip-usage-table">
           <thead><tr>
-            <th>出口 IP</th><th>国家</th><th>延迟</th>
+            <th>出口 IP</th>
             <th>累计次数</th><th>上限占比</th><th>每IP上限</th><th>操作</th>
           </tr></thead>
-          <tbody id="ip-usage-body"><tr><td colspan="7" class="proxy-empty">正在读取</td></tr></tbody>
+          <tbody id="ip-usage-body"><tr><td colspan="5" class="proxy-empty">正在读取</td></tr></tbody>
         </table>
       </div>
       <div class="proxy-pagination">
@@ -3165,12 +3195,8 @@ function renderIpUsage(data) {
     const per = it.limit != null ? Number(it.limit) : 0;
     const pct = eff > 0 ? Math.min(100, Math.round(100 * count / eff)) : 0;
     const over = eff > 0 && count >= eff;
-    const meta = it.meta || {};
-    const latency = it.latency_ms != null ? it.latency_ms + " ms" : "--";
     return `<tr>
       <td class="mono">${esc(ip)}${over ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">超限</span>' : ""}</td>
-      <td>${esc(meta.country || "--")}</td>
-      <td class="mono">${esc(latency)}</td>
       <td class="mono">${esc(count)}</td>
       <td style="min-width:160px">
         <div style="display:flex;align-items:center;gap:8px">
@@ -3190,7 +3216,51 @@ function renderIpUsage(data) {
         <button class="danger" onclick="deleteIpUsageItem('${esc(ip)}')" title="删除该 IP 的使用记录、上限与元数据">删除</button>
       </td>
     </tr>`;
-  }).join("") : '<tr><td colspan="7" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+  }).join("") : '<tr><td colspan="5" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+}
+async function refreshIpPool(silent) {
+  try {
+    const j = await api("/api/ip-pool?_=" + Date.now(), { authHelp: !silent });
+    const st = j.stats || {};
+    const label = document.getElementById("ip-pool-status");
+    if (label) label.textContent = "可用 " + (st.usable ?? 0) + " / 总数 " + (st.total ?? 0)
+      + " / 超限 " + (st.over_limit ?? 0) + " / 占用 " + (st.in_use ?? 0)
+      + (j.updated_at ? " / 更新 " + esc(j.updated_at) : "");
+    const rows = (j.items || []).map(it => {
+      const used = Number(it.used) || 0;
+      const limit = Number(it.limit) || 0;
+      let state = '<span class="badge" style="color:var(--ok)">可用</span>';
+      if (it.consumer) state = '<span class="badge" style="color:var(--accent)">占用中</span>';
+      else if (!it.usable) state = '<span class="badge" style="color:var(--fail)">超限</span>';
+      const ttl = Math.floor(Number(it.ttl_remaining) / 60) + "m" + (Number(it.ttl_remaining) % 60) + "s";
+      return `<tr>
+        <td class="mono">${esc(it.exit_ip || "--")}</td>
+        <td class="mono">${esc(used)}</td>
+        <td class="mono">${limit > 0 ? esc(limit) : "不限"}</td>
+        <td>${state}</td>
+        <td class="mono">${ttl}</td>
+        <td class="mono">${esc(it.consumer || "--")}</td>
+      </tr>`;
+    }).join("");
+    const body = document.getElementById("ip-pool-body");
+    if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">池为空：点击「立即探测」或等待后台补池</td></tr>';
+    document.getElementById("ip-pool-summary-label").textContent = "查看池详情（" + (j.items || []).length + " 条）";
+  } catch (e) {
+    if (!silent) setMsg("ip-pool-msg", String(e.message || e), "err");
+  }
+}
+async function probeIpPool() {
+  const btn = document.getElementById("ip-pool-probe-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "探测中…"; }
+  try {
+    const j = await api("/api/ip-pool/probe", { method: "POST", body: "{}" });
+    const st = j.stats || {};
+    setMsg("ip-pool-msg", "探测完成：新增可用 " + (j.added ?? 0) + " 个，池内可用 " + (st.usable ?? 0) + " 个", "ok");
+    await refreshIpPool(true);
+  } catch (e) {
+    setMsg("ip-pool-msg", String(e.message || e), "err");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "立即探测"; }
 }
 async function savePerIpLimit(ip, btn) {
   const input = btn.closest("div").querySelector("input[data-ip-limit-input]");
@@ -4161,7 +4231,7 @@ setInterval(refreshBfs, 15000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
-  if (document.body.classList.contains("ip-usage-view-open")) refreshIpUsage(false);
+  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
 </script>
 </body>
@@ -4276,7 +4346,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4326,10 +4396,8 @@ class Handler(BaseHTTPRequestHandler):
                 from ip_usage_store import (
                     get_all_ip_usage_detail,
                     get_total_usage,
-                    set_ip_usage_meta,
                     usage_file_path,
                 )
-                from browser_session import lookup_exit_meta
 
                 control = load_control()
                 global_limit = int(control.get("ip_usage_limit", 0) or 0)
@@ -4340,50 +4408,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 items = get_all_ip_usage_detail()
-                # 延迟/服务商：优先复用代理池里该出口的探测结果
-                latency_by_ip: dict[str, int] = {}
-                isp_by_ip: dict[str, str] = {}
-                try:
-                    pool = read_proxy_pool(page_size=500)
-                    for item in pool.get("items") or []:
-                        ip = str(item.get("exit_ip") or "").strip()
-                        if not ip:
-                            continue
-                        if item.get("latency_ms") is not None:
-                            latency_by_ip[ip] = int(item["latency_ms"])
-                        if item.get("asn_org"):
-                            isp_by_ip.setdefault(ip, str(item["asn_org"]))
-                except Exception:
-                    pass
-                # 元数据懒查询：只查有次数、尚无 meta 且不在失败冷却期的 IP。
-                # 每轮最多 3 个，避免地理 API 不可达时拖垮轮询（失败 IP 记
-                # 10 分钟冷却；成功结果由 lookup_exit_meta 进程内缓存复用）。
-                lazy = 0
-                now_ts = time.monotonic()
                 for item in items:
-                    ip = item["ip"]
-                    meta = item.get("meta") or {}
-                    if not meta and item.get("count", 0) > 0 and lazy < 3:
-                        if _ip_usage_meta_fail_until.get(ip, 0) > now_ts:
-                            continue
-                        lazy += 1
-                        info = lookup_exit_meta(ip)
-                        if info.get("status") == "success":
-                            meta = {
-                                "country": str(info.get("country") or ""),
-                                "isp": str(info.get("isp") or ""),
-                                "org": str(info.get("org") or ""),
-                                "asn": str(info.get("as") or ""),
-                            }
-                            try:
-                                set_ip_usage_meta(ip, meta)
-                            except Exception:
-                                pass
-                        else:
-                            _ip_usage_meta_fail_until[ip] = now_ts + 600
-                    item["meta"] = meta
-                    item["latency_ms"] = latency_by_ip.get(ip)
-                    item["isp_label"] = isp_by_ip.get(ip) or meta.get("isp") or meta.get("org") or ""
                     # 生效上限：该 IP 单独覆盖优先，否则回退全局
                     per = item.get("limit")
                     item["limit_effective"] = int(per) if per else global_limit
@@ -4397,6 +4422,14 @@ class Handler(BaseHTTPRequestHandler):
                         "updated_at": updated,
                     },
                 )
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-pool":
+            try:
+                from webui.ip_ready_pool import get_pool_state
+
+                self._json(200, get_pool_state())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4484,6 +4517,31 @@ class Handler(BaseHTTPRequestHandler):
                         "ip": ip,
                         "limit": limit if limit > 0 else None,
                         "note": "0=清除覆盖，回退全局上限",
+                    },
+                )
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-pool/probe":
+            try:
+                from webui.ip_ready_pool import get_pool_state, probe_round
+
+                cfg = _runtime_config()
+                stats_before = get_pool_state()["stats"]
+                stats = probe_round(
+                    target_count=int(cfg.get("ip_pool_target") or 20),
+                    concurrency=int(cfg.get("ip_pool_probe_concurrency") or 12),
+                    ttl=float(cfg.get("ip_pool_identity_ttl") or 600),
+                )
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "stats": stats,
+                        "added": max(
+                            0,
+                            int(stats.get("total") or 0) - int(stats_before.get("total") or 0),
+                        ),
                     },
                 )
             except Exception as e:
@@ -4824,6 +4882,45 @@ def main():
             flush=True,
         )
     print(f"[monitor] http://{host}:{BIND_PORT}/  (bound {host}:{BIND_PORT})", flush=True)
+
+    # 可用 IP 池后台补池线程：定时清理过期项，可用项不足目标时探测补充。
+    # 探测走代理（每身份 2-8s），并发进行；daemon 线程不阻塞 HTTP。
+    def _ip_pool_loop(stop_event: threading.Event):
+        import time as _time
+
+        while not stop_event.is_set():
+            try:
+                from webui.ip_ready_pool import probe_round, refresh_pool
+
+                cfg = _runtime_config()
+                target = max(1, int(cfg.get("ip_pool_target") or 20))
+                interval = max(20.0, float(cfg.get("ip_pool_refresh_interval") or 120))
+                concurrency = max(1, int(cfg.get("ip_pool_probe_concurrency") or 12))
+                ttl = max(30.0, float(cfg.get("ip_pool_identity_ttl") or 600))
+                stats = refresh_pool()
+                if int(stats.get("usable") or 0) < target:
+                    stats = probe_round(
+                        target_count=target,
+                        concurrency=concurrency,
+                        ttl=ttl,
+                    )
+                    if stats.get("usable"):
+                        print(
+                            f"[monitor] ip-pool usable={stats.get('usable')} "
+                            f"total={stats.get('total')}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"[monitor] ip-pool loop error: {redact_log_line(str(exc))}", flush=True)
+            stop_event.wait(interval)
+
+    _ip_pool_stop = threading.Event()
+    threading.Thread(
+        target=_ip_pool_loop,
+        args=(_ip_pool_stop,),
+        name="ip-pool-refresh",
+        daemon=True,
+    ).start()
     stop_tasks_on_exit = os.environ.get(
         "MONITOR_STOP_TASKS_ON_EXIT",
         "1",
@@ -4843,6 +4940,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        _ip_pool_stop.set()
         httpd.server_close()
         if stop_tasks_on_exit:
             stopped = kill_all()

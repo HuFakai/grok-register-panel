@@ -74,6 +74,7 @@ from webui.email_domain_store import (
     select_domain as _select_managed_email_domain,
 )
 from webui.security_utils import redact_log_line as redact_sensitive_log_line
+from webui import ip_ready_pool
 from browser_session import (
 
     browser,
@@ -306,6 +307,12 @@ DEFAULT_CONFIG = {
     # 单 IP 累计使用次数上限（所有任务累计，见 log/ip_usage.json）；
     # 0=不限。超过后下一轮必须更换 IP。
     "ip_usage_limit": 0,
+    # 可用 IP 池（log/ip_ready_pool.json）：面板后台预探测 sticky 身份筛出
+    # 未超限出口，worker 换口时优先取用。以下为池的默认参数（面板线程读取）。
+    "ip_pool_target": 20,          # 池内希望保持的可用身份数（不足则补探测）
+    "ip_pool_refresh_interval": 120,  # 后台补池周期（秒）
+    "ip_pool_probe_concurrency": 12,  # 每轮并发探测数
+    "ip_pool_identity_ttl": 600,   # sticky 会话有效期（秒），过期身份作废
     # 注册提交后的 SSO 获取策略：快速轮询 + 有界的 grok.com 推进重试。
     "sso_wait_timeout": 50,
     "sso_poll_interval": 0.5,
@@ -946,7 +953,55 @@ def rotate_browser_to_new_exit(
     """Rotate endpoints and refuse to start a new account on an unchanged exit.
 
     不再按 Sticky 时长等待：只在轮询周期内（90 秒上限）反复换口核验。
+    优先从可用 IP 池（ip_ready_pool）取预筛过的 sticky 身份，池空才退回
+    随机试错。
     """
+    # 池择优：已预探测确认"未超限 + 非黑名单"的身份，直接核验使用，
+    # 避免起浏览器随机试错（树脂偏向分配已超限的热门节点）。
+    tried_ips = {previous_ip} if previous_ip else set()
+    pool_tries = 0
+    while pool_tries < 3:
+        item = ip_ready_pool.pick_usable(
+            f"W{worker_id + 1}",
+            frozenset(tried_ips),
+        )
+        if not item:
+            break
+        pool_tries += 1
+        try:
+            stop_browser()
+        except Exception:
+            pass
+        proxy = str(item.get("expanded_url") or "")
+        set_thread_proxy(proxy)
+        log_callback(
+            f"[*] [IP策略] 可用池取出口 {item.get('exit_ip') or '?'} "
+            f"（身份 {redact_proxy(proxy)}）"
+        )
+        try:
+            start_browser(log_callback=log_callback)
+        except Exception as exc:
+            ip_ready_pool.remove_item(item.get("id") or "")
+            tried_ips.add(item.get("exit_ip") or "")
+            log_callback(
+                f"[!] [IP策略] 池身份启动失败: "
+                f"{redact_sensitive_log_line(str(exc))}，换下一个"
+            )
+            continue
+        current_ip = get_exit_ip() or ""
+        if current_ip and (not previous_ip or current_ip != previous_ip):
+            ip_ready_pool.remove_item(item.get("id") or "")
+            log_callback(
+                f"[+] [IP策略] 池身份核验通过: "
+                f"{previous_ip or '?'} → {current_ip}"
+            )
+            return rotate_idx, current_ip, time.monotonic()
+        ip_ready_pool.remove_item(item.get("id") or "")
+        tried_ips.add(current_ip or "")
+        log_callback(
+            f"[!] [IP策略] 池身份出口仍为 {current_ip or '?'}，弃用换下一个"
+        )
+
     checks_per_pass = min(proxy_count_for_worker(worker_id), 24)
     deadline = time.monotonic() + 90
     checked = 0
