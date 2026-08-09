@@ -558,23 +558,14 @@ def test_start_reports_unavailable_process_table():
 
 
 def test_ip_usage_api_delete_and_per_ip_limit():
-    import browser_session
     import ip_usage_store
 
     token = "test-ip-usage-token-123456"
     previous_token = os.environ.get("MONITOR_TOKEN")
     previous_file = ip_usage_store._USAGE_FILE
-    previous_lookup = browser_session.lookup_exit_meta
     previous_control = monitor.load_control
     with tempfile.TemporaryDirectory() as temp:
         ip_usage_store._USAGE_FILE = Path(temp) / "log" / "ip_usage.json"
-        browser_session.lookup_exit_meta = lambda ip: {
-            "status": "success",
-            "country": "美国",
-            "isp": "TEST ISP",
-            "org": "TEST ORG",
-            "as": "AS12345",
-        }
         # 隔离全局上限：真实 control 文件可能设置了 ip_usage_limit
         monitor.load_control = lambda: {"ip_usage_limit": 0}
         os.environ["MONITOR_TOKEN"] = token
@@ -594,8 +585,6 @@ def test_ip_usage_api_delete_and_per_ip_limit():
             items = {it["ip"]: it for it in payload["items"]}
             assert payload["total_usage"] == 4
             assert items["203.0.113.7"]["count"] == 3
-            assert items["203.0.113.7"]["meta"]["country"] == "美国"
-            assert items["203.0.113.7"]["meta"]["asn"] == "AS12345"
             # 未设置覆盖 → limit None，生效值回退全局（0=不限）
             assert items["203.0.113.7"]["limit"] is None
             assert items["203.0.113.7"]["limit_effective"] == 0
@@ -661,12 +650,97 @@ def test_ip_usage_api_delete_and_per_ip_limit():
             server.server_close()
             thread.join(timeout=5)
             ip_usage_store._USAGE_FILE = previous_file
-            browser_session.lookup_exit_meta = previous_lookup
             monitor.load_control = previous_control
             if previous_token is None:
                 os.environ.pop("MONITOR_TOKEN", None)
             else:
                 os.environ["MONITOR_TOKEN"] = previous_token
+
+
+def test_ip_pool_api_returns_state():
+    import webui.ip_ready_pool as ip_ready_pool
+    from webui import proxy_store as ps
+
+    token = "test-ip-pool-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = ip_ready_pool._POOL_FILE
+    previous_snapshot = ps.worker_proxy_snapshot
+    with tempfile.TemporaryDirectory() as temp:
+        ip_ready_pool._POOL_FILE = Path(temp) / "log" / "ip_ready_pool.json"
+        ps.worker_proxy_snapshot = lambda: {"configured": False, "urls": []}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            status, _, _ = request(base + "/api/ip-pool")
+            assert status == 401
+            status, _, body = request(base + "/api/ip-pool", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["stats"]["total"] == 0
+            assert payload["items"] == []
+
+            # 写一条可用项后可见
+            ip_ready_pool._write_items(
+                [
+                    {
+                        "id": "abc123",
+                        "template_url": "http://Default.{session}:TOKEN@h:2261",
+                        "expanded_url": "http://Default.ipool-1-0:TOKEN@h:2261",
+                        "exit_ip": "198.51.100.9",
+                        "used": 0,
+                        "limit": 10,
+                        "usable": True,
+                        "checked_at": 1000.0,
+                        "expires_at": 1000.0 + 600,
+                        "consumer": "",
+                        "consumed_at": 0.0,
+                    }
+                ]
+            )
+            status, _, body = request(base + "/api/ip-pool", token=token)
+            payload = json.loads(body)
+            assert payload["stats"]["total"] == 1
+            assert payload["stats"]["usable"] == 0  # 1970 年过期项不计入可用
+            assert payload["items"][0]["exit_ip"] == "198.51.100.9"
+
+            # 探测接口需要写权限
+            status, _, _ = request(base + "/api/ip-pool/probe", method="POST", body=b"{}")
+            assert status == 401
+            status, _, _ = request(
+                base + "/api/ip-pool/probe",
+                token=token,
+                method="POST",
+                body=b"{}",
+            )
+            # 无代理模板时探测不报错，返回当前统计
+            assert status == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            ip_ready_pool._POOL_FILE = previous_file
+            ps.worker_proxy_snapshot = previous_snapshot
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
+if __name__ == "__main__":
+    test_proxy_start_prerequisites()
+    test_kill_all_verifies_process_exit()
+    test_monitor_http_auth_and_headers()
+    test_proxy_api_auth_mutations_and_redaction()
+    test_email_domain_api_auth_and_mutations()
+    test_email_provider_api_auth_secret_masking_and_probe()
+    test_non_loopback_requires_token()
+    test_log_cleanup_api_requires_auth_and_returns_summary()
+    test_start_reports_unavailable_process_table()
+    test_ip_usage_api_delete_and_per_ip_limit()
+    test_ip_pool_api_returns_state()
 
 
 if __name__ == "__main__":

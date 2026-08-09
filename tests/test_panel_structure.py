@@ -139,12 +139,17 @@ def test_proxy_pool_panel_structure():
     assert '/api/proxies/import' in mon
     assert '/api/proxies/test' in mon
     assert '/api/proxies/delete' in mon
+    assert 'id="ip-pool-body"' in html
+    assert 'function refreshIpPool(' in mon
+    assert 'function probeIpPool(' in mon
+    assert '/api/ip-pool' in mon
     assert 'def do_PATCH(self):' in mon
     assert 'def do_DELETE(self):' in mon
     assert 'worker_proxy_snapshot as _managed_worker_proxy_snapshot' in worker
     assert 'pool = load_proxy_pool()' in worker
     assert '面板代理池没有健康且启用的代理' in worker
     assert 'redact_proxy(px)' in worker
+    assert 'ip_ready_pool' in worker
 
 def test_email_service_and_domain_rotation_panel_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
