@@ -13,8 +13,8 @@
 | 项 | Commit |
 |---|---|
 | 本地 fork 点（本地已包含其全部内容） | `280c98e` |
-| 上次合并到的上游 HEAD | `98da9f6`（本次已评估） |
-| 下次合并起始点 | `98da9f6` 之后的上游新提交 |
+| 上次合并到的上游 HEAD | `0371716`（本次已评估） |
+| 下次合并起始点 | `0371716` 之后的上游新提交 |
 
 > 本地仓库与上游**无共同祖先**（独立重写历史），不能用 `git merge`，
 > 需按文件逐个人工移植（`git show <commit> -- <file>` 取补丁）。
@@ -36,7 +36,28 @@
 
 ### 忽略：star 图自动更新（CI 提交，仅 docs/star-history-*.svg）
 
-`b3a128d`、`4c1fa66`、`9559e3c`、`91b025b`、`55ebe16`、`ee6a6d7`、`f913952`
+`b3a128d`、`4c1fa66`、`9559e3c`、`91b025b`、`55ebe16`、`ee6a6d7`、`f913952`、`0371716`
+
+## 本次合并内容（2026-08-09 第二轮）
+
+自检查点 `98da9f6` 之后新增 4 个实质提交，除 connectivity 修复外全部收编。
+
+### 已收编
+
+| Commit | 标题 | 说明 |
+|---|---|---|
+| `a03b789` | fix: drain supervisor output before crash detection | supervisor 管道缓冲崩溃检测：`text=True, bufsize=1` readline 会遮蔽崩溃标记 → 改二进制分块 + 增量 utf-8 解码，崩溃即时重启。保留本地优雅停止改动 |
+| `e2c6301` | fix: preserve refreshed success statistics | 面板 2s 快照轮询冲掉「统计已刷新」完整数据 → `fullStats` 缓存 + `statsForSnapshot()` 合并（jsonl/day 统计保留，快照只更新实时计数器） |
+| `03a8f7e` | feat: integrate optional static asset cache | opt-in 静态资源磁盘缓存（`GROK_STATIC_ASSET_CACHE=1` 门控）：JS/CSS/字体/图片共享缓存，不缓存文档/XHR/Turnstile，不共享 cookie。新文件 `static_asset_cache.py` + 兼容入口 `run_batch_headless_static_cache.py`/`run_until_100_static_cache.py` + `browser_session.py` 挂载（try/except） |
+| `f65f00f` | fix: handle configured BFS auth paths | BFS `Path.is_abs()`→`is_absolute()`（Python 3.11+ 兼容，本地 webui/bfs_ops.py 此前已覆盖该修复）；补 `tests/test_bfs_ops.py` |
+
+### 忽略
+
+| Commit | 标题 | 原因 |
+|---|---|---|
+| `8b7354c` | fix: avoid false admin email preflight failures | connectivity 预检改 TCP-only；本地真实探测建号端点更优，不合并（对应上游测试 `test_cloudflare_direct_create_does_not_probe_admin_domains` 一并跳过） |
+| `9e23229` + `7768eb4` | release: prepare v0.3.0 | 版本发布（版本号/CHANGELOG） |
+| `0371716` | chore: update star history | 仅 SVG |
 
 ## 上游提交全清单（评估状态）
 
@@ -59,11 +80,18 @@
 | `55e4249` | feat: add JWT bfs claim detection | ✅ 已收编 |
 | `eb2ca9f` | fix: harden BFS token detection | ✅ 已收编 |
 | `98da9f6` | Merge PR #15 | ✅ 已评估（= 收编上述两项） |
+| `03a8f7e` | feat: integrate optional static asset cache | ✅ 已收编 |
+| `a03b789` | fix: drain supervisor output before crash detection | ✅ 已收编 |
+| `8b7354c` | fix: avoid false admin email preflight failures | ⏭ 跳过（本地真实探测更优） |
+| `f65f00f` | fix: handle configured BFS auth paths | ✅ 已收编（is_absolute 本地已覆盖，补测试） |
+| `e2c6301` | fix: preserve refreshed success statistics | ✅ 已收编 |
+| `9e23229` + `7768eb4` | release: prepare v0.3.0 | ⏭ 跳过（版本发布） |
+| `0371716` | chore: update star history | ⏭ 跳过（仅 SVG） |
 
 ## 下次合并指引
 
 1. `git fetch https://github.com/lij768423-svg/grok-register-panel main:refs/remotes/upstream-lij/main`
-2. `git log --oneline 98da9f6..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
+2. `git log --oneline 0371716..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
 3. 逐个人工移植新功能（无共同祖先，勿用 git merge）
 4. 移植后更新本文档的「上次合并到的上游 HEAD」为新 HEAD
 
