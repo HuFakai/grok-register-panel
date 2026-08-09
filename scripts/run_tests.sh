@@ -31,7 +31,6 @@ tests=(
   tests/test_ip_usage_store.py
   tests/test_results_store.py
   tests/test_config_backup.py
-  tests/test_graceful_stop.py
   tests/test_email_domain_store.py
   tests/test_email_domain_worker_integration.py
   tests/test_star_history.py

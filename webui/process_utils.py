@@ -19,9 +19,6 @@ except ImportError:  # running from webui/
         sys.path.insert(0, str(ROOT))
     from secure_files import atomic_write_text
 
-# 优雅停止等待上限：让注册子进程跑完当前槽位（验证码 180s + SSO 50s 余量）
-GRACEFUL_STOP_TIMEOUT = 300.0
-
 
 class ProcessInspectionError(RuntimeError):
     pass
@@ -173,7 +170,6 @@ def terminate_managed_processes(
     script_names: tuple[str, ...] | list[str],
     *,
     grace_seconds: float = 2.0,
-    graceful: bool = False,
 ) -> list[int]:
     processes = find_managed_processes(root, script_names)
     pids = {item["pid"] for item in processes}
@@ -217,11 +213,7 @@ def terminate_managed_processes(
         except OSError:
             pass
 
-    # graceful=True：优雅停止（用户停止任务）——SIGTERM 触发各层跑完当前
-    # 槽位后自然退出，等待上限放宽到单槽位时长，超时才 SIGKILL。
-    # 默认（崩溃恢复等场景）保持短 grace 快速收尾。
-    effective_grace = GRACEFUL_STOP_TIMEOUT if graceful else max(0.0, grace_seconds)
-    deadline = time.monotonic() + effective_grace
+    deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
         if not find_managed_processes(root, script_names):
             break

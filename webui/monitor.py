@@ -680,32 +680,19 @@ def _parse_etime(s):
 
 
 def kill_all():
-    """Stop orchestrator and batch process groups under this project root.
-
-    优雅停止：后台线程发 SIGTERM 触发各层让进行中的注册跑完当前槽位后
-    自然退出（SIGKILL 仅在长超时后兜底）；HTTP 立即返回，进程退出由
-    面板轮询体现。
-    """
-    def _graceful_stop():
-        try:
-            terminate_managed_processes(
-                ROOT,
-                ("run_until_100.py", "run_batch_headless.py"),
-                grace_seconds=8.0,
-                graceful=True,
-            )
-        except Exception:
-            pass
-
-    threading.Thread(target=_graceful_stop, daemon=True).start()
+    """Stop orchestrator and batch process groups under this project root."""
+    killed = terminate_managed_processes(
+        ROOT,
+        ("run_until_100.py", "run_batch_headless.py"),
+        grace_seconds=8.0,
+    )
     remaining = process_running()
     return {
-        "ok": True,
-        "killed": [],
+        "ok": not remaining.get("running"),
+        "killed": killed,
         "remaining": remaining,
-        "stopping": bool(remaining.get("running")),
         "error": (
-            "已请求优雅停止：进行中的注册将跑完当前任务后退出（可能需等待数分钟）"
+            "任务进程仍未退出，请重试停止或检查进程权限"
             if remaining.get("running")
             else ""
         ),
@@ -3795,11 +3782,8 @@ async function doStop() {
   document.getElementById("btn-stop").disabled = true;
   try {
     const j = await api("/api/stop", { method: "POST", body: "{}" });
-    if (j.stopping) {
-      setMsg("ctrl-msg", "已请求优雅停止：进行中的注册将跑完当前任务后退出，不再开新任务（可能需等待数分钟）", "ok");
-    } else {
-      setMsg("ctrl-msg", "当前没有运行中的任务", "ok");
-    }
+    const count = (j.killed || []).length;
+    setMsg("ctrl-msg", count ? ("任务已停止，共结束 " + count + " 个主进程") : "当前没有运行中的任务", "ok");
     await refresh();
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
   document.getElementById("btn-stop").disabled = false;

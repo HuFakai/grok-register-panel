@@ -75,22 +75,11 @@ def test_kill_all_verifies_process_exit():
     original_terminate = monitor.terminate_managed_processes
     original_process_running = monitor.process_running
     try:
-        calls = []
-
-        def fake_terminate(*args, **kwargs):
-            calls.append(kwargs)
-            return [101, 102]
-
-        monitor.terminate_managed_processes = fake_terminate
+        monitor.terminate_managed_processes = lambda *_args, **_kwargs: [101, 102]
         monitor.process_running = lambda: {"running": False}
         result = monitor.kill_all()
         assert result["ok"] is True
-        assert result["stopping"] is False
-        # 优雅停止：terminate 走后台线程且 graceful=True（不阻塞 HTTP）
-        assert calls and calls[0].get("graceful") is True
-        import time
-
-        time.sleep(0.05)  # 等后台线程发出信号
+        assert result["killed"] == [101, 102]
 
         monitor.process_running = lambda: {
             "running": True,
@@ -98,10 +87,8 @@ def test_kill_all_verifies_process_exit():
             "batch_pid": 102,
         }
         result = monitor.kill_all()
-        assert result["ok"] is True
-        assert result["stopping"] is True
-        assert "优雅停止" in result["error"]
-        time.sleep(0.05)
+        assert result["ok"] is False
+        assert "仍未退出" in result["error"]
     finally:
         monitor.terminate_managed_processes = original_terminate
         monitor.process_running = original_process_running

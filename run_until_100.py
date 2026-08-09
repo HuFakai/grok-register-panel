@@ -99,17 +99,12 @@ def cpa_count() -> int:
     return len(list(AUTHS.glob("xai-*.json")))
 
 
-def kill_batch(graceful: bool = False) -> None:
-    """Stop only batch processes that belong to this project root.
-
-    graceful=True：SIGTERM 后等待 supervisor/child 跑完当前槽位
-    （长 grace），超时才 SIGKILL——用于用户停止场景。
-    """
+def kill_batch() -> None:
+    """Stop only batch processes that belong to this project root."""
     terminate_managed_processes(
         ROOT,
         ("run_batch_headless.py",),
         grace_seconds=8.0,
-        graceful=graceful,
     )
 
 
@@ -292,12 +287,10 @@ def batch_alive(pid: int) -> bool:
 
 
 def main():
-    # 优雅停止：SIGTERM 后置标志，mon 循环检测到后让当前 batch 跑完再退出
-    stop_requested = {"flag": False}
-
     def request_stop(_signum, _frame):
-        log("收到停止信号，等待当前批次跑完（再次发送可强制停止）")
-        stop_requested["flag"] = True
+        log("收到停止信号，正在停止当前批次")
+        kill_batch()
+        raise SystemExit(130)
 
     for signum in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if signum is not None:
@@ -329,10 +322,6 @@ def main():
         t0 = time.time()
         while True:
             time.sleep(15)
-            if stop_requested["flag"]:
-                log("停止请求已收到，等待当前 batch 跑完（优雅停止）")
-                kill_batch(graceful=True)
-                break
             try:
                 alive = batch_alive(pid)
             except Exception:

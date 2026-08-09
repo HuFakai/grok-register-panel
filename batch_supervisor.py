@@ -87,17 +87,7 @@ def mark_slot_completed(slots: int = 1) -> None:
             )
 
 
-# 用户停止时的优雅等待上限：让 child 跑完当前槽位
-# （验证码轮询 180s + SSO 等待 50s 上限，留足余量）；超时才 SIGKILL
-GRACEFUL_STOP_TIMEOUT = 300.0
-
-
-def _terminate_process_group(
-    process: subprocess.Popen,
-    grace_seconds: float = 5.0,
-    *,
-    graceful: bool = False,
-) -> None:
+def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5.0) -> None:
     if process.poll() is not None:
         return
     try:
@@ -108,9 +98,7 @@ def _terminate_process_group(
     except ProcessLookupError:
         return
     try:
-        process.wait(
-            timeout=max(0.1, GRACEFUL_STOP_TIMEOUT if graceful else grace_seconds)
-        )
+        process.wait(timeout=max(0.1, grace_seconds))
         return
     except subprocess.TimeoutExpired:
         pass
@@ -237,9 +225,7 @@ def run_supervisor(
                 selector.close()
 
             if stop_requested:
-                # 用户停止：优雅 SIGTERM 等 child 跑完当前槽位（长 grace），
-                # 超时才 SIGKILL 兜底
-                _terminate_process_group(active_process, graceful=True)
+                _terminate_process_group(active_process)
                 return 130
 
             return_code = active_process.poll()
