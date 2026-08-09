@@ -82,6 +82,7 @@ except Exception:
 launches += 1
 state.write_text(json.dumps({"launches": launches}))
 if launches == 1:
+    print("progress line before crash marker", flush=True)
     print("TypeError: Cannot read properties of undefined (reading '_getChildFrames')", flush=True)
     time.sleep(30)
 else:
@@ -100,7 +101,7 @@ else:
             3,
             command,
             progress_file=progress,
-            idle_timeout=5,
+            idle_timeout=30,
             max_restarts=2,
             child_env={"PYTHONPATH": str(ROOT)},
         )
