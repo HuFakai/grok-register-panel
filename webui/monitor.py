@@ -2673,6 +2673,7 @@ HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 let last = null;
+let fullStats = null;
 let proxyData = null;
 let proxyPage = 1;
 let proxyPageSize = 50;
@@ -3852,7 +3853,8 @@ async function refreshBlacklist() {
 async function refreshStats(authHelp = true) {
   try {
     const j = await api("/api/stats?_=" + Date.now(), { authHelp });
-    renderStats(j);
+    fullStats = j;
+    renderStats(fullStats);
     setMsg("stats-msg", "统计已刷新 " + (j.refreshed_at || ""), "ok");
   } catch (e) { setMsg("stats-msg", String(e.message || e), "err"); }
 }
@@ -4019,6 +4021,27 @@ function renderStats(s) {
     `<tr><td class="mono">${esc(d)}</td><td class="ok">${v.ok||0}</td><td class="warn">${v.risk||0}</td><td class="fail">${v.fail||0}</td></tr>`
   ).join("") : '<tr><td colspan="4" style="color:var(--muted)">无 jsonl 数据</td></tr>';
 }
+function statsForSnapshot(d) {
+  const liveStats = {
+    cpa: d.cpa,
+    cpa_delta: d.cpa_delta,
+    base_cpa: d.base_cpa,
+    batch_ok: d.ok,
+    batch_fail: d.fail,
+    rates: d.rates || {},
+  };
+  if (!fullStats) {
+    return Object.assign({}, liveStats, {
+      jsonl_ok: "--",
+      jsonl_risk: "--",
+      by_day: {},
+      refreshed_at: d.ts_human,
+    });
+  }
+  return Object.assign({}, fullStats, liveStats, {
+    rates: d.rates || fullStats.rates || {},
+  });
+}
 function render(d) {
   document.getElementById("clock").textContent = d.ts_human || "--";
   document.getElementById("logname").textContent =
@@ -4086,13 +4109,8 @@ function render(d) {
   }
 
   renderBlacklist(d.blacklist, d.blacklist_update);
-  // light stats from snapshot
-  renderStats({
-    cpa: d.cpa, cpa_delta: d.cpa_delta, base_cpa: d.base_cpa,
-    batch_ok: d.ok, batch_fail: d.fail,
-    jsonl_ok: "--", jsonl_risk: "--",
-    by_day: {}, refreshed_at: d.ts_human,
-  });
+  // Keep full jsonl/day statistics while the 2-second snapshot updates live counters.
+  renderStats(statsForSnapshot(d));
 
   const wset = new Set([...(Object.keys(d.worker_ok || {})), ...(Object.keys(d.worker_fail || {}))]);
   const ws = [...wset].sort((a, b) => parseInt(a.slice(1)) - parseInt(b.slice(1)));

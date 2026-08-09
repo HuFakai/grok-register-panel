@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import selectors
@@ -183,8 +184,8 @@ def run_supervisor(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
                 env=env,
                 **popen_group_kwargs(),
             )
@@ -193,26 +194,41 @@ def run_supervisor(
             selector.register(active_process.stdout, selectors.EVENT_READ)
             last_output = time.monotonic()
             restart_reason = ""
+            # 二进制分块 + 增量 utf-8 解码：避免崩溃标记被行缓冲在管道里，
+            # 导致检测延迟到 idle_timeout 才重启
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending_output = ""
 
             try:
                 while not stop_requested:
                     events = selector.select(timeout=1.0)
                     for key, _mask in events:
-                        line = key.fileobj.readline()
-                        if not line:
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
                             continue
                         last_output = time.monotonic()
-                        print(line, end="", flush=True)
-                        if is_driver_crash_line(line):
-                            restart_reason = "playwright driver crashed"
+                        pending_output += decoder.decode(chunk)
+                        lines = pending_output.splitlines(keepends=True)
+                        pending_output = ""
+                        if lines and not lines[-1].endswith(("\n", "\r")):
+                            pending_output = lines.pop()
+                        for line in lines:
+                            print(line, end="", flush=True)
+                            if is_driver_crash_line(line):
+                                restart_reason = "playwright driver crashed"
+                                break
+                        if restart_reason:
                             break
                     if restart_reason:
                         break
                     return_code = active_process.poll()
                     if return_code is not None:
-                        tail = active_process.stdout.read()
-                        if tail:
-                            print(tail, end="", flush=True)
+                        tail = active_process.stdout.read() or b""
+                        pending_output += decoder.decode(tail, final=True)
+                        if pending_output:
+                            print(pending_output, end="", flush=True)
+                            if is_driver_crash_line(pending_output):
+                                restart_reason = "playwright driver crashed"
                         break
                     if time.monotonic() - last_output > max(1.0, float(idle_timeout)):
                         restart_reason = f"no child output for {int(idle_timeout)}s"

@@ -667,6 +667,21 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             camoufox = SafeCamoufox(**opts)
             browser_context = camoufox.__enter__()
 
+            # Optional shared cache for immutable browser assets. The helper is
+            # a no-op unless GROK_STATIC_ASSET_CACHE is explicitly enabled.
+            try:
+                import static_asset_cache
+
+                static_asset_cache.attach_static_cache(
+                    browser_context,
+                    log_callback=log_callback,
+                )
+            except Exception as cache_exc:
+                if log_callback:
+                    log_callback(
+                        f"[static-cache] attach failed: {redact_log_line(str(cache_exc))}"
+                    )
+
             # 获取或创建页面
             raw_pages = (
                 browser_context.pages
