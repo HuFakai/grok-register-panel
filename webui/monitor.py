@@ -2646,7 +2646,12 @@ HTML = r"""<!DOCTYPE html>
     </details>
   </div>
 
-  <div class="three panel-gap">
+  <details class="card panel" aria-labelledby="stats-collapse-title">
+    <summary class="panel-summary">
+      <h2 id="stats-collapse-title">统计明细</h2>
+      <span class="section-meta mono">成功统计 · 黑名单 · 黑名单更新记录</span>
+    </summary>
+    <div class="three">
     <div class="card">
       <div class="section-head">
         <h2>成功统计</h2>
@@ -2681,7 +2686,8 @@ HTML = r"""<!DOCTYPE html>
         <tbody id="bl-added"></tbody></table>
       </div>
     </div>
-  </div>
+    </div>
+  </details>
 
   <div class="two panel-gap">
     <div class="card"><h2>Worker 成功 / 失败</h2><div class="chips" id="workers-stats"></div></div>
