@@ -1207,6 +1207,26 @@ HTML = r"""<!DOCTYPE html>
     margin-bottom: 14px;
   }
   .section-meta { color: var(--muted); font-size: 12px; text-align: right; }
+  .card > summary.panel-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 24px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .card > summary.panel-summary::-webkit-details-marker { display: none; }
+  .card > summary.panel-summary::after {
+    content: "+";
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-family: "Geist Mono", monospace;
+    font-size: 18px;
+    line-height: 1;
+  }
+  .card[open] > summary.panel-summary::after { content: "-"; }
+  .card[open] > summary.panel-summary { margin-bottom: 12px; }
   .control-grid {
     display: grid;
     grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(4, minmax(100px, .55fr)) minmax(258px, auto);
@@ -2588,11 +2608,11 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="two panel-gap">
-    <section class="card recovery-panel" aria-labelledby="recovery-title">
-      <div class="section-head">
+    <details class="card recovery-panel" aria-labelledby="recovery-title">
+      <summary class="panel-summary">
         <h2 id="recovery-title">账号补录</h2>
         <span class="section-meta mono" id="recovery-status">等待检查</span>
-      </div>
+      </summary>
       <div class="recovery-layout">
         <div class="chips" id="recovery-kpis"></div>
         <div class="button-group recovery-actions">
@@ -2602,12 +2622,12 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
-    </section>
-    <section class="card" aria-labelledby="bfs-title">
-      <div class="section-head">
+    </details>
+    <details class="card" aria-labelledby="bfs-title">
+      <summary class="panel-summary">
         <h2 id="bfs-title">BFS 检测</h2>
         <span class="section-meta mono" id="bfs-status">JWT claim</span>
-      </div>
+      </summary>
       <p style="margin:6px 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
         解码 CPA / Grok2API auth 中的 access_token，检查是否含 <code>bfs</code> claim（与 botFlagSource 独立）。
         注册换 token 后会自动检测并写入 <code>accounts/sso_bfs_flagged.txt</code>。
@@ -2623,7 +2643,7 @@ HTML = r"""<!DOCTYPE html>
           <tbody id="bfs-body"><tr><td colspan="4" class="proxy-empty">尚未扫描（点「扫描 auth 目录」）</td></tr></tbody>
         </table>
       </div>
-    </section>
+    </details>
   </div>
 
   <div class="three panel-gap">
