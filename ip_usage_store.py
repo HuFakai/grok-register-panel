@@ -142,6 +142,28 @@ def record_ip_usage(exit_ip: str, times: int = 1) -> int:
             return counts[ip]
 
 
+SOFT_BLACKLIST_COUNT = 99999
+
+
+def soft_blacklist_ip(exit_ip: str) -> int:
+    """把某出口 IP 累计使用次数直接置 99999（软拉黑）。
+
+    超过所有上限后，注册侧预检、可用 IP 池、配额核验都会跳过该出口，
+    等效拉黑但保留记录，可手动删除恢复（与硬黑名单 ASN/ISP 不同）。
+    """
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return 0
+    with _USAGE_LOCK:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_USAGE_FILE.with_suffix(".lock")):
+            data = _load_all()
+            counts = data[_KEY_COUNTS]
+            counts[ip] = SOFT_BLACKLIST_COUNT
+            _write_all(counts, data[_KEY_LIMITS], data[_KEY_META])
+            return SOFT_BLACKLIST_COUNT
+
+
 def get_ip_usage(exit_ip: str) -> int:
     """返回某出口 IP 的累计使用次数（无记录为 0）。"""
     ip = str(exit_ip or "").strip()

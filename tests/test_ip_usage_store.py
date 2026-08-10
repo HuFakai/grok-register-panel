@@ -141,6 +141,25 @@ def test_meta_and_detail():
             ip_usage_store._USAGE_FILE = previous
 
 
+def test_soft_blacklist_ip():
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = ip_usage_store._USAGE_FILE
+        ip_usage_store._USAGE_FILE = Path(tmp) / "ip_usage.json"
+        try:
+            ip_usage_store.record_ip_usage("6.6.6.6", times=3)
+            assert ip_usage_store.get_ip_usage("6.6.6.6") == 3
+            # 软拉黑：累计次数直接置 99999
+            assert ip_usage_store.soft_blacklist_ip("6.6.6.6") == ip_usage_store.SOFT_BLACKLIST_COUNT
+            assert ip_usage_store.get_ip_usage("6.6.6.6") == ip_usage_store.SOFT_BLACKLIST_COUNT
+            # 空 IP 忽略
+            assert ip_usage_store.soft_blacklist_ip("") == 0
+            # 之后再 record +1 仍远超任何上限
+            ip_usage_store.record_ip_usage("6.6.6.6")
+            assert ip_usage_store.get_ip_usage("6.6.6.6") == ip_usage_store.SOFT_BLACKLIST_COUNT + 1
+        finally:
+            ip_usage_store._USAGE_FILE = previous
+
+
 if __name__ == "__main__":
     test_record_and_read_usage()
     test_usage_persists_across_store_reloads()
@@ -148,4 +167,5 @@ if __name__ == "__main__":
     test_per_ip_limit_override_and_fallback()
     test_delete_ip_usage()
     test_meta_and_detail()
+    test_soft_blacklist_ip()
     print("OK ip usage store")

@@ -52,7 +52,7 @@ from account_exports import (
     consolidate_account_exports,
     save_account_record,
 )
-from ip_usage_store import get_ip_usage, get_per_ip_limit, record_ip_usage
+from ip_usage_store import get_ip_usage, get_per_ip_limit, record_ip_usage, soft_blacklist_ip
 from batch_supervisor import mark_slot_completed
 from secure_files import (
     append_private_text,
@@ -4586,7 +4586,20 @@ def run_registration_cli(count):
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
                         )
-                        if (blank_ui or proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
+                        if blank_ui:
+                            # 空页（reload 已尝试仍空白/无表单）：通常是该出口
+                            # 被 xAI 屏蔽的强信号。直接判定槽位失败并软拉黑该 IP
+                            # （累计使用置 99999，超过所有上限，后续预检/可用池/
+                            # 配额全部跳过），不再同槽位换口重试浪费时间。
+                            try:
+                                soft_blacklist_ip(active_ip)
+                            except Exception:
+                                pass
+                            cli_log(
+                                f"[W{wid+1}] [!] 空页判定失败，软拉黑出口 "
+                                f"{active_ip or '?'}（累计使用置 99999）"
+                            )
+                        elif (proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1
                             why = (
                                 "Turnstile卡住"
