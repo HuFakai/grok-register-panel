@@ -1176,15 +1176,15 @@ HTML = r"""<!DOCTYPE html>
     .proxy-state:hover,
     .domain-state:hover { background: var(--surface-soft); }
     .domain-advanced > summary:hover .domain-advanced-title,
-    .log-summary:hover,
     .faq-item summary:hover { color: var(--text-secondary); }
+    .card > summary.panel-summary:hover { background: var(--surface-soft); }
     .faq-item[open] summary:hover { color: var(--accent); }
   }
   .proxy-select:focus-visible,
   .proxy-toggle:focus-visible,
   .domain-toggle:focus-visible,
   .domain-advanced > summary:focus-visible,
-  .log-summary:focus-visible,
+  .card > summary.panel-summary:focus-visible,
   .faq-item summary:focus-visible {
     outline: 2px solid var(--focus);
     outline-offset: 2px;
@@ -1451,6 +1451,7 @@ HTML = r"""<!DOCTYPE html>
   .tail {
     max-height: 360px;
     overflow: auto;
+    overscroll-behavior: contain;
     border: 1px solid var(--border);
     border-radius: 2px;
     background: var(--tail-bg);
@@ -1461,24 +1462,19 @@ HTML = r"""<!DOCTYPE html>
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .log-summary {
-    cursor: pointer;
-    font-weight: 700;
-    margin-bottom: 12px;
-  }
-  details:not([open]) > .log-summary { margin-bottom: 0; }
   .log-tools {
     display: flex;
-    align-items: end;
+    align-items: center;
     justify-content: flex-end;
     gap: 8px;
-    margin: -2px 0 10px;
+    margin: 0 0 10px;
     padding-bottom: 10px;
     border-bottom: 1px solid var(--border);
   }
   .log-retention { width: 132px; }
   .log-retention input { min-height: 32px; }
   .log-tools button { min-height: 32px; padding: 5px 10px; }
+  .log-tools button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
   .log-cleanup-msg { min-width: 180px; color: var(--muted); font-size: 11px; text-align: right; }
   .chips { display: flex; flex-wrap: wrap; gap: 7px; }
   .card > h2 + .chips { margin-top: 14px; }
@@ -2718,13 +2714,17 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
   <details class="card panel" open>
-    <summary class="log-summary">日志尾部（点击展开或收起）</summary>
+    <summary class="panel-summary">
+      <h2>日志尾部</h2>
+      <span class="section-meta mono" id="tail-meta">实时 · 每 2 秒刷新</span>
+    </summary>
     <div class="log-tools">
       <div class="field log-retention">
         <label for="log-retention-days">保留最近天数</label>
         <input type="number" id="log-retention-days" min="1" max="365" value="7"/>
       </div>
       <button class="danger" id="btn-clean-logs" onclick="cleanupLogs()">清理过期日志</button>
+      <button id="tail-follow" onclick="toggleTailFollow()" aria-pressed="true" title="新日志到达时自动滚动到底部">自动滚动</button>
       <span class="log-cleanup-msg" id="log-cleanup-msg" role="status" aria-live="polite"></span>
     </div>
     <div class="tail mono" id="tail"></div>
@@ -3913,6 +3913,29 @@ async function doStop() {
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
   document.getElementById("btn-stop").disabled = false;
 }
+let tailFollow = true;
+function toggleTailFollow() {
+  tailFollow = !tailFollow;
+  const btn = document.getElementById("tail-follow");
+  if (btn) btn.setAttribute("aria-pressed", String(tailFollow));
+  if (tailFollow) {
+    const tail = document.getElementById("tail");
+    if (tail) tail.scrollTop = tail.scrollHeight;
+  }
+}
+function bindTailFollow() {
+  const tail = document.getElementById("tail");
+  if (!tail || tail._followBound) return;
+  tail._followBound = true;
+  tail.addEventListener("scroll", () => {
+    // 用户手动上滚时自动关闭跟随，避免新日志强行拉回底部
+    if (tailFollow && tail.scrollHeight - tail.scrollTop - tail.clientHeight > 24) {
+      tailFollow = false;
+      const btn = document.getElementById("tail-follow");
+      if (btn) btn.setAttribute("aria-pressed", "false");
+    }
+  });
+}
 async function cleanupLogs() {
   const days = Number(document.getElementById("log-retention-days").value || 7);
   if (!Number.isInteger(days) || days < 1 || days > 365) {
@@ -4235,7 +4258,12 @@ function render(d) {
   document.getElementById("fail-body").innerHTML = (d.recent_fail || []).map(r =>
     `<tr><td class="mono">${esc(r.t)}</td><td>${esc(r.w)}</td><td>${esc(r.kind)}</td><td class="mono">${esc(r.msg)}</td></tr>`
   ).join("") || '<tr><td colspan="4" style="color:var(--muted)">暂无记录</td></tr>';
-  document.getElementById("tail").textContent = (d.tail || []).join("\n");
+  const tailEl = document.getElementById("tail");
+  const tailLines = d.tail || [];
+  tailEl.textContent = tailLines.join("\n");
+  const tailMeta = document.getElementById("tail-meta");
+  if (tailMeta) tailMeta.textContent = "最近 " + tailLines.length + " 行 · 每 2 秒刷新";
+  if (tailFollow) tailEl.scrollTop = tailEl.scrollHeight;
   document.getElementById("footer").textContent =
     "服务 " + location.host + " / 日志 " + (d.log || "") + " / 2 秒轮询 / "
     + (d.log_size ? (d.log_size / 1024).toFixed(0) + " KB" : "0 KB")
@@ -4275,6 +4303,7 @@ function changeOkPageSize(value) {
 syncThemeButtons();
 initHelp();
 loadTokenField();
+bindTailFollow();
 refresh();
 setInterval(refresh, 2000);
 // full stats once on load
