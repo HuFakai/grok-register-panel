@@ -1120,7 +1120,7 @@ HTML = r"""<!DOCTYPE html>
     align-items: flex-end;
     justify-content: space-between;
     gap: 20px;
-    margin: 2px 0 20px;
+    margin: 2px 0 14px;
   }
   .page-heading > div { min-width: 0; }
   .page-title { margin: 0; color: var(--text); font-size: 28px; line-height: 1.18; font-weight: 680; }
@@ -1157,14 +1157,14 @@ HTML = r"""<!DOCTYPE html>
   .dot.on { background: var(--ok); }
   .dot.done { background: var(--ok); }
   .dot.off { background: var(--muted); }
-  main { width: min(calc(100% - 64px), 1480px); margin: 0 auto; padding: 28px 0 48px; }
+  main { width: min(calc(100% - 64px), 1280px); margin: 0 auto; padding: 28px 0 48px; }
   .panel-gap { margin-top: 14px; }
   .card {
     min-width: 0;
     background: var(--surface-raised);
     border: 1px solid var(--border);
     border-radius: 0;
-    padding: 16px;
+    padding: 14px;
     transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms cubic-bezier(.16, 1, .3, 1);
   }
   @media (hover: hover) {
@@ -1224,7 +1224,7 @@ HTML = r"""<!DOCTYPE html>
   .ip-policy {
     grid-column: 1 / -1;
     display: grid;
-    grid-template-columns: minmax(260px, 1.4fr) repeat(3, minmax(140px, .6fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
     align-items: end;
     padding: 12px;
@@ -1323,6 +1323,30 @@ HTML = r"""<!DOCTYPE html>
     background: var(--accent);
     color: var(--accent-ink);
   }
+  .header-btn {
+    min-width: 0;
+    min-height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    background: var(--surface-soft);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 620;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms cubic-bezier(.16, 1, .3, 1);
+  }
+  .header-btn:hover { border-color: var(--hover-border); color: var(--text); }
+  .header-btn:active { transform: translateY(1px); }
+  .header-btn.primary { background: var(--primary-bg); border-color: var(--primary-bg); color: var(--primary-text); }
+  .header-btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+  .status-cluster .msg { margin: 0; min-height: 0; font-size: 11px; white-space: nowrap; }
   .theme-switch {
     flex: 0 0 auto;
     display: inline-flex;
@@ -1348,7 +1372,7 @@ HTML = r"""<!DOCTYPE html>
   button.theme-option[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
   .metric-grid {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 1px;
     overflow: hidden;
     border: 1px solid var(--border);
@@ -1373,7 +1397,7 @@ HTML = r"""<!DOCTYPE html>
     overflow-wrap: anywhere;
   }
   .metric .sub { min-height: 16px; margin-top: 4px; color: var(--muted); font-size: 11px; }
-  .rate-panel { margin-top: 10px; padding: 12px 16px 14px; }
+  .rate-panel { padding: 12px 14px 14px; }
   .rate-panel .section-head { min-height: 24px; margin-bottom: 8px; }
   .rate-panel .section-meta { font-size: 11px; }
   .rate-grid {
@@ -1554,6 +1578,9 @@ HTML = r"""<!DOCTYPE html>
   .ip-pool-table th:nth-child(4) { width: 110px; }
   .ip-pool-table th:nth-child(5) { width: 110px; }
   .ip-pool-table th:nth-child(6) { width: 90px; }
+  /* BFS 检测表：4 列自适应（proxy-table 的 min-width:1040px 会撑出横向滚动，这里不适用） */
+  .bfs-table { min-width: 0; }
+  .bfs-table td { overflow-wrap: anywhere; }
   .proxy-select { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-endpoint { overflow-wrap: anywhere; }
   .proxy-meta { margin-top: 3px; color: var(--muted); font-size: 10px; }
@@ -1897,6 +1924,8 @@ HTML = r"""<!DOCTYPE html>
     .brand { width: auto; }
     .status-cluster { width: auto; justify-content: flex-end; margin-left: auto; }
     #clock, #sync-label { display: none; }
+    .header-btn { min-height: 28px; padding: 0 8px; font-size: 10px; }
+    #config-backup-msg { display: none; }
     main { width: calc(100% - 24px); padding: 20px 0 34px; }
     .page-heading { margin-bottom: 16px; }
     .page-title { font-size: 22px; }
@@ -2054,6 +2083,15 @@ HTML = r"""<!DOCTYPE html>
       <button type="button" class="view-switch" id="help-view-toggle" aria-label="打开问题和使用" title="问题和使用" aria-controls="help-view" aria-expanded="false" data-active="false" onclick="toggleAppView()">
         <span id="help-view-label" aria-hidden="true">问题和使用</span>
       </button>
+      <button type="button" class="header-btn primary" id="topbar-export" onclick="exportConfig()"
+              title="导出全部配置（config / 代理池 / 邮箱域名 / 多配置档 / IP 限制，含敏感凭据，请妥善保管）">导出配置</button>
+      <label class="header-btn" id="topbar-import"
+             title="导入配置文件恢复环境（将覆盖上述配置，导入后需重启面板生效）">
+        <span>导入</span>
+        <input type="file" id="config-import-file" accept=".json,application/json" class="sr-only"
+               onchange="importConfigFile(this.files[0])"/>
+      </label>
+      <span class="badge" id="config-backup-msg" role="status" aria-live="polite" hidden></span>
       <div class="theme-switch" role="group" aria-label="界面主题">
         <button type="button" class="theme-option" data-theme-choice="light" aria-pressed="false" onclick="setTheme('light')">浅色</button>
         <button type="button" class="theme-option" data-theme-choice="dark" aria-pressed="false" onclick="setTheme('dark')">深色</button>
@@ -2118,29 +2156,6 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
-  </section>
-
-  <section class="mail-provider-panel" aria-labelledby="config-backup-label" style="margin:12px 0 0">
-    <div class="mail-provider-toolbar">
-      <div>
-        <div class="mail-source-kicker">Config backup</div>
-        <h2 id="config-backup-label">配置备份（一键导出/导入）</h2>
-        <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
-          导出全部配置（config.json / 代理池 / 邮箱域名池 / 邮箱多配置档 / 控制参数 / IP 使用限制），
-          换环境（如重新 clone 仓库）后导入即可直接启动。
-          <span class="fail">导出文件含代理密码与邮箱密钥等敏感凭据，请妥善保管。</span>
-        </p>
-      </div>
-      <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
-        <button class="primary" onclick="exportConfig()">导出配置</button>
-        <label class="proxy-job" style="display:inline-flex;align-items:center;gap:6px">
-          导入
-          <input type="file" id="config-import-file" accept=".json,application/json" style="max-width:220px"
-                 onchange="importConfigFile(this.files[0])"/>
-        </label>
-      </div>
-    </div>
-    <div class="msg" id="config-backup-msg" role="status" aria-live="polite"></div>
   </section>
 
   <section class="help-view" id="help-view" aria-labelledby="help-view-title" hidden>
@@ -2554,60 +2569,62 @@ HTML = r"""<!DOCTYPE html>
 
   <section class="metric-grid panel-gap" id="kpis" aria-label="核心指标"></section>
 
-  <section class="card panel rate-panel">
-    <div class="section-head">
-      <h2>时段成功率</h2>
-      <span class="section-meta mono" id="rates-updated">register_results.jsonl</span>
-    </div>
-    <div class="rate-grid" id="rate-kpis"></div>
-  </section>
-
-  <section class="card panel">
-    <div class="progress-head">
-      <h2>当前批次</h2>
-      <div class="mono" id="prog-text">--</div>
-    </div>
-    <div class="bar-wrap"><div class="bar" id="bar"></div></div>
-    <div class="progress-sub" id="prog-sub"></div>
-  </section>
-
-  <section class="card panel recovery-panel" aria-labelledby="recovery-title">
-    <div class="section-head">
-      <h2 id="recovery-title">账号补录</h2>
-      <span class="section-meta mono" id="recovery-status">等待检查</span>
-    </div>
-    <div class="recovery-layout">
-      <div class="chips" id="recovery-kpis"></div>
-      <div class="button-group recovery-actions">
-        <button id="recovery-pending" onclick="startRecovery('pending')">补录待处理</button>
-        <button id="recovery-accounts" onclick="startRecovery('accounts')">扫描全部账号</button>
-        <button class="danger" id="recovery-stop" onclick="stopRecovery()">停止补录</button>
+  <div class="two panel-gap">
+    <section class="card rate-panel">
+      <div class="section-head">
+        <h2>时段成功率</h2>
+        <span class="section-meta mono" id="rates-updated">register_results.jsonl</span>
       </div>
-    </div>
-    <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
-  </section>
+      <div class="rate-grid" id="rate-kpis"></div>
+    </section>
+    <section class="card">
+      <div class="progress-head">
+        <h2>当前批次</h2>
+        <div class="mono" id="prog-text">--</div>
+      </div>
+      <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+      <div class="progress-sub" id="prog-sub"></div>
+    </section>
+  </div>
 
-  <section class="card panel" aria-labelledby="bfs-title">
-    <div class="section-head">
-      <h2 id="bfs-title">BFS 检测</h2>
-      <span class="section-meta mono" id="bfs-status">JWT claim</span>
-    </div>
-    <p style="margin:6px 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
-      解码 CPA / Grok2API auth 中的 access_token，检查是否含 <code>bfs</code> claim（与 botFlagSource 独立）。
-      注册换 token 后会自动检测并写入 <code>accounts/sso_bfs_flagged.txt</code>。
-    </p>
-    <div class="chips" id="bfs-kpis"></div>
-    <div class="button-group" style="margin:10px 0 8px">
-      <button id="bfs-scan" onclick="runBfsScan()">扫描 auth 目录</button>
-    </div>
-    <div class="msg" id="bfs-msg" role="status" aria-live="polite"></div>
-    <div class="table-scroll">
-      <table class="proxy-table">
-        <thead><tr><th>邮箱</th><th>bfs</th><th>来源</th><th>文件</th></tr></thead>
-        <tbody id="bfs-body"><tr><td colspan="4" class="proxy-empty">尚未扫描（点「扫描 auth 目录」）</td></tr></tbody>
-      </table>
-    </div>
-  </section>
+  <div class="two panel-gap">
+    <section class="card recovery-panel" aria-labelledby="recovery-title">
+      <div class="section-head">
+        <h2 id="recovery-title">账号补录</h2>
+        <span class="section-meta mono" id="recovery-status">等待检查</span>
+      </div>
+      <div class="recovery-layout">
+        <div class="chips" id="recovery-kpis"></div>
+        <div class="button-group recovery-actions">
+          <button id="recovery-pending" onclick="startRecovery('pending')">补录待处理</button>
+          <button id="recovery-accounts" onclick="startRecovery('accounts')">扫描全部账号</button>
+          <button class="danger" id="recovery-stop" onclick="stopRecovery()">停止补录</button>
+        </div>
+      </div>
+      <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
+    </section>
+    <section class="card" aria-labelledby="bfs-title">
+      <div class="section-head">
+        <h2 id="bfs-title">BFS 检测</h2>
+        <span class="section-meta mono" id="bfs-status">JWT claim</span>
+      </div>
+      <p style="margin:6px 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+        解码 CPA / Grok2API auth 中的 access_token，检查是否含 <code>bfs</code> claim（与 botFlagSource 独立）。
+        注册换 token 后会自动检测并写入 <code>accounts/sso_bfs_flagged.txt</code>。
+      </p>
+      <div class="chips" id="bfs-kpis"></div>
+      <div class="button-group" style="margin:10px 0 8px">
+        <button id="bfs-scan" onclick="runBfsScan()">扫描 auth 目录</button>
+      </div>
+      <div class="msg" id="bfs-msg" role="status" aria-live="polite"></div>
+      <div class="table-scroll">
+        <table class="bfs-table">
+          <thead><tr><th>邮箱</th><th>bfs</th><th>来源</th><th>文件</th></tr></thead>
+          <tbody id="bfs-body"><tr><td colspan="4" class="proxy-empty">尚未扫描（点「扫描 auth 目录」）</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
 
   <div class="three panel-gap">
     <div class="card">
@@ -2887,6 +2904,18 @@ function setMsg(id, text, cls) {
   const el = document.getElementById(id);
   el.textContent = text || "";
   el.className = "msg" + (cls ? " " + cls : "");
+  el.hidden = false;
+}
+function flashMsg(id, text, cls, ms) {
+  // 顶部导航栏等紧凑位置的瞬时反馈：显示后自动隐藏
+  setMsg(id, text, cls);
+  setTimeout(() => {
+    const el = document.getElementById(id);
+    if (el && el.textContent === text) {
+      el.textContent = "";
+      el.hidden = true;
+    }
+  }, ms || 6000);
 }
 function getToken() {
   const el = document.getElementById("monitor-token");
@@ -3310,9 +3339,9 @@ async function exportConfig() {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-    setMsg("config-backup-msg", "已导出（含敏感凭据，请妥善保管）", "ok");
+    flashMsg("config-backup-msg", "已导出（含敏感凭据，请妥善保管）", "ok");
   } catch (e) {
-    setMsg("config-backup-msg", String(e.message || e), "err");
+    flashMsg("config-backup-msg", String(e.message || e), "err");
   }
 }
 async function importConfigFile(file) {
@@ -3328,9 +3357,9 @@ async function importConfigFile(file) {
     const msg = "导入完成：" + (j.written || []).join("、")
       + (j.skipped && j.skipped.length ? "；跳过：" + j.skipped.join("、") : "")
       + "。请重启面板/注册进程生效。";
-    setMsg("config-backup-msg", msg, "ok");
+    flashMsg("config-backup-msg", msg, "ok");
   } catch (e) {
-    setMsg("config-backup-msg", "导入失败：" + String(e.message || e), "err");
+    flashMsg("config-backup-msg", "导入失败：" + String(e.message || e), "err");
   } finally {
     document.getElementById("config-import-file").value = "";
   }
