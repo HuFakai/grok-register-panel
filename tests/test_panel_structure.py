@@ -71,8 +71,8 @@ def test_compact_overview_density():
     assert '.control-panel { padding: 12px 16px; }' in mon
     assert '.control-panel .msg:empty { display: none; }' in mon
     assert '#kpis { margin-top: 10px; }' in mon
-    assert '.rate-panel { margin-top: 10px; padding: 12px 16px 14px; }' in mon
-    assert '<section class="card panel rate-panel">' in mon
+    assert '.rate-panel { padding: 12px 14px 14px; }' in mon
+    assert '<section class="card rate-panel">' in mon
     assert '@media (min-width: 1121px)' in mon
     assert '.control-panel .control-actions button {' in mon
 

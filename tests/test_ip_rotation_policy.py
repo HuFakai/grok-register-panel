@@ -350,21 +350,23 @@ def test_rotate_skips_precheck_failed_exit_without_starting_browser():
 
 
 def test_blank_page_fails_and_soft_blacklists_without_same_slot_retry():
-    """空页（页面空白/无表单）直接失败 + 软拉黑当前出口，不再同槽位换口重试。"""
+    """空页（页面空白/无表单）直接失败，首次临时冷却、累计≥2次永久拉黑。"""
     src = (ROOT / "grok_register_ttk.py").read_text(encoding="utf-8")
-    # 空页单独分支先于重试判定：软拉黑后落入通用失败路径
+    # 空页单独分支先于重试判定：不换口重试，走通用失败路径
     assert "if blank_ui:" in src
-    assert "soft_blacklist_ip(active_ip)" in src
-    assert "空页判定失败，软拉黑出口" in src
+    assert "record_blank_page(active_ip)" in src
+    assert "空页判定失败" in src
     # 重试分支不再包含 blank_ui（不再对空页换口重试）
     marker = "elif (proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:"
     assert marker in src
     retry_branch = src.split(marker, 1)[1].split("retry_same_slot = True", 1)[0]
     assert "blank_ui" not in retry_branch
+    # 预检与 claim 路径都检查软拉黑冷却
+    assert "is_soft_blacklisted" in src
 
 
 def test_soft_blacklisted_ip_fails_precheck():
-    """软拉黑后的出口在预检中被跳过（累计使用 99999 超过上限）。"""
+    """软拉黑后的出口在预检中被跳过（累计使用 99999 或冷却中）。"""
     import ip_usage_store
 
     old = dict(app.config)
@@ -383,11 +385,17 @@ def test_soft_blacklisted_ip_fails_precheck():
             usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
             assert usable is False
             assert ip == "203.0.113.99"
-            assert "已到上限" in reason
-            # 可用池探测同样判为不可用
-            import webui.ip_ready_pool as pool
-            assert pool._usage_limit("203.0.113.99") == 30
-            assert pool._read_items() == [] or True
+            assert "软拉黑" in reason or "已到上限" in reason
+            # 临时冷却同样被预检跳过
+            app._bs._resolve_proxy_exit_ip = lambda proxy: "203.0.113.100"
+            ip_usage_store.record_blank_page("203.0.113.100")
+            usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+            assert usable is False
+            assert "冷却" in reason
+            # 冷却到期后恢复可用
+            ip_usage_store.clear_soft_blacklist("203.0.113.100")
+            usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+            assert usable is True
         finally:
             ip_usage_store._USAGE_FILE = previous
         app.config.clear()

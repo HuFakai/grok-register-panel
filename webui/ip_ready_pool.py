@@ -144,7 +144,7 @@ def probe_one(
     """
     try:
         from browser_session import _resolve_proxy_exit_ip, is_blocked_exit_ip
-        from ip_usage_store import get_ip_usage
+        from ip_usage_store import get_ip_usage, is_soft_blacklisted
 
         exit_ip = _resolve_proxy_exit_ip(expanded_url, timeout=6.0)
     except Exception as exc:
@@ -154,6 +154,13 @@ def probe_one(
     exit_ip = str(exit_ip or "").strip()
     if not exit_ip:
         return None
+    try:
+        if is_soft_blacklisted(exit_ip):
+            if log_callback:
+                log_callback(f"[ip-pool] skip soft-blacklisted {exit_ip}")
+            return None
+    except Exception:
+        pass
     try:
         blocked, reason = is_blocked_exit_ip(exit_ip)
         if blocked:
@@ -247,8 +254,8 @@ def probe_round(
 
 
 def refresh_pool(now: float | None = None) -> dict:
-    """清理过期/僵死项，并按当前 ip_usage 计数重算 usable。返回最新统计。"""
-    from ip_usage_store import get_ip_usage
+    """清理过期/僵死项，并按当前 ip_usage 计数与软拉黑状态重算 usable。"""
+    from ip_usage_store import get_ip_usage, is_soft_blacklisted
 
     now = time.time() if now is None else now
     with _POOL_LOCK:
@@ -263,11 +270,14 @@ def refresh_pool(now: float | None = None) -> dict:
             ip = str(it.get("exit_ip") or "").strip()
             if ip:
                 try:
-                    limit = _usage_limit(ip)
-                    used = get_ip_usage(ip)
-                    it["used"] = int(used)
-                    it["limit"] = int(limit)
-                    it["usable"] = not (limit > 0 and used >= limit)
+                    if is_soft_blacklisted(ip):
+                        it["usable"] = False
+                    else:
+                        limit = _usage_limit(ip)
+                        used = get_ip_usage(ip)
+                        it["used"] = int(used)
+                        it["limit"] = int(limit)
+                        it["usable"] = not (limit > 0 and used >= limit)
                 except Exception:
                     pass
             kept.append(it)

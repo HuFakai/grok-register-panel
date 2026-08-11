@@ -52,7 +52,14 @@ from account_exports import (
     consolidate_account_exports,
     save_account_record,
 )
-from ip_usage_store import get_ip_usage, get_per_ip_limit, record_ip_usage, soft_blacklist_ip
+from ip_usage_store import (
+    get_ip_usage,
+    get_per_ip_limit,
+    is_soft_blacklisted,
+    record_blank_page,
+    record_ip_usage,
+    soft_blacklist_until,
+)
 from batch_supervisor import mark_slot_completed
 from secure_files import (
     append_private_text,
@@ -901,6 +908,15 @@ def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
         blocked, reason = _bs.is_blocked_exit_ip(exit_ip)
         if blocked:
             return False, exit_ip, f"出口IP命中黑名单: {reason or exit_ip}"
+    except Exception:
+        pass
+    try:
+        if is_soft_blacklisted(exit_ip):
+            until = soft_blacklist_until(exit_ip)
+            if until > 0:
+                remain = int(until - time.time())
+                return False, exit_ip, f"空页临时冷却中（剩余 {remain}s）"
+            return False, exit_ip, "软拉黑中（累计空页达标）"
     except Exception:
         pass
     try:
@@ -4325,6 +4341,25 @@ def run_registration_cli(count):
                                 )
                             )
                             continue
+                        try:
+                            if is_soft_blacklisted(current_ip):
+                                cli_log(
+                                    f"[W{wid+1}] [*] [IP策略] 跳过出口 {current_ip}："
+                                    "空页软拉黑/冷却中"
+                                )
+                                current_rotate_idx, current_ip, current_started_at = (
+                                    rotate_browser_to_new_exit(
+                                        wid,
+                                        current_rotate_idx,
+                                        current_ip,
+                                        current_started_at,
+                                        log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                        cancel_callback=controller.should_stop,
+                                    )
+                                )
+                                continue
+                        except Exception:
+                            pass
                     claimed, used, reason = ip_quota.claim(wid, current_ip)
                     if claimed:
                         return (
@@ -4587,17 +4622,22 @@ def run_registration_cli(count):
                             or "资料页无提交按钮" in msg
                         )
                         if blank_ui:
-                            # 空页（reload 已尝试仍空白/无表单）：通常是该出口
-                            # 被 xAI 屏蔽的强信号。直接判定槽位失败并软拉黑该 IP
-                            # （累计使用置 99999，超过所有上限，后续预检/可用池/
-                            # 配额全部跳过），不再同槽位换口重试浪费时间。
+                            # 空页（reload 已尝试仍空白/无表单）：直接判定槽位
+                            # 失败，不再同槽位换口重试。首次空页只临时冷却该 IP
+                            # （30 分钟内预检/可用池跳过），累计空页 ≥2 次才
+                            # 永久软拉黑（counts 置 99999）——空页多为页面加载
+                            # 瞬时问题，避免单次抖动误杀长期正常 IP。
                             try:
-                                soft_blacklist_ip(active_ip)
+                                permanent, blank_count = record_blank_page(active_ip)
                             except Exception:
-                                pass
+                                permanent, blank_count = False, 0
                             cli_log(
-                                f"[W{wid+1}] [!] 空页判定失败，软拉黑出口 "
-                                f"{active_ip or '?'}（累计使用置 99999）"
+                                f"[W{wid+1}] [!] 空页判定失败，出口 {active_ip or '?'} "
+                                + (
+                                    f"永久软拉黑（累计空页 {blank_count} 次）"
+                                    if permanent
+                                    else f"临时冷却 30 分钟（累计空页 {blank_count} 次）"
+                                )
                             )
                         elif (proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1

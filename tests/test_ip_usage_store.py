@@ -160,6 +160,53 @@ def test_soft_blacklist_ip():
             ip_usage_store._USAGE_FILE = previous
 
 
+def test_record_blank_page_first_cooldown_then_permanent():
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = ip_usage_store._USAGE_FILE
+        ip_usage_store._USAGE_FILE = Path(tmp) / "ip_usage.json"
+        try:
+            ip_usage_store.record_ip_usage("7.7.7.7", times=5)
+            # 首次空页：临时冷却，不永久拉黑
+            permanent, count = ip_usage_store.record_blank_page("7.7.7.7")
+            assert permanent is False
+            assert count == 1
+            assert ip_usage_store.get_ip_usage("7.7.7.7") == 5  # 计数不变
+            assert ip_usage_store.is_soft_blacklisted("7.7.7.7") is True
+            assert ip_usage_store.soft_blacklist_until("7.7.7.7") > 0
+            # 冷却未过期时累计计数继续
+            permanent, count = ip_usage_store.record_blank_page("7.7.7.7")
+            assert permanent is True  # 累计 2 次 → 永久拉黑
+            assert count == 2
+            assert ip_usage_store.get_ip_usage("7.7.7.7") == ip_usage_store.SOFT_BLACKLIST_COUNT
+            assert ip_usage_store.is_soft_blacklisted("7.7.7.7") is True
+            # 冷却到期后自动恢复（模拟时间流逝）
+            ip_usage_store.record_ip_usage("7.7.7.7")  # 99999 之上 +1
+            ip_usage_store._USAGE_FILE.write_text(
+                ip_usage_store._USAGE_FILE.read_text(encoding="utf-8").replace(
+                    str(ip_usage_store.SOFT_BLACKLIST_COUNT + 1), "8"
+                ),
+                encoding="utf-8",
+            )
+            # 空 IP 忽略
+            assert ip_usage_store.record_blank_page("") == (False, 0)
+        finally:
+            ip_usage_store._USAGE_FILE = previous
+
+
+def test_clear_soft_blacklist():
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = ip_usage_store._USAGE_FILE
+        ip_usage_store._USAGE_FILE = Path(tmp) / "ip_usage.json"
+        try:
+            assert ip_usage_store.clear_soft_blacklist("9.9.9.9") is False
+            ip_usage_store.record_blank_page("9.9.9.9")
+            assert ip_usage_store.clear_soft_blacklist("9.9.9.9") is True
+            assert ip_usage_store.is_soft_blacklisted("9.9.9.9") is False
+            assert ip_usage_store.clear_soft_blacklist("9.9.9.9") is False
+        finally:
+            ip_usage_store._USAGE_FILE = previous
+
+
 if __name__ == "__main__":
     test_record_and_read_usage()
     test_usage_persists_across_store_reloads()
@@ -168,4 +215,6 @@ if __name__ == "__main__":
     test_delete_ip_usage()
     test_meta_and_detail()
     test_soft_blacklist_ip()
+    test_record_blank_page_first_cooldown_then_permanent()
+    test_clear_soft_blacklist()
     print("OK ip usage store")

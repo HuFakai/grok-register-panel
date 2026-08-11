@@ -224,6 +224,57 @@ def test_probe_one_marks_over_limit_and_blocked():
             pool._usage_limit = previous_limit
 
 
+def test_probe_one_skips_soft_blacklisted():
+    """空页临时冷却/永久拉黑的出口不入可用池。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = _use_temp_pool(tmp)
+        previous_usage_file = ip_usage_store._USAGE_FILE
+        ip_usage_store._USAGE_FILE = Path(tmp) / "ip_usage.json"
+        previous_resolve = browser_session._resolve_proxy_exit_ip
+        previous_blocked = browser_session.is_blocked_exit_ip
+        previous_limit = pool._usage_limit
+        try:
+            browser_session._resolve_proxy_exit_ip = lambda *a, **k: "10.0.0.77"
+            browser_session.is_blocked_exit_ip = lambda *a, **k: (False, "")
+            pool._usage_limit = lambda ip: 30
+
+            # 首次空页 → 临时冷却 → 探测不入池
+            ip_usage_store.record_blank_page("10.0.0.77")
+            assert (
+                pool.probe_one(
+                    "http://Default.{session}:TOKEN@h:2261",
+                    "http://Default.cool1:TOKEN@h:2261",
+                )
+                is None
+            )
+            # 冷却清除后恢复入池
+            ip_usage_store.clear_soft_blacklist("10.0.0.77")
+            item = pool.probe_one(
+                "http://Default.{session}:TOKEN@h:2261",
+                "http://Default.cool2:TOKEN@h:2261",
+            )
+            assert item is not None and item["usable"] is True
+
+            # 累计 2 次空页 → 永久拉黑 → 探测不入池
+            browser_session._resolve_proxy_exit_ip = lambda *a, **k: "10.0.0.78"
+            ip_usage_store.record_blank_page("10.0.0.78")
+            ip_usage_store.record_blank_page("10.0.0.78")
+            assert ip_usage_store.get_ip_usage("10.0.0.78") == ip_usage_store.SOFT_BLACKLIST_COUNT
+            assert (
+                pool.probe_one(
+                    "http://Default.{session}:TOKEN@h:2261",
+                    "http://Default.cool3:TOKEN@h:2261",
+                )
+                is None
+            )
+        finally:
+            pool._POOL_FILE = previous
+            ip_usage_store._USAGE_FILE = previous_usage_file
+            browser_session._resolve_proxy_exit_ip = previous_resolve
+            browser_session.is_blocked_exit_ip = previous_blocked
+            pool._usage_limit = previous_limit
+
+
 def test_probe_round_dedupes_and_merges():
     with tempfile.TemporaryDirectory() as tmp:
         previous = _use_temp_pool(tmp)
@@ -281,5 +332,6 @@ if __name__ == "__main__":
     test_refresh_cleans_expired_and_recomputes_usable()
     test_probe_one_builds_item()
     test_probe_one_marks_over_limit_and_blocked()
+    test_probe_one_skips_soft_blacklisted()
     test_probe_round_dedupes_and_merges()
     print("OK ip ready pool")
