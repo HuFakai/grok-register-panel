@@ -7,12 +7,14 @@ Camoufox 从编译层修改 Gecko，JS 完全不可检测。
 from __future__ import annotations
 
 import gc
+import ipaddress
 import os
 import shutil
 import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Callable, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -28,7 +30,9 @@ from playwright._impl._playwright import Playwright as _PwImpl
 from playwright._impl._transport import PipeTransport as _PwPipeTransport
 from playwright.sync_api._generated import Playwright as _SyncPlaywright
 
+from batch_traffic import meter_proxy_url
 from camoufox_adapter import CamoufoxBrowser, CamoufoxPage
+from retry_policy import browser_start_attempts
 from secure_files import ensure_private_dir
 from webui.blacklist_store import read_blacklist
 from webui.security_utils import redact_log_line, redact_proxy
@@ -323,7 +327,27 @@ def _is_managed_profile_dir(path: str) -> bool:
         return False
     norm = os.path.normpath(path).replace("\\", "/").lower()
     marker = _PROFILE_ROOT_MARKER.lower()
-    return f"/{marker}/" in f"/{norm}/" or norm.rstrip("/").endswith(f"/{marker}")
+    if f"/{marker}/" in f"/{norm}/" or norm.rstrip("/").endswith(f"/{marker}"):
+        return True
+    return "/.browser-profiles/" in f"/{norm}/" or norm.rstrip("/").endswith(
+        "/.browser-profiles"
+    )
+
+
+def _profile_root(
+    *,
+    platform_name: str | None = None,
+    environ=None,
+    temp_root: str | None = None,
+) -> Path:
+    platform = os.name if platform_name is None else str(platform_name)
+    source = os.environ if environ is None else environ
+    if platform == "nt":
+        local_app_data = str(source.get("LOCALAPPDATA", "") or "").strip()
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return ensure_private_dir(base / "GrokRegister" / _PROFILE_ROOT_MARKER)
+    base = temp_root if temp_root is not None else tempfile.gettempdir()
+    return ensure_private_dir(Path(base) / _PROFILE_ROOT_MARKER)
 
 
 def _rmtree_with_retry(path: str, max_retries: int = 3, delay: float = 0.5) -> bool:
@@ -382,37 +406,33 @@ def cleanup_stale_profiles(log_callback=None) -> int:
     删除所有未被当前进程占用的旧目录。
     返回清理的目录数量。
     """
-    root = os.path.join(tempfile.gettempdir(), _PROFILE_ROOT_MARKER)
-    if not os.path.isdir(root):
-        return 0
-    ensure_private_dir(root)
+    roots = [Path(tempfile.gettempdir()) / _PROFILE_ROOT_MARKER]
+    if os.name == "nt":
+        roots.insert(0, _profile_root())
+        roots.append(Path(__file__).resolve().parent / ".browser-profiles")
 
     current_pid = os.getpid()
     cleaned = 0
-    try:
-        for entry in os.listdir(root):
-            entry_path = os.path.join(root, entry)
-            if not os.path.isdir(entry_path):
-                continue
-            # Directory format: {pid}-{thread_id}-{uuid8}. Unknown names are
-            # never removed, and profiles owned by any live process are kept.
-            match = __import__("re").fullmatch(r"(\d+)-\d+-[0-9a-fA-F]{8}", entry)
-            if not match:
-                continue
-            owner_pid = int(match.group(1))
-            if owner_pid == current_pid or _pid_alive(owner_pid):
-                continue
-            if _rmtree_with_retry(entry_path):
-                cleaned += 1
-    except Exception:
-        pass
-
-    # 如果 root 目录已空，顺便删掉
-    if cleaned > 0:
+    for root in roots:
+        if not root.is_dir():
+            continue
+        ensure_private_dir(root)
         try:
-            remaining = os.listdir(root)
-            if not remaining:
-                shutil.rmtree(root, ignore_errors=True)
+            for entry in os.listdir(root):
+                entry_path = root / entry
+                if not entry_path.is_dir():
+                    continue
+                # Unknown names and profiles owned by live processes are kept.
+                match = __import__("re").fullmatch(
+                    r"(\d+)-\d+-[0-9a-fA-F]{8}", entry
+                )
+                if not match:
+                    continue
+                owner_pid = int(match.group(1))
+                if owner_pid == current_pid or _pid_alive(owner_pid):
+                    continue
+                if _rmtree_with_retry(str(entry_path)):
+                    cleaned += 1
         except Exception:
             pass
 
@@ -422,60 +442,115 @@ def cleanup_stale_profiles(log_callback=None) -> int:
 
 
 
+def _normalize_ip_candidate(value: object) -> str:
+    text = str(value or "").strip().split()[0] if str(value or "").strip() else ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
 def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 8.0, log_callback=None) -> str:
     """经代理探测出口公网 IP（比 Camoufox 内置 public_ip 更耐住宅延迟）。
 
     Camoufox geoip=True 时会自己请求 ipecho/ipify，timeout 仅 5s，
     住宅 sticky 稍慢就 Failed to get IP → 浏览器启动失败。
-    这里加长超时、多源探测，成功后把 IP 字符串传给 geoip=，跳过库内探测。
+    这里加长总预算、多源探测，成功后把 IP 字符串传给 geoip=，跳过库内探测。
     """
-    import re as _re
-    import requests
-    import urllib3
-    from urllib3.exceptions import InsecureRequestWarning
-
     proxy_str = (proxy_str or "").strip()
     if not proxy_str:
         raise RuntimeError("代理为空，无法探测出口 IP")
     urls = (
         "https://api.ipify.org",
         "https://checkip.amazonaws.com",
-        "https://ipinfo.io/ip",
         "https://icanhazip.com",
-        "https://ifconfig.me/ip",
-        "https://ipecho.net/plain",
     )
-    proxies = {"http": proxy_str, "https": proxy_str}
-    # DataImpulse's HTTPS proxy tunnel can require verify=False. Disable only
-    # the corresponding urllib3 warning globally; catch_warnings is process
-    # global and races when multiple registration workers probe concurrently.
-    urllib3.disable_warnings(InsecureRequestWarning)
     last_exc = None
-    hard_fails = 0
-    # 死代理别把 6 个源全扫完（最坏 ~72s）；连续 2 次连接/SSL 失败即放弃
-    per_try = min(float(timeout), 8.0)
-    for url in urls:
+    # 总预算 2-20s（跨全部客户端与源），避免死代理扫完全部源
+    budget = max(2.0, min(float(timeout), 20.0))
+    deadline = time.monotonic() + budget
+    clients = []
+
+    def add_requests_client():
         try:
-            resp = requests.get(url, proxies=proxies, timeout=per_try, verify=False)
-            resp.raise_for_status()
-            ip = (resp.text or "").strip().split()[0]
-            if _re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) or ":" in ip:
-                if log_callback:
-                    log_callback(f"[*] 代理出口 IP: {ip} (via {url.split('/')[2]})")
-                return ip
-            last_exc = RuntimeError(f"非 IP 响应: {ip[:60]!r}")
-            hard_fails = 0
-        except Exception as exc:
-            last_exc = exc
-            hard_fails += 1
-            if log_callback:
-                host = url.split("/")[2]
-                log_callback(f"[Debug] 出口 IP 探测失败 {host}: {redact_log_line(str(exc))}")
-            if hard_fails >= 2:
+            import requests
+            import urllib3
+            from urllib3.exceptions import InsecureRequestWarning
+
+            # DataImpulse's HTTPS proxy tunnel can require verify=False. Disable
+            # the urllib3 warning globally (not catch_warnings): catch_warnings
+            # is process global and races when workers probe concurrently.
+            urllib3.disable_warnings(InsecureRequestWarning)
+
+            def request_get(url, request_timeout):
+                return requests.get(
+                    url,
+                    proxies={"http": proxy_str, "https": proxy_str},
+                    timeout=request_timeout,
+                    verify=False,
+                )
+
+            clients.append(("requests", request_get))
+        except ImportError:
+            pass
+
+    def add_curl_client():
+        try:
+            from curl_cffi import requests as curl_requests
+
+            def curl_get(url, request_timeout):
+                return curl_requests.get(
+                    url,
+                    proxy=proxy_str,
+                    timeout=request_timeout,
+                    impersonate="chrome",
+                    verify=False,
+                )
+
+            clients.append(("curl_cffi", curl_get))
+        except ImportError:
+            pass
+
+    if os.name == "nt":
+        add_curl_client()
+        add_requests_client()
+    else:
+        add_requests_client()
+        add_curl_client()
+
+    for client_name, request_get in clients:
+        hard_fails = 0
+        for url in urls:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            continue
+            per_try = max(1.0, min(4.0, remaining))
+            try:
+                resp = request_get(url, per_try)
+                resp.raise_for_status()
+                ip = _normalize_ip_candidate(getattr(resp, "text", ""))
+                if ip:
+                    if log_callback:
+                        log_callback(
+                            f"[*] 代理出口 IP: {ip} ({client_name}/{url.split('/')[2]})"
+                        )
+                    return ip
+                last_exc = RuntimeError("出口探测返回了非 IP 内容")
+            except Exception as exc:
+                last_exc = exc
+                hard_fails += 1
+                if log_callback:
+                    log_callback(
+                        f"[Debug] 出口 IP 探测失败 {url.split('/')[2]}: "
+                        f"{redact_log_line(str(exc))}"
+                    )
+                if hard_fails >= 2:
+                    break
+        if time.monotonic() >= deadline:
+            break
     raise RuntimeError(
-        f"代理出口 IP 探测失败(timeout={per_try}s): {redact_log_line(str(last_exc))}"
+        f"代理出口 IP 探测失败(total_timeout={budget:.1f}s): "
+        f"{redact_log_line(str(last_exc))}"
     )
 
 
@@ -566,20 +641,35 @@ def create_browser_options(unique_profile=True) -> dict:
     替代原 DrissionPage 的 ChromiumOptions。
 
     反检测策略：
-    - headless=False：有头模式（headless 更易被检测）
+    - headless=False：有头模式（headless 更易被检测）；GROK_HEADLESS=1 强制
+      无头（某些 Windows 会话有头 Camoufox 会因 GPU 进程崩溃），GROK_HEADED=1 覆盖
     - humanize=True：人类化鼠标移动 + 点击轨迹
     - geoip=True：基于代理 IP 匹配时区 / 语言 / 经纬度
     - block_webrtc=True：WebRTC IP 泄漏防护（避免真实 IP 通过 STUN 暴露）
     - 指纹由 BrowserForge 自动生成（匹配 Firefox/Camoufox 引擎）
     """
+    headless_env = str(os.environ.get("GROK_HEADLESS", "") or "").strip().lower()
+    headed_env = str(os.environ.get("GROK_HEADED", "") or "").strip().lower()
+    force_headless = headless_env in {"1", "true", "yes", "on"}
+    force_headed = headed_env in {"1", "true", "yes", "on"}
+    use_headless = bool(force_headless) and not force_headed
+
     opts: dict = {
-        "headless": False,      # 反检测：有头模式（headless 更易被检测）
+        "headless": use_headless,  # 默认有头；GPU 崩溃会话设 GROK_HEADLESS=1
         "humanize": True,       # 人类化鼠标移动 + 贝塞尔轨迹
         "geoip": True,          # 基于 IP 匹配时区 / 语言 / 经纬度
         "locale": "en-US",      # 与美西出口一致，避免 UI 语言漂移
         "block_webrtc": True,   # 防止 WebRTC 泄漏真实 IP（即使使用代理）
         "i_know_what_im_doing": True,  # 抑制 Firefox 版本伪装警告（Camoufox 引擎层伪装是预期行为）
     }
+    if use_headless or os.name == "nt":
+        # Soften GPU requirements on Windows (headed or headless).
+        opts["firefox_user_prefs"] = {
+            "gfx.webrender.all": False,
+            "gfx.webrender.software": True,
+            "layers.acceleration.disabled": True,
+            "media.hardware-video-decoding.enabled": False,
+        }
 
     # 旧格式安装兼容：传 executable_path 绕过 installed_verstr() 检查
     # 注意：不传 ff_version，让 Camoufox 自动检测版本号
@@ -596,9 +686,10 @@ def create_browser_options(unique_profile=True) -> dict:
     proxies = _proxies()
     proxy = str(proxies.get("https") or proxies.get("http") or "").strip()
     if proxy:
-        opts["proxy"] = _build_camoufox_proxy(proxy)
+        network_proxy = meter_proxy_url(proxy)
+        opts["proxy"] = _build_camoufox_proxy(network_proxy)
         try:
-            exit_ip = _resolve_proxy_exit_ip(proxy, timeout=8.0)
+            exit_ip = _resolve_proxy_exit_ip(network_proxy, timeout=8.0)
             blocked, meta = is_blocked_exit_ip(exit_ip)
             if blocked:
                 set_exit_context(proxy=proxy, exit_ip=exit_ip)
@@ -629,9 +720,7 @@ def create_browser_options(unique_profile=True) -> dict:
 
     # Profile 隔离
     if unique_profile:
-        profile_root = ensure_private_dir(
-            os.path.join(tempfile.gettempdir(), _PROFILE_ROOT_MARKER)
-        )
+        profile_root = _profile_root()
         profile_dir = str(
             profile_root
             / f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
@@ -654,7 +743,10 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
     - 人类化鼠标轨迹
     """
     last_exc = None
-    for attempt in range(1, 5):
+    attempt_limit = browser_start_attempts()
+    attempts_made = 0
+    for attempt in range(1, attempt_limit + 1):
+        attempts_made = attempt
         profile_dir = None
         try:
             opts = create_browser_options(unique_profile=True)
@@ -744,7 +836,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             streak = _note_start_failure()
             if log_callback:
                 log_callback(
-                    f"[Debug] 浏览器启动失败(第{attempt}/4次, 连续失败{streak}): {redact_log_line(str(exc))}"
+                    f"[Debug] 浏览器启动失败(第{attempt}/{attempt_limit}次, 连续失败{streak}): {redact_log_line(str(exc))}"
                 )
             # 同一 sticky 出口探测失败：再试 3 次无意义，交给上层换口
             msg = str(exc)
@@ -765,7 +857,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             set_browser_session(None, None)
             _cleanup_profile_dir(profile_dir)
             time.sleep(min(1.5 * attempt, 4))
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
+    raise Exception(f"浏览器启动失败，已尝试{attempts_made}次: {last_exc}")
 
 
 def stop_browser(force=False):

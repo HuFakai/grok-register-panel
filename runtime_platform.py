@@ -6,8 +6,30 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+def _load_beijing_timezone(loader=ZoneInfo):
+    """Load Beijing time without making system tzdata a startup dependency."""
+    try:
+        return loader("Asia/Shanghai")
+    except (ZoneInfoNotFoundError, OSError):
+        return timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+# 面板 / 日志统一用北京时间（不受服务器 UTC 时区影响）
+TZ_BEIJING = _load_beijing_timezone()
+
+
+def now_beijing() -> datetime:
+    return datetime.now(TZ_BEIJING)
+
+
+def beijing_strftime(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    return now_beijing().strftime(fmt)
 
 
 class RuntimePlatformError(RuntimeError):
@@ -33,7 +55,10 @@ def runtime_python(
         configured_path = Path(configured).expanduser()
         if not configured_path.is_absolute():
             configured_path = project_root / configured_path
-        return configured_path.resolve()
+        # Keep the configured executable path itself. Resolving a venv's
+        # ``bin/python`` symlink selects the base interpreter and drops the
+        # virtual environment's site-packages.
+        return Path(os.path.abspath(configured_path))
 
     project_python = (
         project_root / ".venv" / "Scripts" / "python.exe"

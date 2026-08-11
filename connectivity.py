@@ -15,6 +15,10 @@ XAI_SIGNUP_CHECK_NAME = "xAI注册页"
 XAI_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 
+class XaiSignupPrecheckFailed(RuntimeError):
+    """The registration page was not reachable through the selected proxy."""
+
+
 def _tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
     s = socket.socket()
     s.settimeout(timeout)
@@ -111,6 +115,11 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
     return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
+
+
+def require_xai_signup(results: List[CheckResult]) -> None:
+    if has_blocking_xai_failure(results):
+        raise XaiSignupPrecheckFailed("xAI registration page precheck failed")
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:

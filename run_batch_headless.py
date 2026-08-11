@@ -5,6 +5,7 @@ import os
 os.chdir(str(Path(__file__).resolve().parent))
 
 import json
+import secrets
 import sys
 import time
 import types
@@ -14,7 +15,16 @@ from batch_supervisor import (
     DEFAULT_MAX_RESTARTS,
     run_supervisor,
 )
+from batch_traffic import (
+    BATCH_ID_ENV,
+    HISTORY_FILE_ENV,
+    TRAFFIC_FILE_ENV,
+    archive_batch,
+    finalize_batch,
+    initialize_batch,
+)
 from account_exports import consolidate_account_exports
+from retry_policy import PRECHECK_EXIT_CODE
 from secure_files import atomic_write_json, ensure_private_dir
 from notify_push import notify_task_done
 
@@ -107,7 +117,6 @@ def _run_child(count: int, workers: int) -> int:
     import connectivity
     import grok_register_ttk as app
 
-    connectivity.has_blocking_xai_failure = lambda _results: False
     config_path = ROOT / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["register_count"] = count
@@ -145,7 +154,11 @@ def _run_child(count: int, workers: int) -> int:
         f"proxy={_redact_proxy(app.config.get('proxy'))}",
         flush=True,
     )
-    app.run_registration_cli(count)
+    try:
+        app.run_registration_cli(count)
+    except connectivity.XaiSignupPrecheckFailed:
+        print("[batch] xAI registration page precheck failed; batch stopped", flush=True)
+        return PRECHECK_EXIT_CODE
     print("[batch] finished", flush=True)
     return 0
 
@@ -192,14 +205,43 @@ def main(argv: list[str] | None = None) -> int:
         DEFAULT_MAX_RESTARTS,
         0,
     )
-    result = run_supervisor(
-        count,
-        workers,
-        _child_command,
-        progress_file=progress_file,
-        idle_timeout=idle_timeout,
-        max_restarts=max_restarts,
+    batch_id = str(os.environ.get(BATCH_ID_ENV, "") or "").strip()
+    if not batch_id:
+        batch_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(3)}"
+    traffic_file = Path(
+        str(os.environ.get(TRAFFIC_FILE_ENV, "") or LOG_DIR / "batch_traffic.json")
+    ).resolve()
+    history_file = Path(
+        str(
+            os.environ.get(HISTORY_FILE_ENV, "")
+            or LOG_DIR / "batch_traffic_history.json"
+        )
+    ).resolve()
+    initialize_batch(
+        traffic_file,
+        batch_id,
+        target=count,
+        workers=workers,
     )
+    child_env = {
+        BATCH_ID_ENV: batch_id,
+        TRAFFIC_FILE_ENV: str(traffic_file),
+    }
+    result = 1
+    try:
+        result = run_supervisor(
+            count,
+            workers,
+            _child_command,
+            progress_file=progress_file,
+            idle_timeout=idle_timeout,
+            max_restarts=max_restarts,
+            child_env=child_env,
+        )
+    finally:
+        finalized = finalize_batch(traffic_file, batch_id, result)
+        if finalized.get("batch_id") == batch_id:
+            archive_batch(history_file, finalized)
     try:
         exported = consolidate_account_exports(ROOT / "accounts")
         print(

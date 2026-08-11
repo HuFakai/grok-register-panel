@@ -61,6 +61,8 @@ from ip_usage_store import (
     soft_blacklist_until,
 )
 from batch_supervisor import mark_slot_completed
+from batch_traffic import mark_successful_account
+from retry_policy import proxy_boot_rotations, slot_retries
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -593,6 +595,18 @@ def load_config():
     return config
 
 
+def _sleep_cancelable(seconds, should_stop=None) -> None:
+    """Sleep in short slices so stop flags can interrupt account gaps."""
+    end = time.time() + max(0.0, float(seconds or 0))
+    while time.time() < end:
+        if callable(should_stop) and should_stop():
+            return
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.5, remaining))
+
+
 def parse_account_interval() -> float:
     """解析 account_interval 配置，返回等待秒数。
 
@@ -1101,10 +1115,19 @@ def record_proxy_boot_failure(proxy: str, exc) -> None:
         pass
 
 
-_MAIL_DIRECT_MARKERS = (
-    "mail-api.example.com",
-    "hermaly.com",
-    "example.com",
+def _record_proxy_precheck_failure(proxy: str, checks) -> bool:
+    for name, ok, detail in checks or []:
+        if name != _conn.XAI_SIGNUP_CHECK_NAME or ok:
+            continue
+        record_proxy_boot_failure(
+            proxy,
+            RuntimeError(f"xAI registration-page precheck failed: {detail}"),
+        )
+        return True
+    return False
+
+
+_MAIL_DIRECT_PATH_MARKERS = (
     "/admin/new_address",
     "/api/mails",
     "/api/mail/",
@@ -1114,7 +1137,17 @@ _MAIL_DIRECT_MARKERS = (
 
 def _url_needs_direct(url: str) -> bool:
     u = str(url or "").lower()
-    return any(m in u for m in _MAIL_DIRECT_MARKERS)
+    configured_bases = (
+        config.get("cloudflare_api_base"),
+        config.get("cloudmail_url"),
+        config.get("moemail_api_base"),
+        config.get("duckmail_api_base"),
+    )
+    for value in configured_bases:
+        base = str(value or "").strip().lower().rstrip("/")
+        if base and (u == base or u.startswith(base + "/")):
+            return True
+    return any(marker in u for marker in _MAIL_DIRECT_PATH_MARKERS)
 
 
 def _apply_mail_direct(url, request_kwargs: dict) -> dict:
@@ -1192,6 +1225,18 @@ def _pick_list_payload(data):
     return _pick_list(data)
 
 
+def cloudflare_randomize_subdomain_enabled() -> bool:
+    """主域易被风控时挂随机子域（需 CF Email Routing 对 *.apex catch-all）。
+
+    配置 cloudflare_randomize_subdomain：true/false，默认 false（多数服务端
+    只接受已配置域名；本地 catch-all 免建号依赖固定域名匹配）。
+    """
+    raw = config.get("cloudflare_randomize_subdomain", False)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def cloudflare_create_temp_address(api_base, domain=""):
     selected_domain = str(domain or "").strip() or cloudflare_next_default_domain()
     return cloudflare_provider.create_temp_address(
@@ -1203,9 +1248,8 @@ def cloudflare_create_temp_address(api_base, domain=""):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
-        # 默认不随机子域（多数服务端只接受已配置域名）；需随机时在
-        # config 开启 cloudflare_randomize_subdomain
-        randomize_subdomain=bool(config.get("cloudflare_randomize_subdomain", False)),
+        # 有管理域名时也按配置决定是否随机子域（避免根域被批量风控）
+        randomize_subdomain=cloudflare_randomize_subdomain_enabled(),
     )
 
 
@@ -2224,9 +2268,15 @@ def get_email_and_token(api_key=None):
                         auth_mode=get_cloudflare_auth_mode(),
                         custom_auth=get_cloudflare_custom_auth(),
                         domain=managed_domain,
+                        randomize_subdomain=cloudflare_randomize_subdomain_enabled(),
                     )
-                except Exception:
-                    raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+                except Exception as fallback_exc:
+                    primary_message = redact_sensitive_log_line(str(primary_exc))[:240]
+                    fallback_message = redact_sensitive_log_line(str(fallback_exc))[:240]
+                    raise Exception(
+                        "Cloudflare 创建邮箱失败: "
+                        f"{primary_message} | fallback: {fallback_message}"
+                    ) from primary_exc
 
         # catch-all 免建号优先：配置了 JWT_SECRET 时用随机地址 + 自签 JWT
         # 收信，跳过建号 API；任何异常回退 admin 建号
@@ -3930,7 +3980,7 @@ class GrokRegisterGUI:
             wlog("[*] 浏览器已启动")
             i = 0
             retry_count_for_slot = 0
-            max_slot_retry = 3
+            max_slot_retry = slot_retries()
             retry_same_slot = False
             while True:
                 if self.should_stop():
@@ -4000,6 +4050,8 @@ class GrokRegisterGUI:
                         log_callback=wlog,
                         cancel_callback=self.should_stop,
                         **get_sso_wait_policy(),
+                        email=email,
+                        password=profile.get("password", ""),
                     )
                     ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
                     if config.get("enable_nsfw", True):
@@ -4209,7 +4261,8 @@ def run_registration_cli(count):
     fail_count = 0
     fail_stats = empty_fail_stats()
     retry_count_for_slot = 0
-    max_slot_retry = 3
+    max_slot_retry = slot_retries()
+    max_proxy_boot_rotations = proxy_boot_rotations()
     accounts_output_file = ""  # 已改为按邮箱单独保存，不再使用批量文件
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 24, int(count or 1)))
     pool = load_proxy_pool()
@@ -4271,21 +4324,34 @@ def run_registration_cli(count):
                 f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
                 f"{redact_sensitive_log_line(detail)}"
             )
-        if _conn.has_blocking_xai_failure(startup_checks) and not config.get(
-            "proxy_fallback_to_local", False
-        ):
-            cli_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+        if _conn.has_blocking_xai_failure(startup_checks):
+            _record_proxy_precheck_failure(
+                str(startup_config.get("proxy") or ""),
+                startup_checks,
+            )
+            cli_log("[!] xAI 注册页预检失败，已停止当前批次；请检查或更换当前 proxy 后重试")
             set_current_task_subdir(None)
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
             except Exception:
                 pass
-            return
+            _conn.require_xai_signup(startup_checks)
+    except _conn.XaiSignupPrecheckFailed:
+        set_current_task_subdir(None)
+        raise
     except Exception as exc:
         cli_log(
-            f"[!] 启动连通性检查异常，继续注册: "
+            f"[!] 启动连通性检查异常，已停止当前批次: "
             f"{redact_sensitive_log_line(str(exc))}"
         )
+        set_current_task_subdir(None)
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        raise _conn.XaiSignupPrecheckFailed(
+            "xAI registration page precheck raised an exception"
+        ) from exc
 
     def _cli_record_failure(exc):
         nonlocal fail_count
@@ -4415,7 +4481,7 @@ def run_registration_cli(count):
                     # 黑名单/死代理/预检不通过：多换几条 sticky 再放弃
                     booted = False
                     last_boot = boot_exc
-                    for _try in range(1, 12):
+                    for _try in range(1, max_proxy_boot_rotations + 1):
                         msgb = str(last_boot)
                         if not (
                             "出口IP命中黑名单" in msgb
@@ -4506,6 +4572,8 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                             **get_sso_wait_policy(),
+                            email=email,
+                            password=profile.get("password", ""),
                         )
                         ensure_sso_oauth_eligible(
                             sso,
@@ -4540,6 +4608,7 @@ def run_registration_cli(count):
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
                         local_success += 1
+                        mark_successful_account()
                         i += 1
                         retry = 0
                         consecutive_failures = 0
@@ -4832,7 +4901,7 @@ def run_registration_cli(count):
                                     )
                                     worker_stop = True
                                 else:
-                                    for _try in range(1, 10):
+                                    for _try in range(1, max_proxy_boot_rotations + 1):
                                         msgb = str(last_boot)
                                         if not (
                                             "出口IP命中黑名单" in msgb
@@ -4932,7 +5001,7 @@ def run_registration_cli(count):
     try:
         single_rotate_idx = 0
         last_boot = None
-        boot_attempts = max(1, min(12, len(pool) or 1))
+        boot_attempts = max(1, min(max_proxy_boot_rotations + 1, len(pool) or 1))
         for _boot_try in range(boot_attempts):
             px = ""
             try:
@@ -5024,6 +5093,8 @@ def run_registration_cli(count):
                     log_callback=cli_log,
                     cancel_callback=controller.should_stop,
                     **get_sso_wait_policy(),
+                    email=email,
+                    password=profile.get("password", ""),
                 )
                 ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
                 if config.get("enable_nsfw", True):
@@ -5049,6 +5120,7 @@ def run_registration_cli(count):
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
+                mark_successful_account()
                 retry_count_for_slot = 0
                 i += 1
                 if cpa_ok:
