@@ -21,6 +21,67 @@ from webui import process_utils
 from webui import proxy_store
 
 
+def test_compat_process_roots_require_existing_absolute_paths():
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        current = base / "current"
+        previous = base / "previous"
+        current.mkdir()
+        previous.mkdir()
+        roots = monitor._configured_process_roots(
+            current,
+            {
+                "GROK_COMPAT_PROCESS_ROOTS": os.pathsep.join(
+                    [str(previous), "relative-release", str(base / "missing"), str(current)]
+                )
+            },
+        )
+        assert roots == (current.resolve(), previous.resolve())
+
+
+def test_process_discovery_aggregates_explicit_release_roots():
+    previous_roots = monitor.MANAGED_PROCESS_ROOTS
+    previous_find = monitor.find_managed_processes
+    roots = (Path("/test/current"), Path("/test/previous"))
+    calls = []
+
+    def fake_find(root, script_names):
+        calls.append((root, script_names))
+        pid = 101 if root == roots[0] else 202
+        return [{"pid": pid, "pgid": pid, "etime": "00:01", "cmd": "test"}]
+
+    monitor.MANAGED_PROCESS_ROOTS = roots
+    monitor.find_managed_processes = fake_find
+    try:
+        found = monitor._find_managed_processes(("run_until_100.py",))
+    finally:
+        monitor.MANAGED_PROCESS_ROOTS = previous_roots
+        monitor.find_managed_processes = previous_find
+
+    assert [item["pid"] for item in found] == [101, 202]
+    assert [call[0] for call in calls] == list(roots)
+
+
+def test_panel_registration_env_enables_guarded_cache():
+    previous_enabled = os.environ.pop("GROK_STATIC_ASSET_CACHE", None)
+    previous_dir = os.environ.pop("GROK_STATIC_CACHE_DIR", None)
+    try:
+        env = monitor._registration_env()
+        assert env["GROK_STATIC_ASSET_CACHE"] == "1"
+        assert env["GROK_STATIC_CACHE_DIR"].endswith("log/static-asset-cache")
+        os.environ["GROK_STATIC_ASSET_CACHE"] = "0"
+        assert monitor._registration_env()["GROK_STATIC_ASSET_CACHE"] == "0"
+    finally:
+        if previous_enabled is None:
+            os.environ.pop("GROK_STATIC_ASSET_CACHE", None)
+        else:
+            os.environ["GROK_STATIC_ASSET_CACHE"] = previous_enabled
+        if previous_dir is None:
+            os.environ.pop("GROK_STATIC_CACHE_DIR", None)
+        else:
+            os.environ["GROK_STATIC_CACHE_DIR"] = previous_dir
+
+
 def request(url: str, *, token: str = "", method: str = "GET", body: bytes | None = None):
     headers = {}
     if token:
@@ -114,7 +175,13 @@ def test_monitor_http_auth_and_headers():
 
         status, _, body = request(base + "/api/status", token=token)
         assert status == 200
-        assert "process" in json.loads(body)
+        payload = json.loads(body)
+        assert "process" in payload
+        assert "traffic" in payload
+        assert "bytes_up" in payload["traffic"]
+        assert "traffic_summary" in payload
+        assert "bytes_per_batch" in payload["traffic_summary"]
+        assert "bytes_per_success" in payload["traffic_summary"]
 
         status, _, _ = request(base + "/api/recovery")
         assert status == 401
@@ -732,6 +799,9 @@ def test_ip_pool_api_returns_state():
 if __name__ == "__main__":
     test_proxy_start_prerequisites()
     test_kill_all_verifies_process_exit()
+    test_compat_process_roots_require_existing_absolute_paths()
+    test_process_discovery_aggregates_explicit_release_roots()
+    test_panel_registration_env_enables_guarded_cache()
     test_monitor_http_auth_and_headers()
     test_proxy_api_auth_mutations_and_redaction()
     test_email_domain_api_auth_and_mutations()
@@ -741,17 +811,4 @@ if __name__ == "__main__":
     test_start_reports_unavailable_process_table()
     test_ip_usage_api_delete_and_per_ip_limit()
     test_ip_pool_api_returns_state()
-
-
-if __name__ == "__main__":
-    test_proxy_start_prerequisites()
-    test_kill_all_verifies_process_exit()
-    test_monitor_http_auth_and_headers()
-    test_proxy_api_auth_mutations_and_redaction()
-    test_email_domain_api_auth_and_mutations()
-    test_email_provider_api_auth_secret_masking_and_probe()
-    test_non_loopback_requires_token()
-    test_log_cleanup_api_requires_auth_and_returns_summary()
-    test_start_reports_unavailable_process_table()
-    test_ip_usage_api_delete_and_per_ip_limit()
     print("OK monitor http")

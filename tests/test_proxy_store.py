@@ -150,14 +150,64 @@ def test_probe_result_and_runtime_cooldown_control_worker_selection():
         state["items"][0]["cooldown_until"] = "2000-01-01T00:00:00Z"
         proxy_store.STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
         usable_after = proxy_store.list_worker_proxies()
-        assert usable_after == usable
+        assert usable_after == []
+        assert proxy_store.read_proxy_pool()["items"][0]["stored_status"] == "unknown"
 
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "203.0.113.10",
+                "asn": 64500,
+                "asn_org": "Example ISP",
+                "latency_ms": 222,
+                "checked_at": "2026-07-30T00:05:00Z",
+            },
+        )
+        usable = proxy_store.list_worker_proxies()
         assert proxy_store.record_proxy_result(usable[0], "risk", "policy deny")
         public = proxy_store.read_proxy_pool()
         item = public["items"][0]
         assert item["stored_status"] == "cooldown"
         assert item["cooldown_reason"] == "risk"
         assert item["risk_count"] == 1
+
+
+def test_xai_probe_uses_registration_page_result():
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = "<html>Sign up</html>"
+        headers = {}
+
+    def successful_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    detail = proxy_store.probe_xai_signup(
+        "http://proxy.example:8080",
+        timeout=5,
+        http_get=successful_get,
+    )
+    assert detail == "可达 HTTP 200"
+    assert calls[0][1]["proxies"]["https"] == "http://proxy.example:8080"
+
+    class ChallengeResponse:
+        status_code = 403
+        text = "Just a moment"
+        headers = {"server": "cloudflare"}
+
+    try:
+        proxy_store.probe_xai_signup(
+            "http://proxy.example:8080",
+            timeout=5,
+            http_get=lambda *_args, **_kwargs: ChallengeResponse(),
+        )
+    except RuntimeError as exc:
+        assert "xAI 注册页不可用" in str(exc)
+    else:
+        raise AssertionError("Cloudflare challenge must fail the proxy probe")
 
 
 def test_disable_delete_and_legacy_import():
@@ -271,6 +321,7 @@ if __name__ == "__main__":
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_resin_session_template_is_safe_and_runtime_results_map_to_source()
     test_probe_result_and_runtime_cooldown_control_worker_selection()
+    test_xai_probe_uses_registration_page_result()
     test_disable_delete_and_legacy_import()
     test_pagination_bulk_delete_and_large_test_batching()
     test_async_probe_job_persists_health()

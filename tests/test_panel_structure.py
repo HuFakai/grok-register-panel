@@ -215,6 +215,26 @@ def test_panel_security_and_recovery_structure():
     assert 'if u.path == "/favicon.ico":' in mon
     assert 'def version_string(self):' in mon
 
+
+def test_batch_traffic_metric_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    runner = (ROOT / 'run_batch_headless.py').read_text(encoding='utf-8')
+    assert '"traffic": traffic' in mon
+    assert '"traffic_summary": traffic_summary' in mon
+    assert 'if int(traffic.get("version") or 0) < 2:' in mon
+    assert 'function formatBytes(value)' in mon
+    assert '["本批代理流量"' in mon
+    assert '["每批平均流量"' in mon
+    assert '["每个成功号平均流量"' in mon
+    assert 'trafficSummary.bytes_per_batch' in mon
+    assert 'trafficSummary.bytes_per_success' in mon
+    assert '" / 上行 " + formatBytes(traffic.bytes_up)' in mon
+    assert '" / 下行 " + formatBytes(traffic.bytes_down)' in mon
+    assert 'archive_batch(history_file, finalized)' in runner
+    assert 'GROK_STATIC_ASSET_CACHE' in mon
+    assert 'static-asset-cache' in mon
+    assert 'setInterval(() => refreshStats(false), 30000);' in mon
+
 if __name__ == '__main__':
     test_workers_dom_ids_unique()
     test_no_cors_wildcard()

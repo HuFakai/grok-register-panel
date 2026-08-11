@@ -13,8 +13,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from secure_files import append_private_text, atomic_write_text, ensure_private_dir
+from secure_files import append_private_text, atomic_write_text, best_effort_fchmod, ensure_private_dir
 from webui import blacklist_store, process_utils
+
+
+def test_best_effort_fchmod_handles_missing_windows_api():
+    sentinel = object()
+    original = getattr(os, "fchmod", sentinel)
+    try:
+        os.fchmod = None
+        best_effort_fchmod(-1, 0o600)
+    finally:
+        if original is sentinel:
+            delattr(os, "fchmod")
+        else:
+            os.fchmod = original
+
+
+def test_runtime_entrypoints_use_cross_platform_fchmod_helper():
+    for relative in (
+        "run_until_100.py",
+        "webui/monitor.py",
+        "webui/recovery_ops.py",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "os.fchmod" not in source
+        assert "best_effort_fchmod" in source
 
 
 def test_private_file_helpers():
@@ -226,6 +250,8 @@ def test_permission_hardener_covers_runtime_pools_without_following_symlinks():
 
 
 if __name__ == "__main__":
+    test_best_effort_fchmod_handles_missing_windows_api()
+    test_runtime_entrypoints_use_cross_platform_fchmod_helper()
     test_private_file_helpers()
     test_blacklist_state_is_data_and_sanitized()
     test_process_discovery_is_root_scoped()

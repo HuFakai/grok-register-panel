@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from batch_supervisor import (
+    DEFAULT_MAX_RESTARTS,
     PROGRESS_ENV,
     initialize_progress,
     is_driver_crash_line,
@@ -22,6 +23,7 @@ from batch_supervisor import (
     read_completed,
     run_supervisor,
 )
+from retry_policy import PRECHECK_EXIT_CODE
 
 
 def test_driver_crash_detection_is_specific():
@@ -112,8 +114,69 @@ else:
         assert not progress.exists()
 
 
+
+def test_supervisor_does_not_restart_precheck_failure():
+    assert DEFAULT_MAX_RESTARTS == 2
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        progress = root / "progress.json"
+        launches = root / "launches.txt"
+        child = root / "precheck_fail.py"
+        child.write_text(
+            """
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+count = int(path.read_text()) if path.exists() else 0
+path.write_text(str(count + 1))
+raise SystemExit(78)
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        result = run_supervisor(
+            4,
+            2,
+            lambda _remaining, _workers: [sys.executable, str(child), str(launches)],
+            progress_file=progress,
+            max_restarts=2,
+        )
+        assert result == PRECHECK_EXIT_CODE
+        assert launches.read_text() == "1"
+
+
+def test_clean_exit_drains_pipe_before_restart_decision():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        progress = root / "progress.json"
+        child = root / "clean_child.py"
+        child.write_text(
+            """
+import sys
+from batch_supervisor import mark_slot_completed
+mark_slot_completed(int(sys.argv[1]))
+sys.stdout.write("final line without newline")
+raise SystemExit(0)
+""".lstrip(),
+            encoding="utf-8",
+        )
+        result = run_supervisor(
+            3,
+            1,
+            lambda remaining, _workers: [sys.executable, str(child), str(remaining)],
+            progress_file=progress,
+            idle_timeout=1,
+            max_restarts=0,
+            child_env={"PYTHONPATH": str(ROOT)},
+        )
+        assert result == 0
+
+
 if __name__ == "__main__":
+
     test_driver_crash_detection_is_specific()
     test_progress_updates_are_thread_safe_and_private()
     test_supervisor_restarts_after_driver_crash()
+    test_supervisor_does_not_restart_precheck_failure()
+    test_clean_exit_drains_pipe_before_restart_decision()
     print("OK batch supervisor")

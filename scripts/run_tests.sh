@@ -17,6 +17,11 @@ tests=(
   tests/test_sso_wait.py
   tests/test_bfs_detect.py
   tests/test_bfs_ops.py
+  tests/test_bfs_worker_integration.py
+  tests/test_cloudflare_provider.py
+  tests/test_retry_policy.py
+  tests/test_batch_traffic.py
+  tests/test_orchestrator_policy.py
   tests/test_static_asset_cache.py
   tests/test_monitor_http.py
   tests/test_monitor_control.py
@@ -58,6 +63,8 @@ done
   run_batch_headless.py \
   run_until_100.py \
   sso_to_auth_json.py \
+  retry_policy.py \
+  batch_traffic.py \
   static_asset_cache.py \
   run_batch_headless_static_cache.py \
   run_until_100_static_cache.py
