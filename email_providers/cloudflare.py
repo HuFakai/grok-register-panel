@@ -56,6 +56,16 @@ def is_admin_create_path(path: str) -> bool:
     return str(path or "").rstrip("/").lower() == "/admin/new_address"
 
 
+def _is_address_collision(status_code: int, body_text: str) -> bool:
+    if int(status_code or 0) not in {400, 409}:
+        return False
+    low = str(body_text or "").lower()
+    return any(
+        marker in low
+        for marker in ("already exists", "address exists", "duplicate address")
+    )
+
+
 def next_default_domain(domains: List[str], index: int) -> tuple[str, int]:
     cleaned = [x.strip() for x in domains if str(x).strip()]
     if not cleaned:
@@ -78,36 +88,69 @@ def create_temp_address(
 ) -> tuple[str, str]:
     path = accounts_path if accounts_path.startswith("/") else f"/{accounts_path}"
     url = f"{api_base.rstrip('/')}{path}"
+    selected_domain = str(domain or "").strip()
     # 根域批量易被标；默认挂随机子域（需 CF Email Routing 对 *.apex catch-all）
-    if domain and randomize_subdomain:
-        domain = random_subdomain_domain(domain)
-    if is_admin_create_path(path):
-        payload = {"name": name or generate_username(10), "enablePrefix": False}
-        if domain:
-            payload["domain"] = domain
-        headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
-    else:
-        payload = {}
-        if domain:
-            payload["domain"] = domain
-        headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
-    resp = http_post(url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        body = ""
+    if selected_domain and randomize_subdomain:
+        selected_domain = random_subdomain_domain(selected_domain)
+
+    last_err: Exception | None = None
+    # 并发 worker 容易撞同名 → 400 Address already exists；最多换名重试 4 次
+    for attempt in range(4):
+        local_name = str(name or "").strip()
+        if not local_name or attempt > 0:
+            # 追加短随机后缀，降低 james.smith 这类撞车
+            local_name = f"{generate_username(10)}{secrets.token_hex(2)}"
+        if is_admin_create_path(path):
+            payload = {"name": local_name, "enablePrefix": False}
+            if selected_domain:
+                payload["domain"] = selected_domain
+            headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
+        else:
+            payload = {}
+            if selected_domain:
+                payload["domain"] = selected_domain
+            headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
         try:
-            body = str(getattr(resp, "text", "") or "")[:300]
-        except Exception:
-            pass
-        raise Exception(f"Cloudflare {path} HTTP {resp.status_code}: {body}".strip())
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
-    return address, jwt
+            resp = http_post(url, json=payload, headers=headers)
+            body_text = ""
+            try:
+                body_text = (resp.text or "")[:240]
+            except Exception:
+                body_text = ""
+            if resp.status_code >= 400:
+                # 只有明确的地址冲突会因换名恢复；认证、域名和字段错误直接抛出。
+                retryable = _is_address_collision(resp.status_code, body_text)
+                if retryable and attempt < 3:
+                    last_err = Exception(
+                        f"Cloudflare {path} HTTP {resp.status_code}: 地址已存在"
+                    )
+                    name = ""  # 强制下一轮重新生成
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                raise Exception(
+                    f"Cloudflare {path} 返回非JSON (HTTP {resp.status_code})"
+                )
+            address = data.get("address")
+            jwt = data.get("jwt")
+            if not address or not jwt:
+                raise Exception(f"Cloudflare {path} 返回缺少 address/jwt 字段")
+            return address, jwt
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc).lower()
+            if attempt < 3 and any(
+                marker in msg
+                for marker in ("already exists", "address exists", "duplicate address")
+            ):
+                name = ""
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    raise Exception("Cloudflare 创建邮箱失败（地址冲突重试耗尽）") from last_err
 
 
 def get_domains(
@@ -264,6 +307,7 @@ def create_mailbox_fallback(
     auth_mode: str = "none",
     custom_auth: str = "",
     domain: str = "",
+    randomize_subdomain: bool = True,
 ) -> tuple[str, str]:
     selected_domain = str(domain or "").strip()
     if not selected_domain:
@@ -282,7 +326,21 @@ def create_mailbox_fallback(
         selected_domain = str(target.get("domain") or "").strip()
     if not selected_domain:
         raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-    username = generate_username(10)
+    # /admin/new_address 不能走 address/password 旧 payload（会 400 Required field）
+    # 统一复用 create_temp_address（含撞名重试）
+    if is_admin_create_path(accounts_path):
+        return create_temp_address(
+            http_post,
+            api_base,
+            accounts_path=accounts_path,
+            domain=selected_domain,
+            api_key=api_key,
+            auth_mode=auth_mode,
+            custom_auth=custom_auth,
+            randomize_subdomain=randomize_subdomain,
+        )
+
+    username = generate_username(10) + secrets.token_hex(2)
     address = f"{username}@{selected_domain}"
     password = secrets.token_urlsafe(12)
     create_account(

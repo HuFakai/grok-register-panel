@@ -298,7 +298,14 @@ def _release_expired_cooldowns(state: dict) -> bool:
         until = _parse_utc(item.get("cooldown_until"))
         if until is not None and until > now:
             continue
-        item["status"] = "healthy" if item.get("exit_ip") else "unknown"
+        reason = str(item.get("cooldown_reason") or "").strip().lower()
+        # A previous exit IP does not prove that a proxy recovered from a
+        # network/TLS failure. Require an explicit probe before reusing it.
+        item["status"] = (
+            "unknown"
+            if reason == "network"
+            else ("healthy" if item.get("exit_ip") else "unknown")
+        )
         item["cooldown_until"] = ""
         item["cooldown_reason"] = ""
         changed = True
@@ -723,6 +730,26 @@ def _parse_probe_payload(payload: object) -> tuple[str, int | None, str]:
     return ip, asn, _clean_text(org, 120)
 
 
+def probe_xai_signup(url: object, timeout: float = DEFAULT_TEST_TIMEOUT, *, http_get=None) -> str:
+    """Require the proxy to reach the actual registration page, not only an IP API."""
+    normalized = normalize_proxy(url)
+    timeout = max(2.0, min(float(timeout), 20.0))
+    from connectivity import check_xai_signup
+
+    if http_get is None:
+        from curl_cffi import requests as curl_requests
+
+        def http_get(target, **kwargs):
+            kwargs.pop("_allow_direct_fallback", None)
+            kwargs["timeout"] = min(float(kwargs.get("timeout", timeout)), timeout)
+            return curl_requests.get(target, **kwargs)
+
+    _name, ok, detail = check_xai_signup(normalized, http_get)
+    if not ok:
+        raise RuntimeError(f"xAI 注册页不可用: {detail}")
+    return detail
+
+
 def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     """Probe one proxy via public IP services and return non-secret metadata."""
     normalized = normalize_proxy(url)
@@ -742,6 +769,7 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
         "https://api.ipify.org?format=json",
     )
     last_error = None
+    result = None
     started = time.monotonic()
     for endpoint in endpoints:
         try:
@@ -756,7 +784,7 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
             if endpoint.startswith("https://ipwho.is") and payload.get("success") is False:
                 raise RuntimeError("探测服务拒绝了请求")
             ip, asn, org = _parse_probe_payload(payload)
-            return {
+            result = {
                 "ok": True,
                 "exit_ip": ip,
                 "asn": asn,
@@ -764,9 +792,13 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
                 "latency_ms": max(1, int((time.monotonic() - started) * 1000)),
                 "checked_at": _utc_now(),
             }
+            break
         except Exception as exc:
             last_error = exc
-    raise RuntimeError(_probe_error_message(last_error))
+    if result is None:
+        raise RuntimeError(_probe_error_message(last_error))
+    probe_xai_signup(normalized, timeout=timeout)
+    return result
 
 
 def _apply_probe_result(proxy_id: str, result: dict) -> None:

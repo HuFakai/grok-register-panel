@@ -19,10 +19,16 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from secure_files import atomic_write_json, ensure_private_dir
+from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir
+from batch_traffic import (
+    read_metrics as read_batch_traffic,
+    read_summary as read_batch_traffic_summary,
+)
 from runtime_platform import (
     batch_launch_command,
     batch_runtime_error,
+    beijing_strftime,
+    now_beijing,
     popen_group_kwargs,
     runtime_python,
 )
@@ -106,6 +112,8 @@ except ImportError:  # running as script from webui/
         redact_proxy,
     )
 LOG_DIR = ROOT / "log"
+BATCH_TRAFFIC = LOG_DIR / "batch_traffic.json"
+BATCH_TRAFFIC_HISTORY = LOG_DIR / "batch_traffic_history.json"
 CPA_DIR = Path(os.environ.get("CPA_AUTH_DIR", str(ROOT / "cpa_auth")))
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 FONT_ASSETS = {
@@ -122,6 +130,54 @@ if _panel_tail_setting is None:
     }
 else:
     PANEL_INCLUDE_TAIL = _panel_tail_setting.strip().lower() in ("1", "true", "yes")
+
+
+def _configured_process_roots(
+    current_root: Path = ROOT,
+    environ=None,
+) -> tuple[Path, ...]:
+    """Return exact project roots allowed for cross-release process discovery."""
+    env = os.environ if environ is None else environ
+    roots = [Path(current_root).resolve()]
+    raw = str(env.get("GROK_COMPAT_PROCESS_ROOTS", "") or "").strip()
+    for item in raw.split(os.pathsep):
+        value = item.strip()
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+MANAGED_PROCESS_ROOTS = _configured_process_roots()
+
+
+def _find_managed_processes(script_names) -> list[dict]:
+    found = {}
+    for root in MANAGED_PROCESS_ROOTS:
+        for item in find_managed_processes(root, script_names):
+            found[int(item["pid"])] = item
+    return sorted(found.values(), key=lambda item: int(item["pid"]))
+
+
+def _terminate_managed_processes(
+    script_names,
+    *,
+    grace_seconds: float = 2.0,
+) -> list[int]:
+    killed = set()
+    for root in MANAGED_PROCESS_ROOTS:
+        killed.update(
+            terminate_managed_processes(root, script_names, grace_seconds=grace_seconds)
+        )
+    return sorted(killed)
 
 BASE_FILE = LOG_DIR / "batch1000.base"
 ORCH_PID = LOG_DIR / "orch100.pid"
@@ -306,8 +362,8 @@ def process_running():
         "batch_pid": None,
         "batch_etime": None,
     }
-    orch = find_managed_processes(ROOT, ("run_until_100.py",))
-    batch = find_managed_processes(ROOT, ("run_batch_headless.py",))
+    orch = _find_managed_processes(("run_until_100.py",))
+    batch = _find_managed_processes(("run_batch_headless.py",))
 
     def primary(items):
         if not items:
@@ -643,7 +699,7 @@ def success_stats():
         "batch_log": parsed.get("log_name"),
         "by_day": by_day,
         "rates": rates,
-        "refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "refreshed_at": beijing_strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:
         _write_json(STATS_CACHE, data)
@@ -678,8 +734,7 @@ def _parse_etime(s):
 
 def kill_all():
     """Stop orchestrator and batch process groups under this project root."""
-    killed = terminate_managed_processes(
-        ROOT,
+    killed = _terminate_managed_processes(
         ("run_until_100.py", "run_batch_headless.py"),
         grace_seconds=8.0,
     )
@@ -750,11 +805,22 @@ def _email_domain_pool_view(result: dict | None = None) -> dict:
     return data
 
 
+def _registration_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("GROK_STATIC_ASSET_CACHE", "1")
+    env.setdefault(
+        "GROK_STATIC_CACHE_DIR",
+        str(LOG_DIR / "static-asset-cache"),
+    )
+    return env
+
+
 def _start_orch_unlocked():
     proc = process_running()
     if proc.get("orch_running") or proc.get("batch_running"):
         return {"ok": False, "error": "already running", "process": proc}
-    if find_managed_processes(ROOT, ("sso_to_auth_json.py",)):
+    if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
@@ -791,7 +857,7 @@ def _start_orch_unlocked():
     stdout_path = LOG_DIR / "orch100-stdout.log"
     fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     stdout = os.fdopen(fd, "a", encoding="utf-8")
@@ -806,7 +872,7 @@ def _start_orch_unlocked():
             cwd=str(ROOT),
             stdout=stdout,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=_registration_env(),
             **popen_group_kwargs(),
         )
     finally:
@@ -835,7 +901,7 @@ def _start_batch_only_unlocked():
     proc = process_running()
     if proc.get("batch_running") or proc.get("orch_running"):
         return {"ok": False, "error": "already running", "process": proc}
-    if find_managed_processes(ROOT, ("sso_to_auth_json.py",)):
+    if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
@@ -855,7 +921,7 @@ def _start_batch_only_unlocked():
     ensure_private_dir(LOG_DIR)
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
@@ -870,6 +936,7 @@ def _start_batch_only_unlocked():
             cwd=str(ROOT),
             stdout=fout,
             stderr=subprocess.STDOUT,
+            env=_registration_env(),
             **popen_group_kwargs(),
         )
     finally:
@@ -939,9 +1006,18 @@ def snapshot():
             eta_min = remain / rate_per_min
             eta = f"{int(eta_min)}m" if eta_min < 120 else f"{eta_min/60:.1f}h"
     workers_show = parsed.get("workers") or control.get("workers")
+    traffic = read_batch_traffic(BATCH_TRAFFIC)
+    if traffic.get("running") and not proc.get("running"):
+        traffic["running"] = False
+    if int(traffic.get("version") or 0) < 2:
+        traffic["successful_accounts"] = max(
+            int(traffic.get("successful_accounts") or 0),
+            int(parsed.get("ok") or 0),
+        )
+    traffic_summary = read_batch_traffic_summary(BATCH_TRAFFIC_HISTORY, traffic)
     return {
         "ts": time.time(),
-        "ts_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_human": beijing_strftime("%Y-%m-%d %H:%M:%S"),
         "base_cpa": base,
         "base_cpa_stale": base_stale,
         "cpa": cpa,
@@ -956,6 +1032,8 @@ def snapshot():
         "success_rate": round(100.0 * ok / done, 1) if done else None,
         "rate_per_min": rate_per_min,
         "eta": eta,
+        "traffic": traffic,
+        "traffic_summary": traffic_summary,
         "blacklist": {
             "count": bl.get("count"),
             "asns": bl.get("asns"),
@@ -2926,6 +3004,19 @@ document.addEventListener("keydown", event => {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return Math.round(bytes) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = bytes / 1024;
+  let unit = units[0];
+  for (let i = 1; i < units.length && scaled >= 1024; i += 1) {
+    scaled /= 1024;
+    unit = units[i];
+  }
+  const digits = scaled >= 100 ? 0 : (scaled >= 10 ? 1 : 2);
+  return scaled.toFixed(digits) + " " + unit;
+}
 function setMsg(id, text, cls) {
   const el = document.getElementById(id);
   el.textContent = text || "";
@@ -4196,6 +4287,24 @@ function render(d) {
   document.getElementById("btn-stop").disabled = !on;
   fillControl(d);
 
+  const traffic = d.traffic || {};
+  const hasTrafficBatch = !!traffic.batch_id;
+  const trafficTotal = Number(traffic.bytes_total) || 0;
+  const trafficState = traffic.running ? "运行中" : "上一批";
+  const trafficSub = hasTrafficBatch
+    ? trafficState + " / 上行 " + formatBytes(traffic.bytes_up) + " / 下行 " + formatBytes(traffic.bytes_down)
+      + ((Number(traffic.unmetered_proxies) || 0) > 0 ? " / 未计量 " + traffic.unmetered_proxies : "")
+    : "等待批次计量";
+  const trafficSummary = d.traffic_summary || {};
+  const trafficBatchCount = Number(trafficSummary.batch_count) || 0;
+  const trafficSuccessCount = Number(trafficSummary.successful_accounts) || 0;
+  const trafficAverageSub = trafficBatchCount
+    ? trafficBatchCount + " 批样本 / 累计 " + formatBytes(trafficSummary.total_bytes)
+      + (trafficSummary.includes_current ? " / 含本批" : "")
+    : "等待批次样本";
+  const trafficSuccessSub = trafficSuccessCount
+    ? "累计成功 " + trafficSuccessCount + " / 含失败流量"
+    : "等待成功账号样本";
   const kpis = [
     ["本批成功", d.ok ?? 0, "ok", "目标 " + (d.target ?? "--")],
     ["本批失败", d.fail ?? 0, "fail", d.success_rate != null ? "成功率 " + d.success_rate + "%" : "暂无数据"],
@@ -4203,7 +4312,10 @@ function render(d) {
     ["正常 / 风控", (d.bot0 ?? 0) + " / " + (d.bot1 ?? 0), (d.bot1 ?? 0) > 0 ? "warn" : "ok", "注册结果采样"],
     ["BFS 标记", d.bfs ?? 0, (d.bfs ?? 0) > 0 ? "warn" : "ok", "JWT claim 命中"],
     ["黑名单 ASN", (d.blacklist && d.blacklist.count) ?? "--", "accent", "更新错误 " + ((d.blacklist_update && d.blacklist_update.error_count) ?? 0)],
+    ["本批代理流量", hasTrafficBatch ? formatBytes(trafficTotal) : "--", "accent", trafficSub],
     ["预计完成", d.ended ? "已完成" : (d.eta || "--"), "", "并发 " + (d.workers ?? "--") + (d.rate_per_min != null ? " / " + d.rate_per_min + " 每分钟" : "")],
+    ["每批平均流量", trafficSummary.bytes_per_batch != null ? formatBytes(trafficSummary.bytes_per_batch) : "--", "accent", trafficAverageSub],
+    ["每个成功号平均流量", trafficSummary.bytes_per_success != null ? formatBytes(trafficSummary.bytes_per_success) : "--", "ok", trafficSuccessSub],
   ];
   document.getElementById("kpis").innerHTML = kpis.map(([label, val, cls, sub]) =>
     `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(val)}</div><div class="sub">${esc(sub)}</div></div>`
@@ -4306,8 +4418,9 @@ loadTokenField();
 bindTailFollow();
 refresh();
 setInterval(refresh, 2000);
-// full stats once on load
+// full stats once on load, then refresh every 30s
 refreshStats(false);
+setInterval(() => refreshStats(false), 30000);
 refreshRecovery();
 setInterval(refreshRecovery, 5000);
 refreshBfs();

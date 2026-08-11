@@ -1856,13 +1856,15 @@ def wait_for_sso_cookie(
     retry_interval=6,
     log_callback=None,
     cancel_callback=None,
+    email=None,
+    password=None,
 ):
     """等注册完成后的 sso cookie。
 
     关键：不要一看到「正在登录」就强制 page.get(grok.com)，
     那会打断 accounts.x.ai 的 redirect / Set-Cookie 链，导致 grok.com 只剩匿名 cookie。
-    策略：accounts 短 hold（~7s）→ 点继续 → 轻量跳 grok（最多 retry_count 次，
-    间隔 retry_interval 秒）；cookie 轮询间隔 poll_interval 秒。
+    策略：accounts 长 hold（20s，给 Set-Cookie 链留足窗口）→ 点继续 → 轻量跳 grok；
+    若提交资料后被甩到 sign-in 登录页，用刚设的密码自动重新登录拿 sso（优先于硬跳）。
     """
     deadline = time.time() + max(int(timeout or 10), 8)
     started = time.time()
@@ -1874,6 +1876,8 @@ def wait_for_sso_cookie(
     last_back_click = 0.0
     last_grok_nudge = 0.0
     last_continue_click = 0.0
+    last_signin_attempt = 0.0
+    signin_attempt_count = 0
     grok_nudge_count = 0
     final_no_submit_state = ""
     final_no_submit_since = None
@@ -1884,6 +1888,9 @@ def wait_for_sso_cookie(
     max_grok_nudges = max(0, int(retry_count or 2))
     nudge_gap = max(2.0, float(retry_interval or 6))
     poll_gap = max(0.1, float(poll_interval or 0.5))
+    max_signin_attempts = 2
+    email_s = str(email or "").strip()
+    password_s = str(password or "").strip()
 
     def _current_url():
         try:
@@ -1929,11 +1936,16 @@ return t.includes('您正在登录') || t.includes('正在登录')
         except Exception:
             return False
 
-    def _click_continue_if_any():
-        """点「继续 / Continue / 前往 Grok」类按钮，推动自然 redirect。"""
+    def _click_continue_if_any(strict: bool = False):
+        """点「继续 / Continue / 前往 Grok」类按钮，推动自然 redirect。
+
+        strict=True 时只点明确的「前往 Grok / Go to Grok / 开始使用」，
+        避免在 sign-up 残留页误点通用 Continue 把链打断到 sign-in。
+        """
         try:
             return page.run_js(
                 r"""
+const strict = !!arguments[0];
 function isVisible(node) {
   if (!node) return false;
   const style = window.getComputedStyle(node);
@@ -1949,17 +1961,204 @@ const btn = nodes.find((n) => {
     + (n.getAttribute('href') || '')).replace(/\s+/g, ' ').trim().toLowerCase();
   const compact = t.replace(/\s+/g, '');
   if (compact.includes('返回') || t.includes('back') || t.includes('return')) return false;
-  return compact.includes('继续') || compact.includes('前往') || compact.includes('打开')
-    || t.includes('continue') || t.includes('proceed') || t.includes('go to')
-    || t.includes('grok.com') || compact.includes('开始使用');
+  if (compact.includes('signup') || compact.includes('注册') || t.includes('create account')) return false;
+  const goGrok = compact.includes('前往') || compact.includes('打开') || t.includes('go to')
+    || t.includes('grok.com') || compact.includes('开始使用') || t.includes('open grok');
+  if (goGrok) return true;
+  if (strict) return false;
+  return compact.includes('继续') || t.includes('continue') || t.includes('proceed');
 });
 if (!btn) return false;
 btn.click();
 return true;
-                """
+                """,
+                bool(strict),
             )
         except Exception:
             return False
+
+    def _url_is_sign_in(url: str) -> bool:
+        low = (url or "").lower()
+        return ("/sign-in" in low) or ("signin" in low and "signup" not in low)
+
+    def _page_has_login_password_form():
+        """仅识别「登录」密码表单，排除注册资料页的 new-password。"""
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+// 资料页有 givenName / familyName / new-password，不能当登录页
+const profileHint = Array.from(document.querySelectorAll(
+  'input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"],'
+  + 'input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"],'
+  + 'input[autocomplete="new-password"]'
+)).some(isVisible);
+if (profileHint) return false;
+const title = ((document.body && document.body.innerText) || '').slice(0, 1200).toLowerCase();
+const looksSignup = title.includes('完成注册') || title.includes('complete your sign')
+  || title.includes('create your account') || title.includes('sign up');
+if (looksSignup) return false;
+const pwd = Array.from(document.querySelectorAll(
+  'input[type="password"], input[name="password"], input[autocomplete="current-password"]'
+)).find(isVisible);
+if (!pwd) return false;
+const auto = String(pwd.getAttribute('autocomplete') || '').toLowerCase();
+if (auto.includes('new-password')) return false;
+return true;
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _try_sign_in_with_credentials(reason: str) -> str:
+        """注册后落到 sign-in 时，用刚设的密码完成登录，拿 sso。返回 sso 或空串。"""
+        nonlocal signin_attempt_count, last_signin_attempt
+        if not email_s or not password_s:
+            return ""
+        if signin_attempt_count >= max_signin_attempts:
+            return ""
+        now_ts = time.time()
+        if now_ts - last_signin_attempt < 3.5:
+            return ""
+        last_signin_attempt = now_ts
+        signin_attempt_count += 1
+        if log_callback:
+            log_callback(
+                f"[*] {reason}，自动登录拿 sso"
+                f"（第 {signin_attempt_count}/{max_signin_attempts} 次）..."
+            )
+
+        # 1) 原生优先（真实键盘事件）
+        filled_email = False
+        filled_pwd = False
+        try:
+            email_cands = _native_input_candidates("email")
+            pwd_cands = _native_input_candidates("password")
+            if email_cands:
+                filled_email = _native_type_element(email_cands[0], email_s)
+            if pwd_cands:
+                filled_pwd = _native_type_element(pwd_cands[0], password_s)
+        except Exception as fill_exc:
+            if log_callback:
+                log_callback(f"[Debug] 原生填登录表单失败: {fill_exc}")
+
+        # 2) JS 兜底（React controlled inputs）
+        if not (filled_email and filled_pwd):
+            try:
+                js_state = page.run_js(
+                    r"""
+const email = String(arguments[0] || '');
+const password = String(arguments[1] || '');
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function setInputValue(input, value) {
+  if (!input) return false;
+  input.focus();
+  input.click();
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+  const tracker = input._valueTracker;
+  if (tracker) tracker.setValue('');
+  if (nativeSetter) nativeSetter.call(input, value);
+  else input.value = value;
+  input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
+  input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+  input.blur();
+  return String(input.value || '').trim() === String(value || '').trim();
+}
+const emailInput = Array.from(document.querySelectorAll(
+  'input[type="email"], input[name="email"], input[autocomplete="email"], input[autocomplete="username"], input[data-testid*="email" i]'
+)).find(isVisible) || null;
+const pwdInput = Array.from(document.querySelectorAll(
+  'input[type="password"], input[name="password"], input[autocomplete="current-password"]'
+)).find(isVisible) || null;
+const okEmail = emailInput ? setInputValue(emailInput, email) : true;
+const okPwd = pwdInput ? setInputValue(pwdInput, password) : false;
+return { okEmail, okPwd, hasEmail: !!emailInput, hasPwd: !!pwdInput };
+                    """,
+                    email_s,
+                    password_s,
+                )
+                if isinstance(js_state, dict):
+                    filled_email = filled_email or bool(js_state.get("okEmail"))
+                    filled_pwd = filled_pwd or bool(js_state.get("okPwd"))
+                    if log_callback and not js_state.get("hasPwd"):
+                        log_callback("[Debug] sign-in 页未找到密码框")
+            except Exception as js_exc:
+                if log_callback:
+                    log_callback(f"[Debug] JS 填登录表单失败: {js_exc}")
+
+        if not filled_pwd:
+            if log_callback:
+                log_callback("[Debug] 自动登录：密码未写入，跳过提交")
+            return ""
+
+        # 3) 点登录 / 继续
+        clicked = _native_click_action(
+            (
+                "登录",
+                "登入",
+                "sign in",
+                "signin",
+                "log in",
+                "login",
+                "continue",
+                "继续",
+                "next",
+                "下一步",
+            ),
+            deny_keywords=("sign up", "注册", "create", "google", "apple", "github", "sso"),
+        )
+        if not clicked:
+            try:
+                clicked = page.run_js(
+                    r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const nodes = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'));
+const btn = nodes.find((n) => {
+  if (!isVisible(n) || n.disabled) return false;
+  const t = ((n.innerText || n.textContent || '') + ' ' + (n.getAttribute('aria-label') || '')).replace(/\s+/g, ' ').trim().toLowerCase();
+  const compact = t.replace(/\s+/g, '');
+  if (compact.includes('signup') || compact.includes('注册') || t.includes('google') || t.includes('apple')) return false;
+  return compact.includes('登录') || compact.includes('登入') || t.includes('sign in') || t.includes('log in')
+    || compact.includes('继续') || t.includes('continue') || t.includes('next') || n.type === 'submit';
+});
+if (!btn) return '';
+btn.focus(); btn.click();
+return (btn.innerText || btn.textContent || 'submit').trim().slice(0, 40);
+                    """
+                ) or ""
+            except Exception:
+                clicked = ""
+        if clicked and log_callback:
+            log_callback(f"[*] 自动登录已点击: {clicked}")
+        # 短轮询几次，不硬睡
+        for _ in range(4):
+            sleep_with_cancel(0.35, cancel_callback)
+            sso_val, names = _read_sso_from_cookies()
+            last_seen_names.update(names)
+            if sso_val:
+                return sso_val
+        return ""
 
     def _click_back_if_any():
         try:
@@ -2048,6 +2247,25 @@ return true;
 
             signin_hint = _page_is_signing_in()
 
+            # 阶段0：真正落到 sign-in / 登录表单 → 用注册密码自动登录
+            # （资料页也有 password 框，仅当 URL 是 sign-in 或明确登录表单才触发）
+            on_sign_in = _url_is_sign_in(cur_url)
+            has_login_form = False
+            if on_sign_in:
+                has_login_form = True
+            elif on_accounts and not on_sign_in:
+                has_login_form = _page_has_login_password_form()
+            if has_login_form and email_s and password_s:
+                if not signin_hint:
+                    sso_val = _try_sign_in_with_credentials("注册后落到登录页")
+                    if sso_val:
+                        if log_callback:
+                            log_callback("[*] 已获取到 sso cookie")
+                        return sso_val
+                    # 登录已点，下一轮继续读 cookie（不硬睡）
+                    sleep_with_cancel(0.35, cancel_callback)
+                    continue
+
             # 阶段1：accounts 上「正在登录」→ 短 hold，禁止立刻跳 grok
             if signin_hint and on_accounts and elapsed < accounts_hold_seconds:
                 if log_callback and now - last_signin_log >= 3:
@@ -2060,13 +2278,33 @@ return true;
                 # hold 过半后再点「继续」，避免过早打断
                 if elapsed >= 3 and now - last_continue_click >= 4:
                     last_continue_click = now
-                    if _click_continue_if_any() and log_callback:
-                        log_callback("[*] 已点击继续/前往类按钮，等待 redirect...")
+                    if _click_continue_if_any(strict=True) and log_callback:
+                        log_callback("[*] 已点击前往 Grok 类按钮，等待 redirect...")
                 sleep_with_cancel(0.4, cancel_callback)
                 continue
 
             # 阶段2：hold 结束仍在 accounts 且无 sso → 先点继续，再轻量跳 grok（最多 2 次）
             if on_accounts and elapsed >= accounts_hold_seconds:
+                # 仍在登录表单：优先自动登录，不要硬跳 grok
+                if has_login_form:
+                    if email_s and password_s and not signin_hint:
+                        sso_val = _try_sign_in_with_credentials("accounts 登录页仍无 sso")
+                        if sso_val:
+                            if log_callback:
+                                log_callback("[*] 已获取到 sso cookie")
+                            return sso_val
+                    sleep_with_cancel(0.4, cancel_callback)
+                    if (
+                        grok_nudge_count < max_grok_nudges
+                        and now - last_grok_nudge >= nudge_gap
+                        and signin_attempt_count >= 1
+                    ):
+                        sso_val = _nudge_grok_once("sign-in 自动登录仍无 sso")
+                        if sso_val:
+                            if log_callback:
+                                log_callback("[*] 已获取到 sso cookie")
+                            return sso_val
+                    continue
                 if now - last_continue_click >= 5:
                     last_continue_click = now
                     if _click_continue_if_any() and log_callback:

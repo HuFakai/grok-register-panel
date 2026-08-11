@@ -34,7 +34,10 @@ def generate_username(length: int = 10) -> str:
     ]
     name = random.choice(patterns)
     name = "".join(ch for ch in name if ch.isalnum() or ch in "._-")
-    return (name[:30] or f"{first}{random.randint(10, 99)}")
+    # 并发 worker 易撞 james.smith 这类固定池名字；追加短随机后缀
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=3))
+    base = (name[:24] or f"{first}{random.randint(10, 99)}")
+    return f"{base}{suffix}"
 
 
 def pick_list_payload(data: Any) -> List[dict]:
