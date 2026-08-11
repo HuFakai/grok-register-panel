@@ -13,11 +13,35 @@
 | 项 | Commit |
 |---|---|
 | 本地 fork 点（本地已包含其全部内容） | `280c98e` |
-| 上次合并到的上游 HEAD | `0371716`（本次已评估） |
-| 下次合并起始点 | `0371716` 之后的上游新提交 |
+| 上次合并到的上游 HEAD | `ae281f9`（本次已评估） |
+| 下次合并起始点 | `ae281f9` 之后的上游新提交 |
 
 > 本地仓库与上游**无共同祖先**（独立重写历史），不能用 `git merge`，
 > 需按文件逐个人工移植（`git show <commit> -- <file>` 取补丁）。
+
+## 本次合并内容（2026-08-12 第三轮：0371716 → ae281f9）
+
+### 已收编
+
+| Commit | 标题 | 说明 |
+|---|---|---|
+| `9b91ab6` | feat: reduce registration traffic and harden Windows runtime | 流量削减 + Windows 加固。新文件 `retry_policy.py`（重试收敛：启动 2/代理轮换 3/槽位重试 1/supervisor 重启 2，env 可覆盖）、`batch_traffic.py`（本地代理流量计量层，env 门控）；batch_supervisor 管道重写（queue 读线程 + EOF 宽限，保留 a03b789 增量解码语义）+ 78 码不重启；browser_session 探测源 6→3 + 2-20s 预算 + 启动收敛 + meter 接线；run_batch_headless 预检失败返回 78 整批中止 + batch_id 注入；run_until_100 编排失败上限 + rc==78 整批终止；grok_register_ttk 重试收敛 + 预检中止（移除 proxy_fallback_to_local 逃生口，用户确认）+ `_sleep_cancelable`（修复本地潜在 NameError） |
+| `ae281f9` | feat: add rolling batch traffic averages | 批次流量滚动平均：history 归档 + 每批/每成功号平均流量 KPI + mark_successful_account |
+| `9c5f14d` | fix: validate proxy pool against xAI precheck | 代理池探测追加 xAI 注册页可达性校验；network 冷却到期置 unknown 需重新探测（与本地可用 IP 池互补） |
+| `cbd6059` | feat: improve registration recovery and panel telemetry | register_flow SSO 恢复：sign-in 自动登录（以本地 20s hold + 最终页重试块为基准融合）；cloudflare 撞名重试 + randomize_subdomain（默认 false 按本地）；generate_username 随机后缀；邮件直连按配置 base 匹配；monitor 北京时间统一 + 30s 全量刷新 + traffic KPI；blacklist mtime 北京时间 |
+| `e73f3cb` | feat: track in-flight jobs across release roots | GROK_COMPAT_PROCESS_ROOTS 跨 release 根进程发现/终止（保留本地 kill_all grace 语义） |
+| `4c919a3` | fix(windows): guard fchmod/msvcrt locks and optional headless | `best_effort_fchmod` 助手 + 4 处内联替换（收编通用部分）；GROK_HEADLESS/GROK_HEADED 开关 + 软件渲染 prefs。**跳过** msvcrt 锁/tzdata（纯 Windows） |
+| `52909bf` | fix: preserve virtualenv interpreter overrides | GROK_PYTHON_BIN resolve→abspath 保留 venv 符号链接（通用正确性） |
+| `b2eb6a2` | fix: reuse Windows-safe file permissions in panel jobs | run_until_100/monitor/recovery_ops 裸 os.fchmod → best_effort_fchmod |
+
+### 忽略
+
+| Commit | 标题 | 原因 |
+|---|---|---|
+| `ac366e0`+`c1c4d71` / `c77960f`+`7624423` | docs: README/agent guide/remove private links | 文档 |
+| `47c7f8e` / `f4b6699` | chore: update star history | 仅 SVG |
+| `536b8dc`+`af0de55` / `4f88645` / `0d32188` | docs/release v0.4.0/v0.4.1 | 文档/版本 |
+| 4c919a3 的 msvcrt 锁 / tzdata / firefox Windows prefs 分支 | 纯 Windows | macOS 走 fcntl/POSIX，无需 |
 
 ## 本次合并内容（2026-08-09）
 
@@ -87,17 +111,30 @@
 | `e2c6301` | fix: preserve refreshed success statistics | ✅ 已收编 |
 | `9e23229` + `7768eb4` | release: prepare v0.3.0 | ⏭ 跳过（版本发布） |
 | `0371716` | chore: update star history | ⏭ 跳过（仅 SVG） |
+| `47c7f8e` / `f4b6699` | chore: update star history | ⏭ 跳过（仅 SVG） |
+| `ac366e0`+`c1c4d71` / `c77960f`+`7624423` | docs: README/agent guide | ⏭ 跳过（文档） |
+| `536b8dc`+`af0de55` | docs: runtime optimization notes | ⏭ 跳过（文档） |
+| `4f88645` / `0d32188` | release v0.4.0 / v0.4.1 | ⏭ 跳过（版本发布） |
+| `cbd6059` | feat: recovery + panel telemetry | ✅ 已收编（SSO 恢复融合 + 撞名重试 + 北京时间等） |
+| `e73f3cb` | feat: track in-flight jobs across release roots | ✅ 已收编 |
+| `9b91ab6` | feat: reduce registration traffic + Windows 加固 | ✅ 已收编（重试收敛/流量计量/78 码中止） |
+| `4c919a3` | fix(windows): fchmod/headless | ✅ 部分收编（best_effort_fchmod + GROK_HEADLESS；跳过 msvcrt/tzdata） |
+| `52909bf` | fix: preserve virtualenv interpreter overrides | ✅ 已收编 |
+| `b2eb6a2` | fix: reuse Windows-safe file permissions | ✅ 已收编 |
+| `9c5f14d` | fix: validate proxy pool against xAI precheck | ✅ 已收编 |
+| `ae281f9` | feat: add rolling batch traffic averages | ✅ 已收编 |
 
 ## 下次合并指引
 
 1. `git fetch https://github.com/lij768423-svg/grok-register-panel main:refs/remotes/upstream-lij/main`
-2. `git log --oneline 0371716..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
+2. `git log --oneline ae281f9..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
 3. 逐个人工移植新功能（无共同祖先，勿用 git merge）
 4. 移植后更新本文档的「上次合并到的上游 HEAD」为新 HEAD
 
 ## 本地保留的增强（合并时不得被上游覆盖）
 
-cloudflare 启动检查真实探测建号端点、register_flow 20s SSO hold、catch-all 免建号 +
-随机子域 + 验证码后删邮件、IP 使用统计/启动前预检/分页、配置一键导出导入、
-邮箱多配置档（profiles）、results_store/ip_usage_store/config_backup、
+cloudflare 启动检查真实探测建号端点、register_flow 20s SSO hold + 最终页重试块、
+catch-all 免建号 + 随机子域 + 验证码后删邮件、可用 IP 池（ip_ready_pool）、
+空页临时冷却软拉黑（soft_blacklist）、IP 使用统计/启动前预检/分页（5 列）、
+配置一键导出导入、邮箱多配置档（profiles）、results_store/ip_usage_store/config_backup、
 notify_push、proxy_templates、account_exports 任务目录等。
