@@ -302,6 +302,7 @@ DEFAULT_CONFIG = {
     "grok2api_admin_user": "",
     "grok2api_admin_password": "",
     "grok2api_auto_upload": False,
+    "grok2api_instant_upload": False,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -1406,6 +1407,22 @@ def _append_sso_risk_rejected(email: str, sso: str, details: str, log_callback=N
     except Exception as exc:
         if log_callback:
             log_callback(f"[CPA] 保存注册风控拒绝记录失败: {exc}")
+
+
+def _enqueue_instant_grok2api(email: str, sso: str, password: str, task_subdir=None, log_callback=None):
+    """注册成功即触发 grok2api 即时上传（一号一传，后台异步）。
+
+    入队毫秒级返回，任何异常静默——绝不阻塞注册流程。
+    """
+    try:
+        from webui.grok2api_instant import enqueue_instant_upload
+
+        if enqueue_instant_upload(email, sso, password, task_subdir=task_subdir):
+            if log_callback:
+                log_callback(f"[grok2api] 已入队即时上传: {email}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[grok2api] 即时上传入队失败（忽略）: {exc}")
 
 
 def _append_sso_bfs_flagged(email: str, sso: str, details: str, log_callback=None):
@@ -3478,6 +3495,9 @@ class GrokRegisterGUI:
         self.grok2api_auto_upload_var = tk.BooleanVar(
             value=bool(config.get("grok2api_auto_upload", False))
         )
+        self.grok2api_instant_upload_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_instant_upload", False))
+        )
         c_label(2, 0, "CPA auth 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 2, 1, columnspan=3)
         c_label(3, 0, "远程地址:")
@@ -3494,6 +3514,8 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_password_var, width=52, show="*"), 6, 1, columnspan=3)
         c_label(7, 0, "批次后自动上传:")
         c_field(tk_checkbutton(self.cpa_frame, text="注册批次完成后自动上传到 grok2api", variable=self.grok2api_auto_upload_var), 7, 1, columnspan=3)
+        c_label(8, 0, "注册成功即上传:")
+        c_field(tk_checkbutton(self.cpa_frame, text="获取到 SSO 后立即上传 grok2api（一号一传，后台异步）", variable=self.grok2api_instant_upload_var), 8, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
@@ -3687,6 +3709,7 @@ class GrokRegisterGUI:
             config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
             config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
             config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+            config["grok2api_instant_upload"] = bool(self.grok2api_instant_upload_var.get())
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -3807,6 +3830,7 @@ class GrokRegisterGUI:
         config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
         config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
         config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+        config["grok2api_instant_upload"] = bool(self.grok2api_instant_upload_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -4123,6 +4147,13 @@ class GrokRegisterGUI:
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
                     cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    _enqueue_instant_grok2api(
+                        email,
+                        sso,
+                        profile.get("password", ""),
+                        task_subdir=task_subdir,
+                        log_callback=wlog,
+                    )
                     self._record_success()
                     retry_count_for_slot = 0
                     if cpa_ok:
@@ -4633,6 +4664,13 @@ def run_registration_cli(count):
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                         cpa_ok = add_sso_to_cpa(
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        )
+                        _enqueue_instant_grok2api(
+                            email,
+                            sso,
+                            profile.get("password", ""),
+                            task_subdir=task_subdir,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         local_success += 1
                         mark_successful_account()
@@ -5146,6 +5184,13 @@ def run_registration_cli(count):
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                _enqueue_instant_grok2api(
+                    email,
+                    sso,
+                    profile.get("password", ""),
+                    task_subdir=task_subdir,
+                    log_callback=cli_log,
+                )
                 success_count += 1
                 mark_successful_account()
                 retry_count_for_slot = 0

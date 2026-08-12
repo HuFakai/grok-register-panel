@@ -73,7 +73,7 @@ class FakeSession:
         self.token = ""
 
     def post(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        self.calls.append(("POST", url, kwargs))
         if url.endswith("/auth/login"):
             return FakeResponse(
                 200,
@@ -90,6 +90,22 @@ class FakeSession:
         if "web/import" in url:
             return FakeResponse(text="event: complete\ndata: {\"created\":10,\"skipped\":1}\n\n")
         raise AssertionError(f"unexpected url: {url}")
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return FakeResponse(
+            200,
+            {
+                "data": {
+                    "items": [
+                        {"id": "42", "email": "target@example.com", "provider": "grok_web"},
+                        {"id": "7", "email": "other@example.com", "provider": "grok_web"},
+                    ],
+                    "page": 1,
+                    "total": 2,
+                }
+            },
+        )
 
 
 def test_client_login_import_convert_sync():
@@ -119,17 +135,115 @@ def test_client_login_import_convert_sync():
 
     # 认证头：首次调用自动登录
     login_call = session.calls[0]
-    assert login_call[0].endswith("/auth/login")
-    assert login_call[1]["json"] == {"username": "admin", "password": "test-admin-pw-123"}
+    assert login_call[1].endswith("/auth/login")
+    assert login_call[2]["json"] == {"username": "admin", "password": "test-admin-pw-123"}
     import_call = session.calls[1]
-    assert import_call[0].endswith("/accounts/web/import")
-    assert import_call[1]["headers"]["Authorization"] == "Bearer jwt-token-123"
-    assert "files" in import_call[1]
+    assert import_call[1].endswith("/accounts/web/import")
+    assert import_call[2]["headers"]["Authorization"] == "Bearer jwt-token-123"
+    assert "files" in import_call[2]
     # 转 Build body
     convert_call = session.calls[2]
-    assert convert_call[1]["json"] == {"all": True, "strategy": "missing"}
+    assert convert_call[2]["json"] == {"all": True, "strategy": "missing"}
     sync_call = session.calls[3]
-    assert sync_call[1]["json"] == {"all": True, "strategy": "all"}
+    assert sync_call[2]["json"] == {"all": True, "strategy": "all"}
+
+
+def test_find_web_account_id_matches_by_email():
+    session = FakeSession()
+    client = Grok2apiClient(
+        "http://127.0.0.1:8080",
+        username="admin",
+        password="test-admin-pw-123",
+        session=session,
+    )
+    account_id = client.find_web_account_id("TARGET@example.com", retries=1)
+    assert account_id == "42"
+    get_call = [c for c in session.calls if c[0] == "GET"][0]
+    assert get_call[1].endswith("/api/admin/v1/accounts")
+    assert get_call[2]["params"] == {
+        "search": "target@example.com",
+        "provider": "grok_web",
+        "pageSize": 100,
+    }
+
+
+def test_find_web_account_id_not_found_returns_none():
+    class EmptyAccountsSession(FakeSession):
+        def get(self, url, **kwargs):
+            self.calls.append(("GET", url, kwargs))
+            return FakeResponse(200, {"data": {"items": [], "total": 0}})
+
+    session = EmptyAccountsSession()
+    client = Grok2apiClient(
+        "http://127.0.0.1:8080",
+        username="admin",
+        password="test-admin-pw-123",
+        session=session,
+    )
+    assert client.find_web_account_id("missing@example.com", retries=2, delay=0.0) is None
+    # 重试 2 次 → 2 次 GET
+    gets = [c for c in session.calls if c[0] == "GET"]
+    assert len(gets) == 2
+
+
+def test_convert_and_sync_by_ids_bodies():
+    session = FakeSession()
+    client = Grok2apiClient(
+        "http://127.0.0.1:8080",
+        username="admin",
+        password="test-admin-pw-123",
+        session=session,
+    )
+    assert client.convert_accounts_by_ids(["42"]) == {"created": 2, "linked": 1}
+    assert client.sync_accounts_by_ids(["42"]) == {"created": 4, "synced": 3}
+    convert_call = [c for c in session.calls if "convert-to-build" in c[1]][-1]
+    assert convert_call[2]["json"] == {
+        "ids": ["42"],
+        "all": False,
+        "strategy": "missing",
+    }
+    sync_call = [c for c in session.calls if "sync-to-console" in c[1]][-1]
+    assert sync_call[2]["json"] == {"ids": ["42"], "all": False, "strategy": "all"}
+
+
+def test_authed_retries_once_on_401():
+    class FlakySession(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.unauthorized_done = False
+
+        def post(self, url, **kwargs):
+            self.calls.append(("POST", url, kwargs))
+            if url.endswith("/auth/login"):
+                return FakeResponse(
+                    200,
+                    {
+                        "data": {
+                            "tokens": {"accessToken": "jwt-token-123"},
+                        }
+                    },
+                )
+            if "web/import" in url:
+                if not self.unauthorized_done:
+                    self.unauthorized_done = True
+                    return FakeResponse(401, {}, "unauthorized")
+                return FakeResponse(
+                    text="event: complete\ndata: {\"created\":1,\"skipped\":0}\n\n"
+                )
+            raise AssertionError(f"unexpected url: {url}")
+
+    session = FlakySession()
+    client = Grok2apiClient(
+        "http://127.0.0.1:8080",
+        username="admin",
+        password="test-admin-pw-123",
+        session=session,
+    )
+    report = client.import_web_accounts('{"sso_token":"t1"}\n')
+    assert report == {"created": 1, "skipped": 0}
+    # login（401 前）+ login（401 重登）+ import 重试成功
+    logins = [c for c in session.calls if c[1].endswith("/auth/login")]
+    assert len(logins) == 2
 
 
 if __name__ == "__main__":
@@ -137,4 +251,8 @@ if __name__ == "__main__":
     test_iter_sse_falls_back_to_raw_text()
     test_drain_sse_complete_and_error()
     test_client_login_import_convert_sync()
+    test_find_web_account_id_matches_by_email()
+    test_find_web_account_id_not_found_returns_none()
+    test_convert_and_sync_by_ids_bodies()
+    test_authed_retries_once_on_401()
     print("OK grok2api api")

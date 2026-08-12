@@ -24,6 +24,7 @@ tests=(
   tests/test_orchestrator_policy.py
   tests/test_grok2api_api.py
   tests/test_grok2api_upload.py
+  tests/test_grok2api_instant.py
   tests/test_static_asset_cache.py
   tests/test_monitor_http.py
   tests/test_monitor_control.py
