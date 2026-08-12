@@ -38,7 +38,9 @@ PID_FILE = LOG_DIR / "grok2api_upload.pid"
 UPLOAD_SCRIPT = ROOT / "scripts" / "grok2api_upload.py"
 VENV_PY = runtime_python(ROOT)
 CONFIG_FILE = ROOT / "config.json"
-PROCESS_NAME = "grok2api_upload.py"
+# 进程匹配用的是脚本相对项目根的路径（_snapshot_matches 会 resolve 到
+# ROOT/<name>），脚本位于 scripts/ 子目录，必须带上前缀才能被找到。
+PROCESS_NAME = "scripts/grok2api_upload.py"
 
 
 def _running_processes() -> list[dict]:
