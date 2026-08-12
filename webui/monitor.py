@@ -2696,6 +2696,25 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
+      <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+        <div class="domain-view-heading" style="margin-bottom:6px">
+          <div>
+            <div class="mail-source-kicker">Grok2API upload</div>
+            <div class="page-title" style="font-size:14px">上传到 grok2api（导入 + 转 Build + 转 Console）</div>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
+              把注册产生的 Web SSO 账号批量上传到 grok2api 管理 API，自动执行转 Build / 转 Console。
+              后台执行不阻塞注册。需先在 config 配置 grok2api_admin_url / user / password。
+            </p>
+          </div>
+          <span class="domain-job mono" id="grok2api-status">--</span>
+        </div>
+        <div class="chips" id="grok2api-kpis"></div>
+        <div class="button-group recovery-actions">
+          <button id="grok2api-upload" onclick="startGrok2apiUpload()">上传到 grok2api</button>
+          <button class="danger" id="grok2api-stop" onclick="stopGrok2apiUpload()">停止上传</button>
+        </div>
+        <div class="msg" id="grok2api-msg" role="status" aria-live="polite"></div>
+      </div>
     </details>
     <details class="card" aria-labelledby="bfs-title">
       <summary class="panel-summary">
@@ -4121,6 +4140,55 @@ async function stopRecovery() {
     await refreshRecovery();
   } catch (e) { setMsg("recovery-msg", String(e.message || e), "err"); }
 }
+function renderGrok2api(data) {
+  data = data || {};
+  const report = data.last_report || {};
+  const imported = report.imported || {};
+  const converted = report.converted || {};
+  const synced = report.synced || {};
+  const statusEl = document.getElementById("grok2api-status");
+  if (!statusEl) return;
+  statusEl.textContent = data.running
+    ? "上传中 #" + (data.pid || "?")
+    : (data.configured ? "已配置（空闲）" : "未配置服务地址");
+  const kpis = [
+    ["配置", data.configured ? "就绪" : "未配置", data.configured ? "ok" : "warn"],
+    ["上次导入", report.ok ? ((imported.created ?? 0) + " 新 / " + (imported.skipped ?? 0) + " 跳过") : "--", report.ok ? "ok" : ""],
+    ["转 Build", report.ok ? ((converted.created ?? 0) + " 建 / " + (converted.skipped ?? 0) + " 跳过") : "--", report.ok ? "accent" : ""],
+    ["转 Console", report.ok ? ((synced.created ?? 0) + " 建 / " + (synced.syncFailed ?? 0) + " 失败") : "--", report.ok ? "accent" : ""],
+    ["账号总数", report.total_accounts ?? "--", ""],
+  ];
+  const el = document.getElementById("grok2api-kpis");
+  if (el) el.innerHTML = kpis.map(([label, value, cls]) =>
+    `<div class="chip"><span>${esc(label)}</span><b class="${cls}">${esc(value)}</b></div>`
+  ).join("");
+  document.getElementById("grok2api-upload").disabled = !!data.running || !data.configured;
+  document.getElementById("grok2api-stop").disabled = !data.running;
+}
+async function refreshGrok2api() {
+  try {
+    const data = await api("/api/grok2api?_=" + Date.now(), { authHelp: false });
+    renderGrok2api(data);
+  } catch (e) {
+    const message = String(e.message || e);
+    document.getElementById("grok2api-status").textContent = message.includes("令牌") ? "等待令牌" : "检查失败";
+  }
+}
+async function startGrok2apiUpload() {
+  setMsg("grok2api-msg", "正在启动上传…", "");
+  try {
+    const data = await api("/api/grok2api/upload", { method: "POST", body: "{}" });
+    setMsg("grok2api-msg", data.ok ? ("上传已启动，进程 " + (data.pid || "?")) : String(data.error || "启动失败"), data.ok ? "ok" : "err");
+    await refreshGrok2api();
+  } catch (e) { setMsg("grok2api-msg", String(e.message || e), "err"); }
+}
+async function stopGrok2apiUpload() {
+  try {
+    const data = await api("/api/grok2api/stop", { method: "POST", body: "{}" });
+    setMsg("grok2api-msg", "上传已停止，结束进程 " + JSON.stringify(data.killed || []), "ok");
+    await refreshGrok2api();
+  } catch (e) { setMsg("grok2api-msg", String(e.message || e), "err"); }
+}
 function renderBfs(data) {
   data = data || {};
   const last = data.last_report || {};
@@ -4423,6 +4491,7 @@ refreshStats(false);
 setInterval(() => refreshStats(false), 30000);
 refreshRecovery();
 setInterval(refreshRecovery, 5000);
+setInterval(refreshGrok2api, 5000);
 refreshBfs();
 setInterval(refreshBfs, 15000);
 setInterval(() => {
@@ -4543,7 +4612,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4574,6 +4643,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, recovery_status())
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/grok2api":
+            try:
+                from webui.grok2api_upload_ops import upload_status as _g2api_status
+
+                self._json(200, _g2api_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/proxies":
             try:
@@ -4813,6 +4890,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if result.get("ok") else 409, result)
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/grok2api/upload":
+            try:
+                from webui.grok2api_upload_ops import start_upload as _g2api_start
+
+                with START_LOCK:
+                    result = _g2api_start()
+                self._json(200 if result.get("ok") else 409, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api/stop":
+            try:
+                from webui.grok2api_upload_ops import stop_upload as _g2api_stop
+
+                result = _g2api_stop()
+                self._json(200, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/recovery/stop":
             try:

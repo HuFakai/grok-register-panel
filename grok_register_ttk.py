@@ -297,6 +297,11 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     # 最新 Go 版 Grok2API 的 grok_build JSON 导入目录（默认 grok2api_auth/）
     "grok2api_auth_dir": "grok2api_auth",
+    # grok2api 管理 API（文档 /api/admin/v1）：Web SSO 上传 / 转 Build / 转 Console
+    "grok2api_admin_url": "",
+    "grok2api_admin_user": "",
+    "grok2api_admin_password": "",
+    "grok2api_auto_upload": False,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -3467,6 +3472,12 @@ class GrokRegisterGUI:
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.grok2api_auth_dir_var = tk.StringVar(value=str(config.get("grok2api_auth_dir", "")))
+        self.grok2api_admin_url_var = tk.StringVar(value=str(config.get("grok2api_admin_url", "")))
+        self.grok2api_admin_user_var = tk.StringVar(value=str(config.get("grok2api_admin_user", "")))
+        self.grok2api_admin_password_var = tk.StringVar(value=str(config.get("grok2api_admin_password", "")))
+        self.grok2api_auto_upload_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_auto_upload", False))
+        )
         c_label(2, 0, "CPA auth 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 2, 1, columnspan=3)
         c_label(3, 0, "远程地址:")
@@ -3475,6 +3486,14 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 3, 3)
         c_label(4, 0, "Grok2API 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 4, 1, columnspan=3)
+        c_label(5, 0, "Grok2API 服务:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_url_var, width=34), 5, 1)
+        c_label(5, 2, "管理账号:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_user_var, width=26), 5, 3)
+        c_label(6, 0, "管理密码:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_password_var, width=52, show="*"), 6, 1, columnspan=3)
+        c_label(7, 0, "批次后自动上传:")
+        c_field(tk_checkbutton(self.cpa_frame, text="注册批次完成后自动上传到 grok2api", variable=self.grok2api_auto_upload_var), 7, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
@@ -3664,6 +3683,10 @@ class GrokRegisterGUI:
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+            config["grok2api_admin_url"] = self.grok2api_admin_url_var.get().strip()
+            config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+            config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
+            config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -3780,6 +3803,10 @@ class GrokRegisterGUI:
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
         config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+        config["grok2api_admin_url"] = self.grok2api_admin_url_var.get().strip()
+        config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
+        config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])

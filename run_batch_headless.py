@@ -251,6 +251,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:
         print(f"[batch] account export refresh failed: {exc}", flush=True)
+    # grok2api 自动上传（配置了 grok2api_auto_upload 时后台触发，不阻塞收尾）
+    try:
+        from webui.grok2api_upload_ops import trigger_auto_upload
+
+        if trigger_auto_upload():
+            print("[batch] grok2api auto upload triggered", flush=True)
+    except Exception as exc:
+        print(f"[batch] grok2api auto upload trigger failed: {exc}", flush=True)
     # 任务完成推送提醒（3 次重试，间隔 5 秒）；
     # 编排器 run_until_100 启动本进程时会设置 GROK_NOTIFY_SUPPRESS 以避免重复推送。
     if not os.environ.get("GROK_NOTIFY_SUPPRESS"):
