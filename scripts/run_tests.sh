@@ -22,6 +22,8 @@ tests=(
   tests/test_retry_policy.py
   tests/test_batch_traffic.py
   tests/test_orchestrator_policy.py
+  tests/test_grok2api_api.py
+  tests/test_grok2api_upload.py
   tests/test_static_asset_cache.py
   tests/test_monitor_http.py
   tests/test_monitor_control.py
@@ -67,7 +69,8 @@ done
   batch_traffic.py \
   static_asset_cache.py \
   run_batch_headless_static_cache.py \
-  run_until_100_static_cache.py
+  run_until_100_static_cache.py \
+  scripts/grok2api_upload.py
 
 bash -n scripts/*.sh
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

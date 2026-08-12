@@ -796,6 +796,57 @@ def test_ip_pool_api_returns_state():
                 os.environ["MONITOR_TOKEN"] = previous_token
 
 
+def test_grok2api_api_auth_and_status():
+    import webui.grok2api_upload as g2api_upload
+
+    token = "test-grok2api-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_report = g2api_upload.REPORT_FILE
+    previous_config = g2api_upload.load_config
+    with tempfile.TemporaryDirectory() as temp:
+        g2api_upload.REPORT_FILE = Path(temp) / "log" / "grok2api_upload_report.json"
+        g2api_upload.load_config = lambda *a, **k: {}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            # 读需要 token
+            status, _, _ = request(base + "/api/grok2api")
+            assert status == 401
+            status, _, body = request(base + "/api/grok2api", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["configured"] is False
+            assert payload["running"] is False
+            assert payload["last_report"] == {}
+            # 上传/停止需要写权限
+            status, _, _ = request(base + "/api/grok2api/upload", method="POST", body=b"{}")
+            assert status == 401
+            status, _, body = request(
+                base + "/api/grok2api/upload",
+                token=token,
+                method="POST",
+                body=b"{}",
+            )
+            # 未配置 → 409 且提示未配置
+            assert status == 409
+            assert "未配置" in json.loads(body).get("error", "")
+            status, _, _ = request(base + "/api/grok2api/stop", method="POST", body=b"{}")
+            assert status == 401
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            g2api_upload.REPORT_FILE = previous_report
+            g2api_upload.load_config = previous_config
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
 if __name__ == "__main__":
     test_proxy_start_prerequisites()
     test_kill_all_verifies_process_exit()
@@ -811,4 +862,5 @@ if __name__ == "__main__":
     test_start_reports_unavailable_process_table()
     test_ip_usage_api_delete_and_per_ip_limit()
     test_ip_pool_api_returns_state()
+    test_grok2api_api_auth_and_status()
     print("OK monitor http")

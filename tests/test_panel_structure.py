@@ -235,6 +235,21 @@ def test_batch_traffic_metric_structure():
     assert 'static-asset-cache' in mon
     assert 'setInterval(() => refreshStats(false), 30000);' in mon
 
+def test_grok2api_upload_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="grok2api-upload"' in html
+    assert 'id="grok2api-stop"' in html
+    assert 'id="grok2api-status"' in html
+    assert 'function renderGrok2api(' in mon
+    assert 'function startGrok2apiUpload(' in mon
+    assert 'function stopGrok2apiUpload(' in mon
+    assert '/api/grok2api' in mon
+    assert 'grok2api_admin_url' in mon
+    # 后台脚本存在
+    script = (ROOT / 'scripts/grok2api_upload.py').read_text(encoding='utf-8')
+    assert '--from-config' in script
+
 if __name__ == '__main__':
     test_workers_dom_ids_unique()
     test_no_cors_wildcard()
