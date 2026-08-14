@@ -4608,6 +4608,12 @@ def run_registration_cli(count):
                         i = claimed
                     slot_start_i = i
                     try:
+                        # 先绑定槽位相关局部变量：fill_email_and_submit 在
+                        # 空页等场景会于赋值前抛异常，except 块引用 email 时
+                        # 若未初始化会 UnboundLocalError 直接杀死 worker 线程
+                        email = ""
+                        dev_token = ""
+                        code = ""
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
