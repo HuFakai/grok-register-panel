@@ -202,11 +202,15 @@ def test_panel_security_and_recovery_structure():
     assert 'def _require_read(self)' in mon
     assert 'frame-ancestors \'none\'' in mon
     assert 'X-Frame-Options' in mon
-    assert 'MAX_REQUEST_BODY = 64 * 1024' in mon
+    assert 'MAX_REQUEST_BODY = 256 * 1024' in mon
     assert mon.index('if not self._require_write():') < mon.index('body = self._read_body()')
     assert '/api/recovery/start' in mon
     assert '/api/recovery/stop' in mon
     assert 'id="recovery-pending"' in html
+    # IP 使用统计一键清空：后端端点 + 面板按钮 + JS
+    assert '/api/ip-usage/reset' in mon
+    assert 'id="ip-usage-reset-btn"' in html
+    assert 'function resetIpUsage' in mon
     assert 'id="recovery-accounts"' in html
     assert 'id="recovery-stop"' in html
     assert 'id="run-status" aria-label="任务状态：加载中"' in html

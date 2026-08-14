@@ -190,7 +190,7 @@ VENV_PY = runtime_python(ROOT)
 ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
-MAX_REQUEST_BODY = 64 * 1024
+MAX_REQUEST_BODY = 256 * 1024
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -2438,6 +2438,9 @@ HTML = r"""<!DOCTYPE html>
           <p class="domain-view-subtitle">所有任务累计的出口 IP 使用次数（log/ip_usage.json）</p>
         </div>
         <span class="domain-job" id="ip-usage-heading-label">--</span>
+        <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+          <button class="danger" id="ip-usage-reset-btn" onclick="resetIpUsage()">清空全部统计</button>
+        </div>
       </div>
 
       <div class="proxy-summary" id="ip-usage-summary"></div>
@@ -3448,6 +3451,21 @@ async function deleteIpUsageItem(ip) {
     await refreshIpUsage(false);
   } catch (e) {
     setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  }
+}
+async function resetIpUsage() {
+  if (!confirm("清空全部 IP 使用统计？将删除所有累计次数、每 IP 上限、软拉黑与 IP 元数据（log/ip_usage.json），不可恢复。")) return;
+  const btn = document.getElementById("ip-usage-reset-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const j = await api("/api/ip-usage/reset", { method: "POST" });
+    setMsg("ip-usage-limit-msg", j.cleared ? "已清空全部 IP 使用统计" : "清空失败", j.cleared ? "ok" : "err");
+    await refreshIpUsage(false);
+    await refreshIpPool(false);
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 async function saveIpUsageLimit() {
@@ -4767,6 +4785,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 deleted = delete_ip_usage(ip)
                 self._json(200, {"ok": True, "deleted": deleted})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-usage/reset":
+            try:
+                from ip_usage_store import reset_ip_usage
+
+                reset_ip_usage()
+                self._json(200, {"ok": True, "cleared": True})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return

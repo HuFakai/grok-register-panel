@@ -724,6 +724,63 @@ def test_ip_usage_api_delete_and_per_ip_limit():
                 os.environ["MONITOR_TOKEN"] = previous_token
 
 
+def test_ip_usage_api_reset_clears_all():
+    import ip_usage_store
+
+    token = "test-ip-usage-reset-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = ip_usage_store._USAGE_FILE
+    previous_control = monitor.load_control
+    with tempfile.TemporaryDirectory() as temp:
+        ip_usage_store._USAGE_FILE = Path(temp) / "log" / "ip_usage.json"
+        monitor.load_control = lambda: {"ip_usage_limit": 0}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            # 写入统计 + 每 IP 上限 + 软拉黑，确认清空前存在
+            ip_usage_store.record_ip_usage("203.0.113.9", times=2)
+            ip_usage_store.record_ip_usage("203.0.113.10", times=1)
+            ip_usage_store.set_ip_usage_limit("203.0.113.9", 5)
+            assert ip_usage_store.get_total_usage() == 3
+            ip_usage_store.soft_blacklist_ip("203.0.113.10")
+            assert ip_usage_store.get_ip_usage("203.0.113.10") == 99999
+
+            # 无 token → 401
+            status, _, _ = request(
+                base + "/api/ip-usage/reset", method="POST"
+            )
+            assert status == 401
+            # 带 token → 200，统计全清
+            status, _, body = request(
+                base + "/api/ip-usage/reset", token=token, method="POST"
+            )
+            assert status == 200
+            assert json.loads(body) == {"ok": True, "cleared": True}
+
+            # GET 确认全空：次数/上限/软拉黑/元数据都清掉
+            status, _, body = request(base + "/api/ip-usage", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["items"] == []
+            assert payload["total_usage"] == 0
+            assert ip_usage_store.get_per_ip_limit("203.0.113.9") is None
+            assert ip_usage_store.get_ip_usage("203.0.113.10") == 0
+            assert ip_usage_store.is_soft_blacklisted("203.0.113.10") is False
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            ip_usage_store._USAGE_FILE = previous_file
+            monitor.load_control = previous_control
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
 def test_ip_pool_api_returns_state():
     import webui.ip_ready_pool as ip_ready_pool
     from webui import proxy_store as ps
@@ -861,6 +918,7 @@ if __name__ == "__main__":
     test_log_cleanup_api_requires_auth_and_returns_summary()
     test_start_reports_unavailable_process_table()
     test_ip_usage_api_delete_and_per_ip_limit()
+    test_ip_usage_api_reset_clears_all()
     test_ip_pool_api_returns_state()
     test_grok2api_api_auth_and_status()
     print("OK monitor http")
