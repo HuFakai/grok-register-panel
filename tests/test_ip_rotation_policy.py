@@ -182,19 +182,24 @@ def test_verified_rotation_retries_until_ip_changes():
 def test_worker_proxy_assignments_do_not_collide_during_rotation():
     original_load = app.load_proxy_pool
     original_mark = app._mark_managed_proxy_used
+    original_details = app._managed_worker_proxy_details
     try:
         app.load_proxy_pool = lambda: ["proxy-a", "proxy-b", "proxy-c"]
         app._mark_managed_proxy_used = lambda _proxy: None
-        with app._proxy_pool_lock:
-            app._proxy_worker_assignments.clear()
+        # 隔离真实面板代理池：测试用固定列表走 leases 轮换
+        app._managed_worker_proxy_details = lambda: []
+        with app._proxy_lease_lock:
+            app._proxy_leases.clear()
         assert app.pick_proxy_for_worker(0, 0) == "proxy-a"
         assert app.pick_proxy_for_worker(1, 0) == "proxy-b"
         assert app.pick_proxy_for_worker(0, 1) == "proxy-c"
     finally:
         app.release_proxy_for_worker(0)
         app.release_proxy_for_worker(1)
+        app.release_proxy_lease()
         app.load_proxy_pool = original_load
         app._mark_managed_proxy_used = original_mark
+        app._managed_worker_proxy_details = original_details
 
 
 def test_ip_quota_is_shared_and_exclusive_across_workers():
@@ -352,15 +357,15 @@ def test_rotate_skips_precheck_failed_exit_without_starting_browser():
 def test_blank_page_fails_and_soft_blacklists_without_same_slot_retry():
     """空页（页面空白/无表单）直接失败，首次临时冷却、累计≥2次永久拉黑。"""
     src = (ROOT / "grok_register_ttk.py").read_text(encoding="utf-8")
-    # 空页单独分支先于重试判定：不换口重试，走通用失败路径
+    # 空页单独分支先于重试判定：直接判失败并冷却，不换口重试
     assert "if blank_ui:" in src
     assert "record_blank_page(active_ip)" in src
     assert "空页判定失败" in src
-    # 重试分支不再包含 blank_ui（不再对空页换口重试）
-    marker = "elif (proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:"
-    assert marker in src
-    retry_branch = src.split(marker, 1)[1].split("retry_same_slot = True", 1)[0]
-    assert "blank_ui" not in retry_branch
+    # 空页分支内不含 retry_same_slot（空页不换口重试）；重试分支含 pipe_dead
+    blank_branch = src.split("if blank_ui:", 1)[1].split("elif (blank_ui", 1)[0]
+    assert "retry_same_slot = True" not in blank_branch
+    assert "pipe_dead" in src
+    assert "Playwright管道断开" in src
     # 预检与 claim 路径都检查软拉黑冷却
     assert "is_soft_blacklisted" in src
 

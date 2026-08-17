@@ -37,6 +37,7 @@ tests=(
   tests/test_cloudflare_catchall.py
   tests/test_ip_rotation_policy.py
   tests/test_ip_ready_pool.py
+  tests/test_windows_fingerprint.py
   tests/test_shared_slot_pool.py
   tests/test_ip_usage_store.py
   tests/test_results_store.py

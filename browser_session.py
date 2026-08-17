@@ -18,6 +18,32 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 from urllib.parse import urlparse
 
+
+def _pin_playwright_node() -> None:
+    """Playwright 1.60 自带 Node 24，管道对端关闭时 Unhandled EPIPE 会拖死整批。
+
+    优先走本仓库 scripts/playwright-node（系统 Node 22 + EPIPE guard）。
+    必须在 import playwright / camoufox 之前设置 PLAYWRIGHT_NODEJS_PATH。
+    """
+    current = str(os.environ.get("PLAYWRIGHT_NODEJS_PATH") or "").strip()
+    if current and os.path.isfile(current) and os.access(current, os.X_OK):
+        return
+    wrapper = Path(__file__).resolve().parent / "scripts" / "playwright-node"
+    if wrapper.is_file():
+        try:
+            wrapper.chmod(wrapper.stat().st_mode | 0o111)
+        except Exception:
+            pass
+        os.environ["PLAYWRIGHT_NODEJS_PATH"] = str(wrapper)
+        return
+    for cand in ("/usr/bin/node", "/usr/local/bin/node"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            os.environ["PLAYWRIGHT_NODEJS_PATH"] = cand
+            return
+
+
+_pin_playwright_node()
+
 import asyncio
 from greenlet import greenlet
 from typing import cast as _tcast
@@ -36,6 +62,93 @@ from retry_policy import browser_start_attempts
 from secure_files import ensure_private_dir
 from webui.blacklist_store import read_blacklist
 from webui.security_utils import redact_log_line, redact_proxy
+
+SUPPORTED_BROWSER_OS = ("windows", "macos", "linux")
+DEFAULT_BROWSER_OS = "windows"
+_BROWSER_OS_ALIASES = {
+    "win": "windows",
+    "win32": "windows",
+    "windows": "windows",
+    "mac": "macos",
+    "darwin": "macos",
+    "macos": "macos",
+    "lin": "linux",
+    "linux": "linux",
+}
+_FP_PROBE_JS = """() => {
+  const out = {
+    ua: String(navigator.userAgent || ''),
+    platform: String(navigator.platform || ''),
+    oscpu: String(navigator.oscpu || ''),
+    maxTouch: Number(navigator.maxTouchPoints || 0),
+    webgl: false,
+    vendor: '',
+    renderer: '',
+    fontsWin: false,
+  };
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (gl) {
+      out.webgl = true;
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if (ext) {
+        out.vendor = String(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || '');
+        out.renderer = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '');
+      }
+    }
+  } catch (e) {}
+  try {
+    out.fontsWin = !!(document.fonts && (
+      document.fonts.check('12px "Segoe UI"') ||
+      document.fonts.check('12px "Segoe UI Historic"')
+    ));
+  } catch (e) {}
+  return out;
+}"""
+
+
+def resolve_browser_os(raw: Optional[str] = None) -> str:
+    """Camoufox 指纹目标 OS。默认 windows，避免 Linux Xvfb 把 UA/字体/WebGL 露成 linux。
+
+    覆盖：GROK_BROWSER_OS=windows|macos|linux
+    """
+    if raw is None:
+        raw = os.environ.get("GROK_BROWSER_OS", DEFAULT_BROWSER_OS)
+    value = str(raw or DEFAULT_BROWSER_OS).strip().lower()
+    return _BROWSER_OS_ALIASES.get(value, DEFAULT_BROWSER_OS)
+
+
+def format_fingerprint_log(os_name: str, probe: Optional[dict] = None) -> str:
+    """把指纹探测压成一行日志。"""
+    probe = probe or {}
+    ua = str(probe.get("ua") or "")
+    ua_short = ua[:72] + ("…" if len(ua) > 72 else "")
+    plat = str(probe.get("platform") or "?")
+    renderer = str(probe.get("renderer") or ("ok" if probe.get("webgl") else "none"))[:80]
+    leak = []
+    blob = " ".join([ua, plat, str(probe.get("oscpu") or "")]).lower()
+    if "linux" in blob:
+        leak.append("linux-ua")
+    if not probe.get("webgl"):
+        leak.append("no-webgl")
+    if probe.get("fontsWin") is False:
+        leak.append("no-segoe")
+    leak_s = f" leak={','.join(leak)}" if leak else " leak=none"
+    return (
+        f"[*] 指纹 os={os_name} platform={plat} "
+        f"webgl={renderer} fontsWin={probe.get('fontsWin')} "
+        f"ua={ua_short}{leak_s}"
+    )
+
+
+def probe_browser_fingerprint(raw_page) -> dict:
+    """在已启动的 Playwright page 上读 UA / platform / WebGL / Segoe。"""
+    try:
+        data = raw_page.evaluate(_FP_PROBE_JS)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 class SafeCamoufox(_Camoufox):
@@ -85,9 +198,19 @@ class SafeCamoufox(_Camoufox):
         try:
             self.browser = NewBrowser(self._playwright, **self.launch_options)
         except BaseException as e:
-            super().__exit__(type(e), e, e.__traceback__)
+            try:
+                super().__exit__(type(e), e, e.__traceback__)
+            except BaseException:
+                pass
             raise
         return self.browser
+
+    def __exit__(self, exc_type, exc, tb):
+        """关闭时吞掉 EPIPE / TargetClosed，避免 Node 24 未处理 error 拖死进程。"""
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        except BaseException:
+            return True
 
 
 # 仅允许删除该目录树下的临时 profile，防止误删其它路径
@@ -127,6 +250,22 @@ def _note_start_failure():
         return _start_fail_streak
 
 
+def _is_driver_pipe_error(exc: object) -> bool:
+    """Playwright Node 管道断开 / 浏览器已关。"""
+    msg = str(exc or "")
+    low = msg.lower()
+    return (
+        "epipe" in low
+        or "econnreset" in low
+        or "target closed" in low
+        or "targetclosed" in low
+        or "browser has been closed" in low
+        or "connection closed" in low
+        or "pipe closed" in low
+        or "playwright connection" in low
+    )
+
+
 def _proxies() -> dict:
     if _get_proxy:
         return _get_proxy() or {}
@@ -158,6 +297,13 @@ def get_bound_proxy() -> str:
 def set_exit_context(proxy: str = "", exit_ip: str = "") -> None:
     _tls.bound_proxy = proxy or ""
     _tls.exit_ip = exit_ip or ""
+    if proxy and exit_ip:
+        try:
+            from webui.proxy_store import note_proxy_exit
+
+            note_proxy_exit(proxy, exit_ip)
+        except Exception:
+            pass
 
 
 def clear_exit_context() -> None:
@@ -274,14 +420,7 @@ def is_blocked_exit_ip(ip: str) -> tuple:
     blocked_asns = set(state.get("asns") or _BLOCKED_ASN_NUMS)
     blocked_asn_labels = tuple(f"AS{value}" for value in blocked_asns)
     blocked_isp_keywords = tuple(state.get("isp_keywords") or _BLOCKED_ISP_SUBSTR)
-    if asn_num in blocked_asns:
-        return True, f"blocked ASN AS{asn_num}: {asn} / {isp} / {org} / {info.get('city')}"
-    for key in blocked_asn_labels:
-        if key.lower() in blob:
-            return True, f"blocked ASN {key}: {asn} / {isp} / {info.get('city')}"
-    for key in blocked_isp_keywords:
-        if key in blob:
-            return True, f"blocked ISP '{key}': {asn} / {isp} / {info.get('city')}"
+    # 家宽只换 IP，不因 ASN/ISP 整段跳过
     summary = f"{asn or '?'} | {isp or '?'} | {info.get('city') or '?'}"
     return False, summary
 
@@ -646,6 +785,8 @@ def create_browser_options(unique_profile=True) -> dict:
     - humanize=True：人类化鼠标移动 + 点击轨迹
     - geoip=True：基于代理 IP 匹配时区 / 语言 / 经纬度
     - block_webrtc=True：WebRTC IP 泄漏防护（避免真实 IP 通过 STUN 暴露）
+    - os=windows：UA / Client Hints / 字体 / WebGL 渲染器按 Windows 配置文件对齐
+      （宿主机即使是 Linux Xvfb 也不走 linux 指纹）
     - 指纹由 BrowserForge 自动生成（匹配 Firefox/Camoufox 引擎）
     """
     headless_env = str(os.environ.get("GROK_HEADLESS", "") or "").strip().lower()
@@ -653,6 +794,7 @@ def create_browser_options(unique_profile=True) -> dict:
     force_headless = headless_env in {"1", "true", "yes", "on"}
     force_headed = headed_env in {"1", "true", "yes", "on"}
     use_headless = bool(force_headless) and not force_headed
+    browser_os = resolve_browser_os()
 
     opts: dict = {
         "headless": use_headless,  # 默认有头；GPU 崩溃会话设 GROK_HEADLESS=1
@@ -660,6 +802,7 @@ def create_browser_options(unique_profile=True) -> dict:
         "geoip": True,          # 基于 IP 匹配时区 / 语言 / 经纬度
         "locale": "en-US",      # 与美西出口一致，避免 UI 语言漂移
         "block_webrtc": True,   # 防止 WebRTC 泄漏真实 IP（即使使用代理）
+        "os": browser_os,       # Windows 配置文件：UA + hints + 字体 + WebGL
         "i_know_what_im_doing": True,  # 抑制 Firefox 版本伪装警告（Camoufox 引擎层伪装是预期行为）
     }
     if use_headless or os.name == "nt":
@@ -828,6 +971,11 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 if eip or bpx:
                     extra = f" | {meta}" if meta else ""
                     log_callback(f"[*] 出口IP={eip or '?'} 代理={redact_proxy(bpx) or '?'}{extra}")
+                try:
+                    probe = probe_browser_fingerprint(raw_page)
+                except Exception:
+                    probe = {}
+                log_callback(format_fingerprint_log(str(opts.get("os") or "?"), probe))
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser_obj, page_obj
@@ -847,6 +995,10 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 or "出口IP命中黑名单" in msg
             ):
                 break
+            # EPIPE / 驱动管道断开：稍等再起一个新 Node，不要立刻放弃
+            if _is_driver_pipe_error(exc) and attempt < attempt_limit:
+                time.sleep(min(1.0 * attempt, 3))
+                continue
             profile_dir = profile_dir or getattr(_tls, "profile_dir", None)
             try:
                 cur = active_browser()

@@ -281,7 +281,7 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["batch_count"] = 40
         try:
-            c["add_count"] = max(1, int(c.get("add_count", 40)))
+            c["add_count"] = max(1, min(2000, int(c.get("add_count", 40))))
         except Exception:
             c["add_count"] = 40
         try:
@@ -825,6 +825,10 @@ def _registration_env() -> dict[str, str]:
         "GROK_STATIC_CACHE_DIR",
         str(LOG_DIR / "static-asset-cache"),
     )
+    wrapper = ROOT / "scripts" / "playwright-node"
+    if wrapper.is_file():
+        env["PLAYWRIGHT_NODEJS_PATH"] = str(wrapper)
+    env.setdefault("GROK_PLAYWRIGHT_NODE", "/usr/bin/node")
     return env
 
 
@@ -2345,7 +2349,7 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="batch_count" min="1" value="40"/>
       </div>
       <div class="field"><label for="add_count">追加目标</label>
-        <input type="number" id="add_count" min="1" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
+        <input type="number" id="add_count" min="1" max="2000" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
       </div>
       <div class="field"><label for="risk_pause">风控阈值</label>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>

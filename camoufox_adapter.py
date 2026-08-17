@@ -618,20 +618,26 @@ class CamoufoxBrowser:
         del_data 参数仅为兼容 DrissionPage 接口签名；
         persistent_context=True 时关闭 context 即清除会话数据。
         """
-        # 先关闭 context / browser
+        # 先关 context / browser，再拆 Playwright。任何一端已死后都吞掉
+        # EPIPE / TargetClosed，避免 Node 24 Unhandled 'error' 拖死整批。
         try:
             if self._context:
                 self._context.close()
-            elif self._browser:
+        except Exception:
+            pass
+        try:
+            if self._browser:
                 self._browser.close()
         except Exception:
             pass
-        # 再调用 Camoufox.__exit__ 释放 Playwright 事件循环
         try:
             if self._camoufox:
                 self._camoufox.__exit__(None, None, None)
         except Exception:
             pass
+        self._context = None
+        self._browser = None
+        self._camoufox = None
 
     @property
     def raw(self):

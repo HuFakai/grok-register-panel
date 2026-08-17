@@ -74,6 +74,14 @@ TOKEN_ENDPOINTS: Tuple[Tuple[str, Dict[str, str]], ...] = (
 )
 
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
+GRAPH_JUNK_MESSAGES_URL = (
+    "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages"
+)
+GRAPH_INBOX_FOLDER_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox"
+ACCESS_TOKEN_SKEW_SECONDS = 90
+WAIT_HEARTBEAT_SECONDS = 15
+# Graph 连续空箱这么久就提前放弃，避免 180s 空耗；不记 used，库存可再领
+EMPTY_INBOX_ABORT_SECONDS = 20
 CODE_KEYWORDS = (
     "x.ai",
     "xai",
@@ -99,6 +107,10 @@ _reserved: set[str] = set()
 _token_map: Dict[str, Dict[str, Any]] = {}
 _refresh_locks: Dict[str, threading.Lock] = {}
 _refresh_locks_guard = threading.Lock()
+_CODE_WAIT_LIMIT = max(
+    1, int(os.environ.get("OUTLOOK_RT_CODE_WAIT_CONCURRENCY", "3") or 3)
+)
+_code_wait_sema = threading.Semaphore(_CODE_WAIT_LIMIT)
 
 # refresh 连续失败多少次视为死号（秒退，避免空耗 180s）
 MAX_REFRESH_FAILURES = 2
@@ -471,6 +483,13 @@ def refresh_access_token(
 ) -> str:
     email_addr = account["email"]
     with _refresh_lock(email_addr):
+        cached = str(account.get("_access_token") or "")
+        try:
+            cached_exp = float(account.get("_access_expires") or 0)
+        except Exception:
+            cached_exp = 0.0
+        if cached and time.time() < cached_exp:
+            return cached
         refresh_token = account.get("refresh_token") or ""
         last_err: Any = None
         # 已绑定 client_id 时优先只试该 client，减少无效 client 噪音
@@ -523,6 +542,14 @@ def refresh_access_token(
                                         new_rt,
                                         client_id=client_id,
                                     )
+                            try:
+                                ttl = int(token_data.get("expires_in") or 3600)
+                            except Exception:
+                                ttl = 3600
+                            account["_access_token"] = str(access)
+                            account["_access_expires"] = time.time() + max(
+                                60, ttl - ACCESS_TOKEN_SKEW_SECONDS
+                            )
                             return str(access)
                         error_code = str(token_data.get("error") or "").strip()
                         description = str(token_data.get("error_description") or "")
@@ -572,14 +599,17 @@ def take_mailbox(
     used_path: str = "",
     default_client_id: str = "",
     http_post: Optional[HttpPost] = None,
+    http_get: Optional[HttpGet] = None,
     log_callback: LogFn = None,
     max_attempts: int = 8,
+    skip_empty_inbox: bool = True,
 ) -> Tuple[str, str]:
     """领取一个未使用的 Outlook 邮箱。
 
     若传入 http_post，会在取号后立刻 refresh 预检：
     - 成功：返回 (email, token_key)
     - 失败：mark_used 并换下一个，避免把死 RT 带进 180s 等码
+    若同时传入 http_get 且 skip_empty_inbox，Inbox 为 0 的号直接跳过。
 
     返回 (email, token_key)。token_key 供 wait_for_code 使用。
     """
@@ -639,9 +669,6 @@ def take_mailbox(
                 inventory_path=path,
                 default_client_id=default_client_id or DEFAULT_CLIENT_ID,
             )
-            if log_callback:
-                log_callback(f"[*] Outlook RT 预检 OK (at_len={len(access)})")
-            return email, token_key
         except Exception as exc:
             last_err = _safe_error(exc)
             if log_callback:
@@ -657,6 +684,39 @@ def take_mailbox(
                 pass
             release_reservation(token_key, email)
             continue
+
+        if skip_empty_inbox and http_get is not None:
+            try:
+                inbox_n = inbox_total_count(http_get, access)
+            except Exception as exc:
+                last_err = _safe_error(exc)
+                if log_callback:
+                    log_callback(
+                        f"[!] Outlook RT Inbox 预检失败，保留该号继续用: {last_err}"
+                    )
+                inbox_n = -1
+            if inbox_n == 0:
+                last_err = "empty_inbox"
+                if log_callback:
+                    log_callback("[*] Outlook RT Inbox=0，跳过空箱换号")
+                try:
+                    mark_used(
+                        email,
+                        path,
+                        used_path,
+                        reason="precheck_empty_inbox",
+                    )
+                except Exception:
+                    pass
+                release_reservation(token_key, email)
+                continue
+
+        if log_callback:
+            extra = ""
+            if skip_empty_inbox and http_get is not None:
+                extra = f" inbox={inbox_n}"
+            log_callback(f"[*] Outlook RT 预检 OK (at_len={len(access)}{extra})")
+        return email, token_key
 
     used_file = used_path_for(path, used_path)
     hint = f"；最后预检错误: {last_err}" if last_err else ""
@@ -705,9 +765,39 @@ def _resolve_session(
     raise Exception("Outlook RT token_key 无效或会话已过期，请重新取号")
 
 
-def list_messages(
+def inbox_total_count(http_get: HttpGet, access_token: str) -> int:
+    """读取 Inbox totalItemCount；读不到则抛错。"""
+    resp = http_get(
+        GRAPH_INBOX_FOLDER_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        params={"$select": "id,displayName,totalItemCount,unreadItemCount"},
+        timeout=20,
+    )
+    status = getattr(resp, "status_code", 0)
+    if status >= 400:
+        raise RuntimeError(f"Graph inbox folder HTTP {status}")
+    try:
+        data = resp.json() if hasattr(resp, "json") else {}
+    except Exception as exc:
+        raise RuntimeError("Graph inbox folder 响应无效") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Graph inbox folder 响应无效")
+    err = data.get("error")
+    if isinstance(err, dict) and err.get("code"):
+        raise RuntimeError(f"Graph inbox folder {err.get('code')}")
+    try:
+        return int(data.get("totalItemCount") or 0)
+    except Exception as exc:
+        raise RuntimeError("Graph inbox folder 无 totalItemCount") from exc
+
+
+def _list_messages_url(
     http_get: HttpGet,
     access_token: str,
+    url: str,
     *,
     top: int = 25,
 ) -> List[dict]:
@@ -717,7 +807,7 @@ def list_messages(
         "$select": "id,subject,receivedDateTime,from,bodyPreview,body",
     }
     resp = http_get(
-        GRAPH_MESSAGES_URL,
+        url,
         headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
@@ -736,6 +826,37 @@ def list_messages(
     if not isinstance(items, list):
         return []
     return [item for item in items if isinstance(item, dict)]
+
+
+def list_messages(
+    http_get: HttpGet,
+    access_token: str,
+    *,
+    top: int = 25,
+    include_junk: bool = True,
+) -> List[dict]:
+    inbox = _list_messages_url(http_get, access_token, GRAPH_MESSAGES_URL, top=top)
+    if not include_junk:
+        return inbox
+    try:
+        junk = _list_messages_url(
+            http_get,
+            access_token,
+            GRAPH_JUNK_MESSAGES_URL,
+            top=min(15, top),
+        )
+    except Exception:
+        return inbox
+    seen: set[str] = set()
+    merged: List[dict] = []
+    for item in inbox + junk:
+        mid = str(item.get("id") or item.get("Id") or "")
+        if mid:
+            if mid in seen:
+                continue
+            seen.add(mid)
+        merged.append(item)
+    return merged
 
 
 def _message_blob(item: dict) -> Tuple[str, str, str]:
@@ -804,6 +925,45 @@ def wait_for_code(
     cancel_callback: CancelFn = None,
     mark_on_success: bool = True,
     max_refresh_failures: int = MAX_REFRESH_FAILURES,
+    empty_abort_seconds: int = EMPTY_INBOX_ABORT_SECONDS,
+) -> str:
+    if not _code_wait_sema.acquire(timeout=max(5, int(timeout or 20))):
+        raise Exception("Outlook RT 等码并发已满，提前放弃")
+    try:
+        return _wait_for_code_unlocked(
+            http_get,
+            http_post,
+            token_key,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            raise_if_cancelled=raise_if_cancelled,
+            sleep_with_cancel=sleep_with_cancel,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            mark_on_success=mark_on_success,
+            max_refresh_failures=max_refresh_failures,
+            empty_abort_seconds=empty_abort_seconds,
+        )
+    finally:
+        _code_wait_sema.release()
+
+
+def _wait_for_code_unlocked(
+    http_get: HttpGet,
+    http_post: HttpPost,
+    token_key: str,
+    email: str,
+    *,
+    timeout: int = 180,
+    poll_interval: int = 4,
+    raise_if_cancelled: Callable[[CancelFn], None],
+    sleep_with_cancel: Callable[[float, CancelFn], None],
+    log_callback: LogFn = None,
+    cancel_callback: CancelFn = None,
+    mark_on_success: bool = True,
+    max_refresh_failures: int = MAX_REFRESH_FAILURES,
+    empty_abort_seconds: int = EMPTY_INBOX_ABORT_SECONDS,
 ) -> str:
     info = _resolve_session(token_key, email)
     account = info["account"]
@@ -818,6 +978,13 @@ def wait_for_code(
     refresh_failures = int(info.get("refresh_failures") or 0)
     graph_transient_failure = False
     max_rf = max(1, int(max_refresh_failures or MAX_REFRESH_FAILURES))
+    last_heartbeat = 0.0
+    polls = 0
+    empty_since: Optional[float] = None
+    try:
+        empty_limit = max(0, int(empty_abort_seconds))
+    except Exception:
+        empty_limit = EMPTY_INBOX_ABORT_SECONDS
 
     def _retire(reason: str) -> None:
         if not inventory_path:
@@ -871,6 +1038,8 @@ def wait_for_code(
             status = getattr(getattr(exc, "response", None), "status_code", None)
             err_s = safe_graph_error
             if "401" in err_s or "403" in err_s or status in (401, 403):
+                account.pop("_access_token", None)
+                account.pop("_access_expires", None)
                 refresh_failures += 1
                 info["refresh_failures"] = refresh_failures
                 if refresh_failures >= max_rf:
@@ -895,10 +1064,46 @@ def wait_for_code(
                 log_callback("[*] Outlook RT 已提取验证码并完成库存记账")
             release_reservation(token_key, mailbox)
             return code
-        if log_callback:
-            remaining = max(0, int(deadline - time.time()))
+        polls += 1
+        now = time.time()
+        remaining = max(0, int(deadline - now))
+        if messages:
+            empty_since = None
+        else:
+            if empty_since is None:
+                empty_since = now
+            empty_for = now - empty_since
+            if empty_limit and empty_for >= empty_limit:
+                if inventory_path:
+                    try:
+                        mark_used(
+                            mailbox,
+                            inventory_path,
+                            used_path,
+                            reason="code_empty_abort",
+                        )
+                    except Exception as exc:
+                        if log_callback:
+                            log_callback(
+                                f"[Debug] Outlook RT 标记已用失败: {_safe_error(exc)}"
+                            )
+                release_reservation(token_key, mailbox)
+                if log_callback:
+                    log_callback(
+                        f"[*] Outlook RT 连续 {int(empty_for)}s 仍是 0 封信，记 used 后换号"
+                    )
+                raise Exception(
+                    f"Outlook RT 连续 {int(empty_for)}s 收件箱为空（0 封信），提前放弃"
+                )
+        if log_callback and (
+            polls == 1 or now - last_heartbeat >= WAIT_HEARTBEAT_SECONDS
+        ):
+            last_heartbeat = now
+            extra = ""
+            if empty_since is not None and empty_limit:
+                extra = f" 空箱 {int(now - empty_since)}/{empty_limit}s"
             log_callback(
-                f"[Debug] Outlook RT 等待验证码… 剩余 {remaining}s 邮件 {len(messages)} 封"
+                f"[*] Outlook RT 等待验证码… 剩余 {remaining}s 邮件 {len(messages)} 封{extra}"
             )
         sleep_with_cancel(poll_interval, cancel_callback)
 

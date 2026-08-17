@@ -73,8 +73,12 @@ from secure_files import (
     exclusive_file_lock,
 )
 from webui.proxy_store import (
+    IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
     mark_proxy_used as _mark_managed_proxy_used,
+    note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
+    restore_home_proxies as _restore_home_proxies,
+    worker_proxy_details as _managed_worker_proxy_details,
     worker_proxy_snapshot as _managed_worker_proxy_snapshot,
 )
 from webui.email_domain_store import (
@@ -563,7 +567,13 @@ def classify_failure(exc) -> str:
         or "最终注册页资料填写失败" in msg
     ):
         return FAIL_PROFILE
-    if "未收到验证码" in msg or "验证码阶段失败" in msg or ("验证码" in msg and "失败" in msg):
+    if (
+        "未收到验证码" in msg
+        or "验证码阶段失败" in msg
+        or "0 封信" in msg
+        or "收件箱为空" in msg
+        or ("验证码" in msg and "失败" in msg)
+    ):
         return FAIL_CODE
     if "Page.goto" in msg or (
         "打开注册页失败" in msg and ("timeout" in low or "超时" in msg)
@@ -717,6 +727,25 @@ _proxy_pool: list = []
 _proxy_pool_lock = threading.Lock()
 _proxy_pool_source = "none"
 _proxy_worker_assignments: dict[int, str] = {}
+_proxy_leases: dict = {}
+_proxy_lease_lock = threading.Lock()
+_submit_slot_lock = threading.Lock()
+_next_submit_at = 0.0
+# 各窗口提交邮箱至少隔这么久，避免同时打 xAI 验证码
+SIGNUP_SUBMIT_GAP_SECONDS = max(
+    0.0, float(os.environ.get("SIGNUP_SUBMIT_GAP_SECONDS", "7") or 7)
+)
+
+
+def reserve_signup_submit_slot(gap: float | None = None) -> float:
+    """预约下一次提交邮箱的时间，返回需要先等待的秒数。"""
+    global _next_submit_at
+    wait_gap = SIGNUP_SUBMIT_GAP_SECONDS if gap is None else max(0.0, float(gap))
+    with _submit_slot_lock:
+        now = time.time()
+        slot = now if _next_submit_at <= now else _next_submit_at
+        _next_submit_at = slot + wait_gap
+        return max(0.0, slot - now)
 
 
 def load_proxy_pool(path: str = "") -> list:
@@ -770,9 +799,28 @@ def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
+def release_proxy_lease(worker_id: int | None = None) -> None:
+    """释放某个 worker 占用的出口；worker_id 为空则清空。"""
+    with _proxy_lease_lock:
+        if worker_id is None:
+            _proxy_leases.clear()
+            return
+        _proxy_leases.pop(int(worker_id), None)
+
+
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
-    """账号边界热加载，全池轮换；当前浏览器会话内不再换代理。"""
+    """账号边界选口：跳过别人占用的，优先 40 分钟内没出现过的出口 IP。
+
+    风控前置：当前口的 IP 若在窗口内用过，即使 rotate_idx=0 也换一条冷 IP。
+    """
     pool = load_proxy_pool()
+    details = []
+    try:
+        details = list(_managed_worker_proxy_details() or [])
+    except Exception:
+        details = []
+    if details:
+        pool = [str(row.get("url") or "") for row in details if row.get("url")]
     if not pool:
         if _proxy_pool_source == "managed-empty" and not config.get(
             "proxy_fallback_to_local", False
@@ -780,32 +828,68 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             raise RuntimeError("面板代理池没有健康且启用的代理，请先检测或等待冷却结束")
         # 回退本地网络：config.proxy 可用则走本地代理；留空则浏览器直连
         return str(config.get("proxy", "") or "").strip()
-    worker_id = max(0, int(worker_id))
-    rotate_idx = max(0, int(rotate_idx))
-    idx = (worker_id + rotate_idx) % len(pool)
-    with _proxy_pool_lock:
-        occupied = {
-            proxy
-            for owner, proxy in _proxy_worker_assignments.items()
-            if owner != worker_id
-        }
-        selected_raw = next(
-            (
-                pool[(idx + offset) % len(pool)]
-                for offset in range(len(pool))
-                if expand_proxy_template(
-                    pool[(idx + offset) % len(pool)], worker_id, rotate_idx
-                ) not in occupied
-            ),
-            pool[idx],
-        )
-        selected = expand_proxy_template(selected_raw, worker_id, rotate_idx)
-        _proxy_worker_assignments[worker_id] = selected
+    wid = max(0, int(worker_id))
+    rot = max(0, int(rotate_idx))
+    by_url = {str(row.get("url") or ""): row for row in details}
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    def _age(url: str) -> float:
+        row = by_url.get(url) or {}
+        ip = str(row.get("exit_ip") or "").strip()
+        if not ip:
+            return 10**9
+        raw = str(row.get("last_used_at") or "")
+        if not raw:
+            return 10**9
+        try:
+            used = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return max(0.0, (now - used).total_seconds())
+        except Exception:
+            return 10**9
+
+    fresh = max(60, int(_PROXY_IP_FRESH_SECONDS or 2400))
+    with _proxy_lease_lock:
+        current = _proxy_leases.get(wid)
+        others = {url for owner, url in _proxy_leases.items() if owner != wid}
+        avoid = set(others)
+        if current and (_age(current) < fresh or rot > 0):
+            avoid.add(current)
+        # 同 IP 也避开（两条口偶发同一 sticky）
+        hot_ips = set()
+        for url, row in by_url.items():
+            ip = str(row.get("exit_ip") or "").strip()
+            if ip and _age(url) < fresh:
+                hot_ips.add(ip)
+        ranked = []
+        for offset, cand in enumerate(pool):
+            if cand in avoid:
+                continue
+            ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
+            if ip and ip in hot_ips and cand != current:
+                continue
+            ranked.append((-_age(cand), offset, cand))
+        ranked.sort()
+        selected = ranked[0][2] if ranked else ""
+        if not selected:
+            leftovers = [
+                (-_age(cand), idx, cand)
+                for idx, cand in enumerate(pool)
+                if cand not in others
+            ]
+            leftovers.sort()
+            selected = leftovers[0][2] if leftovers else ""
+        if not selected:
+            selected = pool[(wid + rot) % len(pool)]
+        _proxy_leases[wid] = selected
     try:
-        _mark_managed_proxy_used(selected_raw)
+        _mark_managed_proxy_used(selected)
     except Exception:
         pass
-    return selected
+    # Resin {session}/{worker} 模板展开为本 worker 的粘性身份
+    try:
+        return expand_proxy_template(selected, wid, rot)
+    except Exception:
+        return selected
 
 
 def release_proxy_for_worker(worker_id: int) -> None:
@@ -2362,14 +2446,22 @@ def outlook_rt_take_mailbox():
             "请在配置中填写 outlook_rt_inventory（jsonl/文本库存路径，"
             "字段 email + refresh_token）"
         )
-    # 取号后立刻 refresh 预检：死 RT 秒退并 mark used，不进入 180s 等码
+    # 取号后立刻 refresh + Inbox 预检：空箱/死 RT 秒退并 mark used
+    def _log(msg: str) -> None:
+        try:
+            cli_log(msg)
+        except Exception:
+            print(msg, flush=True)
+
     return outlook_rt_provider.take_mailbox(
         inv,
         used_path=get_outlook_rt_used_path(),
         default_client_id=get_outlook_rt_client_id(),
         http_post=http_post,
-        log_callback=None,
-        max_attempts=10,
+        http_get=http_get,
+        log_callback=_log,
+        max_attempts=20,
+        skip_empty_inbox=True,
     )
 
 
@@ -4485,6 +4577,12 @@ def run_registration_cli(count):
     max_proxy_boot_rotations = proxy_boot_rotations()
     accounts_output_file = ""  # 已改为按邮箱单独保存，不再使用批量文件
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 24, int(count or 1)))
+    try:
+        home = _restore_home_proxies()
+        if int(home.get("restored") or 0) > 0:
+            cli_log(f"[*] 已恢复家宽出口 {home.get('restored')} 条（风控不冷却）")
+    except Exception:
+        pass
     pool = load_proxy_pool()
     cli_log(
         f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | "
@@ -4776,6 +4874,12 @@ def run_registration_cli(count):
                         email = ""
                         dev_token = ""
                         code = ""
+                        delay = reserve_signup_submit_slot()
+                        if delay >= 0.5:
+                            cli_log(
+                                f"[W{wid+1}] [*] 错开提交 {delay:.0f}s，避免同时打验证码"
+                            )
+                            sleep_with_cancel(delay, controller.should_stop)
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
@@ -4910,6 +5014,14 @@ def run_registration_cli(count):
                             or "出口IP命中黑名单" in msg
                             or "命中黑名单" in msg
                         )
+                        pipe_dead = (
+                            "epipe" in msg.lower()
+                            or "econnreset" in msg.lower()
+                            or "target closed" in msg.lower()
+                            or "targetclosed" in msg.lower()
+                            or "browser has been closed" in msg.lower()
+                            or "connection closed" in msg.lower()
+                        )
                         if proxy_dead:
                             record_proxy_boot_failure(
                                 get_bound_proxy() or get_thread_proxy(), exc
@@ -4941,12 +5053,16 @@ def run_registration_cli(count):
                                     else f"临时冷却 30 分钟（累计空页 {blank_count} 次）"
                                 )
                             )
-                        elif (proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
+                        elif (blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1
                             why = (
-                                "Turnstile卡住"
-                                if turnstile_stuck
-                                else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                "Playwright管道断开"
+                                if pipe_dead
+                                else (
+                                    "Turnstile卡住"
+                                    if turnstile_stuck
+                                    else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                )
                             )
                             cli_log(
                                 f"[W{wid+1}] [!] {why}，同槽位换口重试 {retry}/{max_slot_retry}: "
@@ -4998,9 +5114,11 @@ def run_registration_cli(count):
                             cli_log(f"[W{wid+1}] [*] [IP策略] 页面加载超时，切换 sticky #{rotate_idx}")
                         elif kind == FAIL_RISK and accounts_per_ip > 0:
                             rotate_idx += 1
-                            cli_log(f"[W{wid+1}] [*] 风控拒绝，切换 sticky #{rotate_idx}")
+                            cli_log(
+                                f"[W{wid+1}] [*] 风控拒绝，换 40 分钟内未出现的 IP #{rotate_idx}"
+                            )
                         elif accounts_per_ip > 0 and (
-                            blank_ui or proxy_dead or turnstile_stuck or profile_soft or kind in (
+                            blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft or kind in (
                             FAIL_TURNSTILE,
                             FAIL_PROFILE,
                             )
@@ -5198,6 +5316,7 @@ def run_registration_cli(count):
             finally:
                 ip_quota.release(wid)
                 release_proxy_for_worker(wid)
+                release_proxy_lease(wid)
                 try:
                     maybe_stop_browser(
                         user_stopped=bool(controller.should_stop()),
@@ -5376,7 +5495,7 @@ def run_registration_cli(count):
                     bot_flag=0,
                     log_callback=cli_log,
                 )
-                if success_count % 2 == 0:
+                if success_count % 3 == 0:
                     single_rotate_idx += 1
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 record_ip_usage(get_exit_ip())
@@ -5448,6 +5567,17 @@ def run_registration_cli(count):
                         "命中黑名单",
                     )
                 )
+                pipe_dead = any(
+                    marker in message.lower()
+                    for marker in (
+                        "epipe",
+                        "econnreset",
+                        "target closed",
+                        "targetclosed",
+                        "browser has been closed",
+                        "connection closed",
+                    )
+                )
                 if proxy_dead:
                     record_proxy_boot_failure(
                         get_bound_proxy() or get_thread_proxy(), exc
@@ -5455,6 +5585,7 @@ def run_registration_cli(count):
                 if (
                     kind == FAIL_RISK
                     or proxy_dead
+                    or pipe_dead
                     or kind in (FAIL_TURNSTILE, FAIL_PROFILE, FAIL_PAGE_LOAD)
                 ):
                     single_rotate_idx += 1

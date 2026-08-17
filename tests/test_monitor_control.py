@@ -60,7 +60,7 @@ def test_ip_policy_control_round_trip_and_bounds():
             monitor.CONTROL_FILE = previous
 
 
-def test_batch_and_add_count_have_no_upper_bound():
+def test_batch_and_add_count_are_bounded():
     previous = monitor.CONTROL_FILE
     with tempfile.TemporaryDirectory() as tmp:
         monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
@@ -72,7 +72,8 @@ def test_batch_and_add_count_have_no_upper_bound():
                 }
             )
             assert big["batch_count"] == 100000
-            assert big["add_count"] == 500000
+            # add_count 封顶 2000（上游 dbcd902 收紧，防误填拉爆批次）
+            assert big["add_count"] == 2000
 
             floor = monitor.save_control(
                 {
@@ -111,6 +112,6 @@ def test_base_ok_persists_through_save_control():
 
 if __name__ == "__main__":
     test_ip_policy_control_round_trip_and_bounds()
-    test_batch_and_add_count_have_no_upper_bound()
+    test_batch_and_add_count_are_bounded()
     test_base_ok_persists_through_save_control()
     print("OK monitor_control")

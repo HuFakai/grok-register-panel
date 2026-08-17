@@ -231,6 +231,190 @@ def test_wait_for_code_with_fake_http():
         assert "RT_NEW" not in joined
 
 
+def test_wait_for_code_reads_junk_and_heartbeats():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [{"email": "junkbox@outlook.com", "refresh_token": "RT_FAKE"}],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+        email, token_key = outlook_rt.take_mailbox(str(inv))
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, **kwargs):
+            return Resp({"access_token": "AT_TEST", "expires_in": 3600})
+
+        inbox_calls = {"n": 0}
+
+        def http_get(url, **kwargs):
+            if "junkemail" in str(url):
+                return Resp(
+                    {
+                        "value": [
+                            {
+                                "id": "junk1",
+                                "subject": "xAI verification",
+                                "bodyPreview": "verification code JNK-441",
+                                "body": {"content": "code JNK-441"},
+                                "receivedDateTime": "2099-06-01T12:00:00Z",
+                            }
+                        ]
+                    }
+                )
+            inbox_calls["n"] += 1
+            return Resp({"value": []})
+
+        logs = []
+        code = outlook_rt.wait_for_code(
+            http_get,
+            http_post,
+            token_key,
+            email,
+            timeout=10,
+            poll_interval=0,
+            raise_if_cancelled=lambda _c: None,
+            sleep_with_cancel=lambda _s, _c: None,
+            log_callback=logs.append,
+        )
+        assert code == "JNK-441"
+        assert inbox_calls["n"] >= 1
+        joined = "\n".join(logs)
+        assert "JNK-441" not in joined
+        assert "junkbox@" not in joined
+
+
+def test_wait_for_code_heartbeat_uses_info_prefix():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [{"email": "waitbox@outlook.com", "refresh_token": "RT_FAKE"}],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+        email, token_key = outlook_rt.take_mailbox(str(inv))
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, **kwargs):
+            return Resp({"access_token": "AT_TEST", "expires_in": 3600})
+
+        calls = {"n": 0}
+
+        def http_get(url, **kwargs):
+            if "junkemail" in str(url):
+                return Resp({"value": []})
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return Resp({"value": []})
+            return Resp(
+                {
+                    "value": [
+                        {
+                            "id": "m2",
+                            "subject": "xAI verification",
+                            "bodyPreview": "verification code HBX-902",
+                            "body": {"content": "code HBX-902"},
+                            "receivedDateTime": "2099-06-01T12:00:00Z",
+                        }
+                    ]
+                }
+            )
+
+        logs = []
+        code = outlook_rt.wait_for_code(
+            http_get,
+            http_post,
+            token_key,
+            email,
+            timeout=10,
+            poll_interval=0,
+            raise_if_cancelled=lambda _c: None,
+            sleep_with_cancel=lambda _s, _c: None,
+            log_callback=logs.append,
+        )
+        assert code == "HBX-902"
+        assert any(line.startswith("[*] Outlook RT 等待验证码") for line in logs)
+        assert not any("[Debug] Outlook RT 等待验证码" in line for line in logs)
+
+
+def test_wait_for_code_aborts_empty_inbox_and_marks_used():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [{"email": "emptybox@outlook.com", "refresh_token": "RT_FAKE"}],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+        email, token_key = outlook_rt.take_mailbox(str(inv))
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        clock = {"t": 1000.0}
+        original_time = outlook_rt.time.time
+        outlook_rt.time.time = lambda: clock["t"]
+
+        def http_post(url, **kwargs):
+            return Resp({"access_token": "AT_TEST", "expires_in": 3600})
+
+        def http_get(url, **kwargs):
+            return Resp({"value": []})
+
+        def sleep_fn(seconds, _cancel):
+            clock["t"] += max(1.0, float(seconds or 0) or 1.0)
+
+        logs = []
+        try:
+            try:
+                outlook_rt.wait_for_code(
+                    http_get,
+                    http_post,
+                    token_key,
+                    email,
+                    timeout=180,
+                    poll_interval=15,
+                    empty_abort_seconds=20,
+                    raise_if_cancelled=lambda _c: None,
+                    sleep_with_cancel=sleep_fn,
+                    log_callback=logs.append,
+                )
+                raise AssertionError("expected empty-inbox abort")
+            except Exception as exc:
+                assert "0 封信" in str(exc) or "收件箱为空" in str(exc)
+                assert clock["t"] < 1100
+            used = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+            assert "emptybox@outlook.com" in used
+            assert "code_empty_abort" in used
+            assert any("记 used 后换号" in line for line in logs)
+        finally:
+            outlook_rt.time.time = original_time
+
+
 def test_provider_store_outlook_rt_schema():
     from webui import email_provider_store
 
@@ -330,6 +514,61 @@ def test_take_mailbox_precheck_skips_dead_rt():
             for line in used.splitlines()
             if line.strip()
         }
+
+
+def test_take_mailbox_skips_empty_inbox():
+    with tempfile.TemporaryDirectory() as tmp:
+        inv = Path(tmp) / "stock.jsonl"
+        _write_jsonl(
+            inv,
+            [
+                {"email": "empty@outlook.com", "refresh_token": "RT_EMPTY"},
+                {"email": "warm@outlook.com", "refresh_token": "RT_WARM"},
+            ],
+        )
+        outlook_rt._reserved.clear()
+        outlook_rt._token_map.clear()
+
+        class Resp:
+            def __init__(self, payload, status=200):
+                self._payload = payload
+                self.status_code = status
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def http_post(url, **kwargs):
+            return Resp({"access_token": "AT", "expires_in": 3600})
+
+        def http_get(url, **kwargs):
+            if "mailFolders/inbox" in str(url) and "messages" not in str(url):
+                # first claimed empty, then warm
+                n = 0 if http_get.calls == 0 else 3
+                http_get.calls += 1
+                return Resp({"totalItemCount": n, "unreadItemCount": n})
+            return Resp({"value": []})
+
+        http_get.calls = 0
+        logs = []
+        email, token = outlook_rt.take_mailbox(
+            str(inv),
+            http_post=http_post,
+            http_get=http_get,
+            log_callback=logs.append,
+            max_attempts=5,
+            skip_empty_inbox=True,
+        )
+        assert email == "warm@outlook.com"
+        used = outlook_rt.used_path_for(str(inv)).read_text(encoding="utf-8")
+        assert "empty@outlook.com" in used
+        assert "precheck_empty_inbox" in used
+        assert "warm@outlook.com" not in {
+            line.split("----", 1)[0].strip().lower()
+            for line in used.splitlines()
+            if line.strip()
+        }
+        assert any("Inbox=0" in line for line in logs)
 
 
 def test_wait_for_code_fast_fail_on_dead_refresh():
@@ -466,8 +705,12 @@ if __name__ == "__main__":
     test_find_code_in_messages()
     test_graph_timestamp_is_utc_independent_of_host_timezone()
     test_wait_for_code_with_fake_http()
+    test_wait_for_code_reads_junk_and_heartbeats()
+    test_wait_for_code_heartbeat_uses_info_prefix()
+    test_wait_for_code_aborts_empty_inbox_and_marks_used()
     test_provider_store_outlook_rt_schema()
     test_take_mailbox_precheck_skips_dead_rt()
+    test_take_mailbox_skips_empty_inbox()
     test_wait_for_code_fast_fail_on_dead_refresh()
     test_probe_persists_rotated_refresh_token_without_consuming_inventory()
     test_transient_graph_failure_does_not_consume_inventory()
