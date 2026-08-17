@@ -54,12 +54,18 @@ def test_provider_schema_and_defaults():
             "mailnest",
             "cloudmail",
             "moemail",
+            "outlook_rt",
         }
         assert providers["duckmail"]["configured"] is True
         assert providers["cloudmail"]["configured"] is False
+        assert providers["outlook_rt"]["configured"] is False
         assert any(
             field["name"] == "cloudmail_password" and field["secret"] is True
             for field in providers["cloudmail"]["fields"]
+        )
+        assert any(
+            field["name"] == "outlook_rt_inventory"
+            for field in providers["outlook_rt"]["fields"]
         )
 
 

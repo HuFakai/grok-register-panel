@@ -59,5 +59,8 @@
   "moemail_api_key": "",
   "moemail_domain": "",
   "moemail_expiry_ms": 3600000,
+  "outlook_rt_inventory": "",
+  "outlook_rt_used_path": "",
+  "outlook_rt_client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
   "push_token": ""
 }
