@@ -29,8 +29,8 @@ class FakeWait:
 
 
 class FakePage:
-    def __init__(self, cookie_after_nudge=None):
-        self.url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+    def __init__(self, cookie_after_nudge=None, url="https://grok.com/"):
+        self.url = url
         self.wait = FakeWait()
         self.nudges = 0
         self.cookie_after_nudge = cookie_after_nudge

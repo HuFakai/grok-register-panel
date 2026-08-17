@@ -77,6 +77,7 @@ GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/messages"
 CODE_KEYWORDS = (
     "x.ai",
     "xai",
+    "spacexai",
     "grok",
     "verification",
     "verify",

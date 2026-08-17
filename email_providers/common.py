@@ -81,11 +81,14 @@ def _normalize_code(code: str) -> str:
     return str(code or "").strip().upper()
 
 
-def _is_plausible_xai_code(code: str) -> bool:
+def _is_plausible_xai_code(code: str, *, allow_numeric: bool = False) -> bool:
     """过滤邮件 HTML/模板伪验证码（如 per-100）。
 
     真码也可能是「三字母-三数字」(XSB-802)，不能整类 letter-digit 干掉；
     只拦模板常见左词 + 黑名单 token。
+
+    SpaceXAI 新主题是全数字 3-3（427-599）；仅在 confirmation/spacexai
+    上下文里允许两侧都是数字，避免 HTML 里的 100-200 误伤。
     """
     if not code or "-" not in code:
         return False
@@ -98,7 +101,7 @@ def _is_plausible_xai_code(code: str) -> bool:
     if not (left.isalnum() and right.isalnum()):
         return False
     if left.isdigit() and right.isdigit():
-        return False
+        return bool(allow_numeric)
     if left.isalpha() and right.isdigit() and left.lower() in _BAD_LEFT:
         return False
     return True
@@ -115,7 +118,10 @@ def _score_code(code: str, hay: str, index: int) -> int:
         score += 1
     window = hay[max(0, index - 48): index + len(code) + 48].lower()
     for kw, pts in (
+        ("spacexai", 10),
+        ("x.ai", 8),
         ("xai", 8),
+        ("confirmation code", 8),
         ("verification", 6),
         ("verify", 5),
         ("one-time", 5),
@@ -148,21 +154,27 @@ def extract_verification_code(text: str, subject: str = "") -> Optional[str]:
     if m and _is_plausible_xai_code(m.group(1)):
         return _normalize_code(m.group(1))
 
+    hay = f"{subject}\n{text}"
+    # SpaceXAI 新模板主题即 "SpaceXAI confirmation code: 427-599"（两侧全数字）
     for pat in (
+        r"(?:spacexai|x\.?ai)\s+confirmation\s+code[:\s]+([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b",
+        r"(?:verification|security|confirm(?:ation)?)\s+code[:\s]+([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b",
         r"\b([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b\s*xAI\b",
         r"\bxAI\b[^\n]{0,48}\b([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b",
-        r"(?:verification|security|confirm(?:ation)?)\s+code[:\s]+([A-Za-z0-9]{3}-[A-Za-z0-9]{3})\b",
     ):
-        m = re.search(pat, text, re.IGNORECASE)
-        if m and _is_plausible_xai_code(m.group(1)):
+        m = re.search(pat, hay, re.IGNORECASE)
+        if m and _is_plausible_xai_code(m.group(1), allow_numeric=True):
             return _normalize_code(m.group(1))
 
-    hay = f"{subject}\n{text}"
+    allow_numeric = any(
+        k in hay.lower()
+        for k in ("spacexai", "confirmation code", "x.ai", "noreply@x.ai")
+    )
     best = None
     best_score = -10**9
     for m in _CODE_RE.finditer(hay):
         cand = m.group(1)
-        if not _is_plausible_xai_code(cand):
+        if not _is_plausible_xai_code(cand, allow_numeric=allow_numeric):
             continue
         sc = _score_code(cand, hay, m.start())
         if sc > best_score:
