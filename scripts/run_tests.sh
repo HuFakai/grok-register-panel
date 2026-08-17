@@ -43,6 +43,7 @@ tests=(
   tests/test_config_backup.py
   tests/test_email_domain_store.py
   tests/test_email_domain_worker_integration.py
+  tests/test_sso_state.py
   tests/test_star_history.py
   tests/test_panel_structure.py
   tests/test_no_live_hardcode.py
@@ -72,7 +73,9 @@ done
   static_asset_cache.py \
   run_batch_headless_static_cache.py \
   run_until_100_static_cache.py \
-  scripts/grok2api_upload.py
+  scripts/grok2api_upload.py \
+  scripts/check_sso_state.py \
+  webui/sso_state_ops.py
 
 bash -n scripts/*.sh
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

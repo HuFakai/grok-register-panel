@@ -189,6 +189,18 @@ def test_monitor_http_auth_and_headers():
         assert status == 200
         assert "pending_count" in json.loads(body)
 
+        status, _, _ = request(base + "/api/sso-state")
+        assert status == 401
+        status, _, body = request(base + "/api/sso-state", token=token)
+        assert status == 200
+        assert "sources" in json.loads(body)
+        status, _, body = request(
+            base + "/api/sso-state/start",
+            method="POST",
+            body=b'{"source":"paste","text":""}',
+        )
+        assert status == 401
+
         status, _, body = request(base + "/api/proxies")
         assert status == 401
 

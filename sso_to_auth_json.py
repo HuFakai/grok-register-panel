@@ -45,6 +45,7 @@ from pathlib import Path
 
 from curl_cffi import requests
 from secure_files import (
+    append_private_text,
     atomic_write_json,
     atomic_write_text,
     ensure_private_dir,
@@ -747,7 +748,7 @@ def _parse_grok_account_state(page_html: str) -> dict:
         risk = None
     policy = detail_fields.get("policy", "").lower()
     event = detail_fields.get("event", "")
-    denied = policy == "deny" and event == "$registration"
+    denied = policy == "deny"
 
     return {
         "found": bool(source_match or details_match),
@@ -808,6 +809,146 @@ def inspect_sso_account_state(
     except Exception as exc:
         result["error"] = str(exc)
         return result
+
+
+def classify_sso_account_state(state: dict) -> str:
+    """Map inspect_sso_account_state() into flagged / clean / error / unknown.
+
+    Aligns with the live risk gate:
+      - botFlagSource in (1, 2)
+      - policy=deny (any event, including $registration / $login)
+    """
+    if not isinstance(state, dict):
+        return "unknown"
+    bf = state.get("bot_flag_source")
+    policy = str(state.get("policy") or "").strip().lower()
+    if state.get("denied") or bf in (1, 2) or policy == "deny":
+        return "flagged"
+    if state.get("found"):
+        return "clean"
+    try:
+        status = int(state.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status != 200 or str(state.get("error") or "").strip():
+        return "error"
+    return "unknown"
+
+
+def run_check_sso_state(
+    records: list[SsoInput],
+    *,
+    proxy: str = "",
+    delay: float = 0,
+    export: str | Path | None = None,
+    clean_export: str | Path | None = None,
+    log=print,
+    on_item=None,
+    cancel_callback=None,
+) -> dict:
+    """批量读取 grok.com 账号风控状态，不换 token 不入库。
+
+    export / clean_export 边检查边逐行追加写（0600），中断不丢已检查结果；
+    clean_export 写出 verdict=clean 的原始行（raw_line，每行一条），仅用于本机后续 --sso 输入。
+    """
+    summary: dict = {
+        "ok": True,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total": 0,
+        "flagged_count": 0,
+        "clean_count": 0,
+        "unknown_count": 0,
+        "error_count": 0,
+        "denied_count": 0,
+        "bot_flag_dist": {},
+        "items": [],
+        "export_path": "",
+        "export_count": 0,
+        "clean_export_path": "",
+        "clean_export_count": 0,
+        "cancelled": False,
+    }
+    dist: dict[str, int] = {}
+    export_path = None
+    clean_path = None
+    if export:
+        export_path = Path(export)
+        export_path.unlink(missing_ok=True)
+    if clean_export:
+        clean_path = Path(clean_export)
+        clean_path.unlink(missing_ok=True)
+
+    total = len(records)
+    for i, record in enumerate(records, 1):
+        if cancel_callback and cancel_callback():
+            summary["cancelled"] = True
+            break
+        email = str(record.email or "").strip()
+
+        def _check_log(message, _i=i):
+            log(f"  [{_i}] {str(message).strip()}")
+
+        state = inspect_sso_account_state(record.sso, proxy=proxy, log=_check_log)
+        verdict = classify_sso_account_state(state)
+        bf = state.get("bot_flag_source")
+        summary["total"] += 1
+        dist_key = str(bf) if bf is not None else "none"
+        dist[dist_key] = dist.get(dist_key, 0) + 1
+        row = {
+            "index": i,
+            "email": email,
+            "bot_flag_source": bf,
+            "bot_flag_details": state.get("bot_flag_details") or "",
+            "risk": state.get("risk"),
+            "policy": state.get("policy") or "",
+            "event": state.get("event") or "",
+            "denied": bool(state.get("denied")),
+            "found": bool(state.get("found")),
+            "status_code": state.get("status_code"),
+            "verdict": verdict,
+            "error": state.get("error") or "",
+        }
+        summary["items"].append(row)
+        if verdict == "flagged":
+            summary["flagged_count"] += 1
+            if row["denied"]:
+                summary["denied_count"] += 1
+            if export_path:
+                append_private_text(export_path, json.dumps(row, ensure_ascii=False) + "\n")
+        elif verdict == "clean":
+            summary["clean_count"] += 1
+            if clean_path:
+                append_private_text(clean_path, record.raw_line + "\n")
+        elif verdict == "unknown":
+            summary["unknown_count"] += 1
+        else:
+            summary["error_count"] += 1
+
+        tag = "❌" if verdict == "flagged" else ("✅" if verdict == "clean" else "⚠️")
+        log(
+            f"{tag} [{i}/{total}] {email or '(no email)'} "
+            f"botFlagSource={bf} details={row['bot_flag_details'] or '-'} "
+            f"status={state.get('status_code')} -> {verdict}"
+        )
+        if on_item:
+            on_item(row, record, summary)
+        if delay and i < total:
+            if cancel_callback and cancel_callback():
+                summary["cancelled"] = True
+                break
+            time.sleep(float(delay))
+
+    summary["export_path"] = str(export_path) if export_path else ""
+    summary["export_count"] = summary["flagged_count"]
+    summary["clean_export_path"] = str(clean_path) if clean_path else ""
+    summary["clean_export_count"] = summary["clean_count"]
+    summary["bot_flag_dist"] = dist
+    if (
+        summary["total"]
+        and summary["flagged_count"] + summary["clean_count"] + summary["unknown_count"] == 0
+    ):
+        summary["ok"] = False
+    return summary
 
 
 def _normalize_token_payload(token: dict) -> dict | None:
@@ -2129,10 +2270,52 @@ def main() -> int:
     ap.add_argument("--proxy", default="", help="OAuth 请求走代理，如 http://127.0.0.1:7890")
     ap.add_argument("--consume-success", action="store_true", help="成功后从 SSO 队列文件原子移除对应记录（--sso 文件，或 --accounts-dir 扫描到的各任务 sso_pending.txt）")
     ap.add_argument("--pending-only", action="store_true", help="配合 --accounts-dir：只处理各任务目录的 sso_pending.txt")
+    ap.add_argument(
+        "--check-sso-state",
+        metavar="FILE",
+        default=None,
+        help="仅批量检查 sso 列表的 grok.com 账号风控状态（botFlagSource/risk/policy deny），不换 token 不入库",
+    )
+    ap.add_argument(
+        "--sso-state-export",
+        metavar="FILE",
+        default=None,
+        help="与 --check-sso-state 联用：导出被标记（botFlagSource=1/2 或 policy deny）名单 jsonl，不含 token",
+    )
+    ap.add_argument(
+        "--sso-state-clean-export",
+        metavar="FILE",
+        default=None,
+        help="与 --check-sso-state 联用：导出干净 sso 原始行 txt，每行一条，可直接复用为 --sso 输入",
+    )
     ap.add_argument("--report-json", default=None, help="写入不含 token 的运行摘要 JSON")
     args = ap.parse_args()
 
     apply_config_defaults(args)
+
+    # Standalone batch grok.com account-state check (no token conversion)
+    if args.check_sso_state:
+        records = load_sso_records(path=args.check_sso_state)
+        if not records:
+            ap.error(f"--check-sso-state: {args.check_sso_state} 中没有可用 sso")
+        summary = run_check_sso_state(
+            records,
+            proxy=args.proxy,
+            delay=args.delay,
+            export=args.sso_state_export,
+            clean_export=args.sso_state_clean_export,
+        )
+        if args.report_json:
+            atomic_write_json(args.report_json, summary)
+            print(f"报告 → {args.report_json}")
+        print(
+            f"sso 状态检查: total={summary['total']} "
+            f"flagged={summary['flagged_count']} clean={summary['clean_count']} "
+            f"unknown={summary['unknown_count']} err={summary['error_count']} "
+            f"botFlagDist={summary['bot_flag_dist']}"
+        )
+        return 0 if summary.get("ok") else 1
+
     records = load_sso_records(
         path=args.sso,
         single=args.sso_cookie,
