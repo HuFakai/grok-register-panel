@@ -35,6 +35,7 @@ import sso_to_auth_json as _s2cpa
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
+from email_providers import inbucket as inbucket_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
 from email_providers import outlook_rt as outlook_rt_provider
@@ -317,6 +318,9 @@ DEFAULT_CONFIG = {
     "moemail_api_key": "",
     "moemail_domain": "",
     "moemail_expiry_ms": moemail_provider.DEFAULT_EXPIRY_MS,
+    "inbucket_api_base": "",
+    "inbucket_domain": "",
+    "inbucket_random_levels": "0",
     # Outlook MSA refresh_token 库存（jsonl: email + refresh_token）
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
@@ -1237,6 +1241,7 @@ def _url_needs_direct(url: str) -> bool:
         config.get("cloudmail_url"),
         config.get("moemail_api_base"),
         config.get("duckmail_api_base"),
+        config.get("inbucket_api_base"),
     )
     for value in configured_bases:
         base = str(value or "").strip().lower().rstrip("/")
@@ -2403,6 +2408,8 @@ def get_email_and_token(api_key=None):
             result = _admin_create()
     elif provider == "mailnest":
         result = mailnest_buy_email(), "_"
+    elif provider == "inbucket":
+        result = inbucket_get_email_and_token(domain=managed_domain)
     elif provider == "outlook_rt":
         result = outlook_rt_take_mailbox()
     else:
@@ -2422,6 +2429,57 @@ def get_email_and_token(api_key=None):
         except Exception:
             pass
     return result
+
+
+def get_inbucket_api_base():
+    raw = (
+        os.environ.get("INBUCKET_API_BASE")
+        or config.get("inbucket_api_base")
+        or ""
+    )
+    return inbucket_provider.normalize_base(str(raw))
+
+
+def get_inbucket_domain():
+    return str(config.get("inbucket_domain", "") or "").strip()
+
+
+def get_inbucket_random_levels():
+    return str(config.get("inbucket_random_levels", "0") or "0").strip()
+
+
+def inbucket_get_email_and_token(domain=""):
+    address, mailbox = inbucket_provider.create_address(
+        str(domain or "").strip() or get_inbucket_domain(),
+        random_levels=get_inbucket_random_levels(),
+    )
+    print(f"[*] 已生成 Inbucket 邮箱: {address}")
+    return address, mailbox
+
+
+def inbucket_get_oai_code(
+    mailbox,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del mailbox
+    return inbucket_provider.wait_for_code(
+        http_get,
+        get_inbucket_api_base(),
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        http_delete=http_delete,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
 
 
 def get_outlook_rt_inventory():
@@ -2546,6 +2604,16 @@ def get_oai_code(
             poll_interval=poll_interval,
             log_callback=log_callback,
             cancel_callback=cancel_callback,
+        )
+    if provider == "inbucket":
+        return inbucket_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
         )
     if provider == "outlook_rt":
         return outlook_rt_get_code(
@@ -3291,6 +3359,7 @@ class GrokRegisterGUI:
                 "cloudmail",
                 "moemail",
                 "outlook_rt",
+                "inbucket",
             ],
             width=12,
         )
@@ -3608,6 +3677,56 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # Inbucket 自建临时邮箱（实例地址 + 收信根域名，可随机子域）
+        self.inbucket_api_base_var = tk.StringVar(
+            value=str(config.get("inbucket_api_base", "") or "")
+        )
+        self.inbucket_domain_var = tk.StringVar(
+            value=str(config.get("inbucket_domain", "") or "")
+        )
+        self.inbucket_random_levels_var = tk.StringVar(
+            value=str(config.get("inbucket_random_levels", "0") or "0")
+        )
+        self._inbucket_widgets = [
+            p_label(0, 0, "实例地址:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.inbucket_api_base_var, width=52),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "收信根域名:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.inbucket_domain_var, width=34),
+                1,
+                1,
+            ),
+            p_label(1, 2, "随机子域级数:"),
+            p_field(
+                tk_option_menu(
+                    self.provider_frame,
+                    self.inbucket_random_levels_var,
+                    ["0", "1", "2", "1-2", "1-3"],
+                    width=8,
+                ),
+                1,
+                3,
+                sticky=tk.W,
+            ),
+            p_label(2, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="多个根域名用逗号分隔；随机子域需泛解析",
+                    bg=UI_PANEL_BG,
+                ),
+                2,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
         self._provider_widget_groups = {
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
@@ -3616,6 +3735,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
             "moemail": self._moemail_widgets,
             "outlook_rt": self._outlook_rt_widgets,
+            "inbucket": self._inbucket_widgets,
         }
 
         add_label(3, 0, "并发数（可选）:")
@@ -3830,6 +3950,7 @@ class GrokRegisterGUI:
             "cloudmail": "CloudMail 配置",
             "moemail": "MoeMail 配置",
             "outlook_rt": "Outlook RT 库存配置",
+            "inbucket": "Inbucket 自建邮箱配置",
         }
         self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
         for widgets in self._provider_widget_groups.values():
@@ -3929,6 +4050,9 @@ class GrokRegisterGUI:
                 self.outlook_rt_client_id_var.get().strip()
                 or outlook_rt_provider.DEFAULT_CLIENT_ID
             )
+            config["inbucket_api_base"] = self.inbucket_api_base_var.get().strip()
+            config["inbucket_domain"] = self.inbucket_domain_var.get().strip()
+            config["inbucket_random_levels"] = self.inbucket_random_levels_var.get().strip()
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
             if "协议" in _mode_text:
@@ -4056,6 +4180,9 @@ class GrokRegisterGUI:
             self.outlook_rt_client_id_var.get().strip()
             or outlook_rt_provider.DEFAULT_CLIENT_ID
         )
+        config["inbucket_api_base"] = self.inbucket_api_base_var.get().strip()
+        config["inbucket_domain"] = self.inbucket_domain_var.get().strip()
+        config["inbucket_random_levels"] = self.inbucket_random_levels_var.get().strip()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()
         if "协议" in _mode_text:
@@ -4105,6 +4232,15 @@ class GrokRegisterGUI:
 
             if not _Path(inv).expanduser().is_file():
                 self.log(f"[!] Outlook RT 库存文件不存在: {inv}")
+                return
+        if config["email_provider"] == "inbucket":
+            missing = []
+            if not get_inbucket_api_base():
+                missing.append("Inbucket 实例地址")
+            if not get_inbucket_domain():
+                missing.append("收信根域名")
+            if missing:
+                self.log(f"[!] Inbucket 模式缺少配置: {', '.join(missing)}")
                 return
         if config["email_provider"] == "moemail":
             missing = []

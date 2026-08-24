@@ -32,6 +32,7 @@ tests=(
   tests/test_proxy_store.py
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
+  tests/test_inbucket.py
   tests/test_outlook_rt.py
   tests/test_email_profile_rotation.py
   tests/test_cloudflare_catchall.py
