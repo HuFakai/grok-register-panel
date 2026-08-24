@@ -13,7 +13,12 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from runtime_platform import batch_launch_command, popen_group_kwargs, runtime_python
+from runtime_platform import (
+    apply_playwright_node_env,
+    batch_launch_command,
+    popen_group_kwargs,
+    runtime_python,
+)
 from retry_policy import PRECHECK_EXIT_CODE, orchestrator_failure_limit
 from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from notify_push import notify_task_done
@@ -120,10 +125,10 @@ def start_batch(count: int):
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["GROK_NOTIFY_SUPPRESS"] = "1"
-    wrapper = ROOT / "scripts" / "playwright-node"
-    if wrapper.is_file():
-        env["PLAYWRIGHT_NODEJS_PATH"] = str(wrapper)
-    env.setdefault("GROK_PLAYWRIGHT_NODE", "/usr/bin/node")
+    if os.name == "nt":
+        env.setdefault("GROK_HEADLESS", "1")
+        env.setdefault("PYTHONUTF8", "1")
+    apply_playwright_node_env(env)
     try:
         proc = subprocess.Popen(
             batch_launch_command(

@@ -68,7 +68,12 @@ def test_panel_registration_env_enables_guarded_cache():
     try:
         env = monitor._registration_env()
         assert env["GROK_STATIC_ASSET_CACHE"] == "1"
-        assert env["GROK_STATIC_CACHE_DIR"].endswith("log/static-asset-cache")
+        assert Path(env["GROK_STATIC_CACHE_DIR"]).as_posix().endswith("log/static-asset-cache")
+        node_path = Path(str(env.get("PLAYWRIGHT_NODEJS_PATH") or ""))
+        if os.name == "nt":
+            assert env.get("GROK_HEADLESS") == "1"
+            assert env.get("PYTHONUTF8") == "1"
+            assert node_path.name != "playwright-node"
         os.environ["GROK_STATIC_ASSET_CACHE"] = "0"
         assert monitor._registration_env()["GROK_STATIC_ASSET_CACHE"] == "0"
     finally:

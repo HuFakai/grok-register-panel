@@ -22,24 +22,14 @@ from urllib.parse import urlparse
 def _pin_playwright_node() -> None:
     """Playwright 1.60 自带 Node 24，管道对端关闭时 Unhandled EPIPE 会拖死整批。
 
-    优先走本仓库 scripts/playwright-node（系统 Node 22 + EPIPE guard）。
-    必须在 import playwright / camoufox 之前设置 PLAYWRIGHT_NODEJS_PATH。
+    统一交给 runtime_platform.apply_playwright_node_env：POSIX 优先
+    scripts/playwright-node（系统 Node + EPIPE guard），Windows 用真实
+    node.exe + NODE_OPTIONS 注入 guard。必须在 import playwright /
+    camoufox 之前调用。
     """
-    current = str(os.environ.get("PLAYWRIGHT_NODEJS_PATH") or "").strip()
-    if current and os.path.isfile(current) and os.access(current, os.X_OK):
-        return
-    wrapper = Path(__file__).resolve().parent / "scripts" / "playwright-node"
-    if wrapper.is_file():
-        try:
-            wrapper.chmod(wrapper.stat().st_mode | 0o111)
-        except Exception:
-            pass
-        os.environ["PLAYWRIGHT_NODEJS_PATH"] = str(wrapper)
-        return
-    for cand in ("/usr/bin/node", "/usr/local/bin/node"):
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            os.environ["PLAYWRIGHT_NODEJS_PATH"] = cand
-            return
+    from runtime_platform import apply_playwright_node_env
+
+    apply_playwright_node_env()
 
 
 _pin_playwright_node()
