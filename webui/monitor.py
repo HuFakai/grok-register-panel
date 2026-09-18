@@ -203,7 +203,7 @@ VENV_PY = runtime_python(ROOT)
 ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
-MAX_REQUEST_BODY = 256 * 1024
+MAX_REQUEST_BODY = 1024 * 1024
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")

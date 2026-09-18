@@ -202,7 +202,7 @@ def test_panel_security_and_recovery_structure():
     assert 'def _require_read(self)' in mon
     assert 'frame-ancestors \'none\'' in mon
     assert 'X-Frame-Options' in mon
-    assert 'MAX_REQUEST_BODY = 256 * 1024' in mon
+    assert 'MAX_REQUEST_BODY = 1024 * 1024' in mon
     assert mon.index('if not self._require_write():') < mon.index('body = self._read_body()')
     assert '/api/recovery/start' in mon
     assert '/api/recovery/stop' in mon
