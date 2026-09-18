@@ -387,6 +387,8 @@ def wait_for_code(
     cancel_callback: Optional[Callable[[], bool]] = None,
     resend_callback: Optional[Callable[[], None]] = None,
     on_code_mail: Optional[Callable[[object], None]] = None,
+    http_delete: Optional[Callable[..., Any]] = None,
+    purge_on_failure: bool = False,
 ) -> str:
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
@@ -497,7 +499,77 @@ def wait_for_code(
                     f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}"
                 )
         sleep_with_cancel(poll_interval, cancel_callback)
+    # 超时：清理该邮箱残留邮件（解析失败的、迟到的），避免服务端存储持续膨胀
+    if purge_on_failure and http_delete is not None:
+        purged = purge_mailbox(
+            http_get,
+            http_delete,
+            api_base,
+            dev_token,
+            messages_path=messages_path,
+            api_key=api_key,
+            auth_mode=auth_mode,
+            custom_auth=custom_auth,
+        )
+        if log_callback and purged:
+            log_callback(f"[*] 验证码超时，已清理邮箱残留邮件 {purged} 封")
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
+
+
+def purge_mailbox(
+    http_get: HttpGet,
+    http_delete: Callable[..., Any],
+    api_base: str,
+    dev_token: str,
+    *,
+    messages_path: str = "/messages",
+    api_key: str = "",
+    auth_mode: str = "none",
+    custom_auth: str = "",
+    max_rounds: int = 5,
+) -> int:
+    """清空该邮箱全部邮件（尽力而为，返回成功删除数量）。
+
+    用于验证码超时/失败后清理残留，避免服务端（D1/SQLite）邮件表持续膨胀。
+    删除走 admin 凭证（x-admin-auth）；单封失败不中断，列表拉取失败即停。
+    """
+    deleted = 0
+    for _ in range(max(1, int(max_rounds))):
+        try:
+            messages = get_messages(
+                http_get,
+                api_base,
+                dev_token,
+                messages_path=messages_path,
+                api_key=api_key,
+                auth_mode=auth_mode,
+                custom_auth=custom_auth,
+            )
+        except Exception:
+            break
+        if not messages:
+            break
+        removed_this_round = 0
+        for msg in messages:
+            msg_id = msg.get("id") or msg.get("msgid")
+            if not msg_id:
+                continue
+            try:
+                delete_mail(
+                    http_delete,
+                    api_base,
+                    msg_id,
+                    admin_auth=api_key,
+                    custom_auth=custom_auth,
+                )
+                deleted += 1
+                removed_this_round += 1
+            except Exception:
+                continue
+        # 一轮没能删掉任何邮件（例如服务端故障）就停，避免死循环
+        if removed_this_round == 0 or len(messages) < 20:
+            break
+    return deleted
 
 
 def delete_mail(

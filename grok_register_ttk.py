@@ -2689,6 +2689,9 @@ def cloudflare_get_oai_code(
         resend_callback=resend_callback,
         # 验证码提取成功后即删除该邮件（admin 凭证；失败仅记日志，不阻塞）
         on_code_mail=lambda mid: cloudflare_delete_mail(mid, log_callback=log_callback),
+        # 超时后清理该邮箱残留（解析失败的/迟到的）邮件，避免服务端存储持续膨胀
+        http_delete=http_delete,
+        purge_on_failure=True,
     )
 
 
@@ -2712,6 +2715,34 @@ def cloudflare_delete_mail(mail_id, *, log_callback=None):
         if log_callback:
             log_callback(f"[Debug] 删除验证码邮件失败 id={mail_id}: {exc}")
         return None
+
+
+def purge_cloudflare_mailbox_quiet(dev_token, email="", *, log_callback=None):
+    """清空该 Cloudflare 邮箱全部邮件（注册收尾调用）。
+
+    覆盖验证码提取后由 resend 迟到/解析失败残留的邮件，遏制服务端
+    邮件表（D1/SQLite）持续膨胀。非 cloudflare provider 或任何异常都静默跳过。
+    """
+    if not dev_token:
+        return 0
+    try:
+        if get_email_provider() != "cloudflare":
+            return 0
+        count = cloudflare_provider.purge_mailbox(
+            http_get,
+            http_delete,
+            get_cloudflare_api_base(),
+            dev_token,
+            messages_path=get_cloudflare_path("cloudflare_path_messages", "/messages"),
+            api_key=get_cloudflare_api_key(),
+            auth_mode=get_cloudflare_auth_mode(),
+            custom_auth=get_cloudflare_custom_auth(),
+        )
+        if count and log_callback:
+            log_callback(f"[*] 已清理邮箱残留邮件 {count} 封")
+        return count
+    except Exception:
+        return 0
 
 
 def generate_random_birthdate():
@@ -4544,6 +4575,9 @@ class GrokRegisterGUI:
                         task_subdir=task_subdir,
                         log_callback=wlog,
                     )
+                    purge_cloudflare_mailbox_quiet(
+                        dev_token, email, log_callback=wlog
+                    )
                     self._record_success()
                     retry_count_for_slot = 0
                     if cpa_ok:
@@ -5080,6 +5114,11 @@ def run_registration_cli(count):
                             task_subdir=task_subdir,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
+                        purge_cloudflare_mailbox_quiet(
+                            dev_token,
+                            email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         local_success += 1
                         mark_successful_account()
                         i += 1
@@ -5614,6 +5653,7 @@ def run_registration_cli(count):
                     task_subdir=task_subdir,
                     log_callback=cli_log,
                 )
+                purge_cloudflare_mailbox_quiet(dev_token, email, log_callback=cli_log)
                 success_count += 1
                 mark_successful_account()
                 retry_count_for_slot = 0
