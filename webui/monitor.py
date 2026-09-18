@@ -73,6 +73,13 @@ try:
         start_sso_state_scan,
         stop_sso_state_scan,
     )
+    from webui.account_manager_ops import (
+        build_payload as accounts_build_payload,
+        delete_accounts as accounts_delete,
+        list_accounts as accounts_list,
+        resolve_filtered_emails as accounts_resolve_filtered,
+        set_account_status as accounts_set_status,
+    )
     from webui.security_utils import (
         check_token_optional_read,
         expected_token,
@@ -116,6 +123,13 @@ except ImportError:  # running as script from webui/
         sso_state_status,
         start_sso_state_scan,
         stop_sso_state_scan,
+    )
+    from account_manager_ops import (  # type: ignore
+        build_payload as accounts_build_payload,
+        delete_accounts as accounts_delete,
+        list_accounts as accounts_list,
+        resolve_filtered_emails as accounts_resolve_filtered,
+        set_account_status as accounts_set_status,
     )
     from security_utils import (  # type: ignore
         check_token_optional_read,
@@ -1811,6 +1825,114 @@ HTML = r"""<!DOCTYPE html>
   .sso-verdict.clean { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); color: var(--ok); }
   .sso-verdict.flagged { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); color: var(--fail); }
   .sso-verdict.error, .sso-verdict.unknown { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); color: var(--warn); }
+  body.accounts-view-open { overflow: hidden; }
+  body.accounts-view-open #dashboard-view > :not(#accounts-view) { display: none; }
+  .accounts-view {
+    position: fixed;
+    inset: 68px 0 0;
+    z-index: 8;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .accounts-view[hidden] { display: none; }
+  .accounts-view-inner {
+    width: min(calc(100% - 64px), 1280px);
+    margin: 0 auto;
+    padding: 28px 0 48px;
+  }
+  .accounts-view-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .accounts-view-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+  .accounts-summary {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--border);
+    gap: 1px;
+  }
+  .accounts-summary-item { min-width: 0; padding: 12px 14px; background: var(--surface); }
+  .accounts-summary-label { color: var(--muted); font-size: 11px; }
+  .accounts-summary-value { margin-top: 4px; font-family: "Geist Mono", monospace; font-size: 22px; line-height: 1; font-weight: 720; }
+  .accounts-summary-value.ok { color: var(--ok); }
+  .accounts-summary-value.fail { color: var(--fail); }
+  .accounts-toolbar {
+    display: grid;
+    grid-template-columns: minmax(180px, 1.4fr) minmax(150px, 1fr) minmax(120px, .8fr) minmax(120px, .8fr) auto;
+    gap: 10px;
+    align-items: end;
+    margin-top: 14px;
+    padding: 14px 0;
+    border-top: 1px solid var(--border);
+  }
+  .accounts-toolbar .field { min-width: 0; }
+  .accounts-toolbar-actions { display: flex; gap: 6px; align-items: center; }
+  .accounts-bulk {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .accounts-bulk[hidden] { display: none; }
+  .accounts-bulk-count { margin-right: 4px; color: var(--text); font-size: 12px; font-weight: 600; }
+  .accounts-bulk .select-all-filtered { border-color: var(--accent); color: var(--accent); }
+  .accounts-list-section { margin-top: 16px; }
+  .accounts-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+  .accounts-list-head h2 { margin: 0; font-size: 13px; }
+  .accounts-job { color: var(--muted); font-size: 11px; }
+  .accounts-table-wrap { overflow: auto; border: 1px solid var(--border); background: var(--surface-raised); max-height: 520px; }
+  .accounts-table { min-width: 980px; table-layout: fixed; }
+  .accounts-table th:nth-child(1) { width: 40px; }
+  .accounts-table th:nth-child(2) { width: 240px; }
+  .accounts-table th:nth-child(3) { width: 130px; }
+  .accounts-table th:nth-child(4) { width: 170px; }
+  .accounts-table th:nth-child(5) { width: 110px; }
+  .accounts-table th:nth-child(6) { width: 185px; }
+  .accounts-table th:nth-child(7) { width: 130px; }
+  .accounts-table td, .accounts-table th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .accounts-table input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+  .accounts-secret { font-family: "Geist Mono", monospace; font-size: 11px; color: var(--muted); }
+  .accounts-secret.reveal { color: var(--text); }
+  .accounts-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
+  .acc-status {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 2px 7px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text);
+  }
+  .acc-status.used { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); color: var(--ok); }
+  .acc-status.disabled { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); color: var(--fail); }
+  .acc-status.unused { color: var(--muted); }
+  .row-actions { display: flex; gap: 5px; }
+  .row-actions button { min-height: 24px; padding: 2px 8px; font-size: 11px; }
+  .accounts-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0 0; flex-wrap: wrap; }
+  .accounts-page-controls { display: flex; align-items: center; gap: 7px; }
+  .accounts-page-controls select { min-height: 32px; width: auto; padding: 5px 28px 5px 9px; }
+  .accounts-page-controls button { min-height: 32px; padding: 5px 10px; }
+  .accounts-page-info { color: var(--muted); font-size: 11px; }
   .proxy-pagination {
     display: flex;
     align-items: center;
@@ -2172,6 +2294,13 @@ HTML = r"""<!DOCTYPE html>
     .sso-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
     .sso-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .sso-import { grid-template-columns: minmax(0, 1fr); }
+    .accounts-view { inset-block-start: 60px; }
+    .accounts-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
+    .accounts-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
+    .accounts-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .accounts-toolbar { grid-template-columns: minmax(0, 1fr); }
+    .accounts-toolbar-actions button { flex: 1 1 auto; }
+    .accounts-list-head { align-items: flex-start; flex-direction: column; }
     .proxy-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .proxy-summary-item:last-child { grid-column: 1 / -1; }
     .proxy-import { grid-template-columns: minmax(0, 1fr); }
@@ -2214,10 +2343,11 @@ HTML = r"""<!DOCTYPE html>
     .button-group { justify-content: flex-start; }
     #run-status { display: none; }
     button.view-switch { min-width: 0; padding-inline: 6px; }
-    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label { font-size: 0; }
+    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label, #accounts-view-label { font-size: 0; }
     #domain-view-label::after { content: "邮箱"; font-size: 11px; }
     #proxy-view-label::after { content: "代理"; font-size: 11px; }
     #sso-view-label::after { content: "风控"; font-size: 11px; }
+    #accounts-view-label::after { content: "账号"; font-size: 11px; }
     #help-view-label::after { content: "问题"; font-size: 11px; }
     #domain-view-toggle[data-active="true"] #domain-view-label::after,
     #proxy-view-toggle[data-active="true"] #proxy-view-label::after,
@@ -2294,6 +2424,9 @@ HTML = r"""<!DOCTYPE html>
       <button type="button" class="view-switch" id="sso-view-toggle" aria-label="打开 SSO 风控" title="SSO 风控" aria-controls="sso-view" aria-expanded="false" data-active="false" onclick="toggleSsoView()">
         <span id="sso-view-label" aria-hidden="true">SSO 风控</span>
       </button>
+      <button type="button" class="view-switch" id="accounts-view-toggle" aria-label="打开账号管理" title="账号管理" aria-controls="accounts-view" aria-expanded="false" data-active="false" onclick="toggleAccountsView()">
+        <span id="accounts-view-label" aria-hidden="true">账号管理</span>
+      </button>
       <button type="button" class="view-switch" id="ip-usage-view-toggle" aria-label="打开IP使用统计" title="IP使用统计" aria-controls="ip-usage-view" aria-expanded="false" data-active="false" onclick="toggleIpUsageView()">
         <span id="ip-usage-view-label" aria-hidden="true">IP使用</span>
       </button>
@@ -2334,7 +2467,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshAccounts(); refreshBfs()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
@@ -2869,6 +3002,106 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
+  <section class="accounts-view" id="accounts-view" aria-labelledby="accounts-view-title" hidden>
+    <div class="accounts-view-inner">
+      <div class="accounts-view-heading">
+        <div>
+          <div class="mail-source-kicker">Account manager</div>
+          <div class="page-title" id="accounts-view-title">账号管理</div>
+          <p class="accounts-view-subtitle">管理 accounts/tasks 下全部已注册账号：多选复制（完整信息 / 仅 SSO / 邮箱）、标记使用状态、删除并自动重建聚合导出</p>
+        </div>
+        <span class="accounts-job mono" id="accounts-heading-status">尚未加载</span>
+      </div>
+
+      <div class="accounts-summary" id="accounts-summary" aria-label="账号统计">
+        <div class="accounts-summary-item"><div class="accounts-summary-label">总账号</div><div class="accounts-summary-value" id="acc-kpi-total">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">任务批次</div><div class="accounts-summary-value" id="acc-kpi-tasks">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">未使用</div><div class="accounts-summary-value" id="acc-kpi-unused">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">已使用</div><div class="accounts-summary-value ok" id="acc-kpi-used">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">已禁用</div><div class="accounts-summary-value fail" id="acc-kpi-disabled">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">筛选结果</div><div class="accounts-summary-value" id="acc-kpi-filtered">--</div></div>
+      </div>
+
+      <div class="accounts-toolbar">
+        <div class="field">
+          <label for="acc-search">搜索邮箱</label>
+          <input id="acc-search" type="search" autocomplete="off" placeholder="关键字，如 anna / snkjvpn" oninput="accSearchDebounced()"/>
+        </div>
+        <div class="field">
+          <label for="acc-task">批次任务</label>
+          <select id="acc-task" onchange="accSetFilter('task', this.value)"><option value="">全部任务</option></select>
+        </div>
+        <div class="field">
+          <label for="acc-status">状态</label>
+          <select id="acc-status" onchange="accSetFilter('status', this.value)">
+            <option value="">全部状态</option>
+            <option value="unused">未使用</option>
+            <option value="used">已使用</option>
+            <option value="disabled">已禁用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="acc-sort">排序</label>
+          <select id="acc-sort" onchange="accSetFilter('sort', this.value)">
+            <option value="newest">最新注册优先</option>
+            <option value="oldest">最早注册优先</option>
+            <option value="email">邮箱 A→Z</option>
+            <option value="email_desc">邮箱 Z→A</option>
+          </select>
+        </div>
+        <div class="accounts-toolbar-actions">
+          <button id="acc-reveal" aria-pressed="false" onclick="accToggleReveal()" title="切换明文 / 脱敏显示密码与 SSO">显示明文</button>
+          <button class="primary" onclick="refreshAccounts(true)">刷新</button>
+        </div>
+      </div>
+
+      <div class="accounts-bulk" id="accounts-bulk" hidden>
+        <span class="accounts-bulk-count" id="acc-bulk-count">已选 0</span>
+        <button type="button" class="select-all-filtered" id="acc-select-filtered" onclick="accSelectAllFiltered()">全选筛选结果</button>
+        <button type="button" onclick="accCopy('full')">复制账号</button>
+        <button type="button" onclick="accCopy('sso')">复制 SSO</button>
+        <button type="button" onclick="accCopy('emails')">复制邮箱</button>
+        <button type="button" onclick="accExport('full')">导出 TXT</button>
+        <button type="button" onclick="accExport('jsonl')">导出 JSONL</button>
+        <button type="button" onclick="accSetStatus('used')">标记已使用</button>
+        <button type="button" onclick="accSetStatus('unused')">标记未使用</button>
+        <button type="button" onclick="accSetStatus('disabled')">标记禁用</button>
+        <button type="button" class="danger" onclick="accDelete()">删除选中</button>
+      </div>
+
+      <div class="msg" id="acc-msg" role="status" aria-live="polite"></div>
+
+      <div class="accounts-list-section">
+        <div class="accounts-list-head">
+          <h2>账号列表</h2>
+          <span class="accounts-job mono" id="accounts-job-status" role="status" aria-live="polite">--</span>
+        </div>
+        <div class="accounts-table-wrap">
+          <table class="accounts-table">
+            <thead><tr>
+              <th><input type="checkbox" id="acc-check-page" aria-label="全选本页" onchange="accToggleSelectPage(this.checked)"/></th>
+              <th>邮箱</th><th>密码</th><th>SSO</th><th>状态</th><th>批次任务</th><th>注册时间</th><th>操作</th>
+            </tr></thead>
+            <tbody id="acc-body"><tr><td colspan="8" class="accounts-empty">点击"刷新"加载账号</td></tr></tbody>
+          </table>
+        </div>
+        <div class="accounts-pagination">
+          <div class="accounts-page-controls">
+            <button type="button" onclick="accPage(-1)" aria-label="上一页">‹ 上一页</button>
+            <span class="accounts-page-info mono" id="acc-page-info">-</span>
+            <button type="button" onclick="accPage(1)" aria-label="下一页">下一页 ›</button>
+            <select id="acc-page-size" onchange="accSetFilter('page_size', this.value)" aria-label="每页条数">
+              <option value="50">每页 50</option>
+              <option value="100">每页 100</option>
+              <option value="200">每页 200</option>
+            </select>
+          </div>
+          <span class="accounts-page-info mono" id="acc-dir-info"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="metric-grid panel-gap" id="kpis" aria-label="核心指标"></section>
 
   <div class="two panel-gap">
@@ -3090,13 +3323,14 @@ function setTheme(theme) {
   syncThemeButtons();
 }
 function setAppView(view, options = {}) {
-  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "ip-usage" && view !== "sso") return;
+  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "ip-usage" && view !== "sso" && view !== "accounts") return;
   const dashboard = document.getElementById("dashboard-view");
   const help = document.getElementById("help-view");
   const proxies = document.getElementById("proxy-view");
   const domains = document.getElementById("domain-view");
   const ipUsage = document.getElementById("ip-usage-view");
   const sso = document.getElementById("sso-view");
+  const accounts = document.getElementById("accounts-view");
   const domainToggle = document.getElementById("domain-view-toggle");
   const domainLabel = document.getElementById("domain-view-label");
   const toggle = document.getElementById("help-view-toggle");
@@ -3107,14 +3341,17 @@ function setAppView(view, options = {}) {
   const ipUsageLabel = document.getElementById("ip-usage-view-label");
   const ssoToggle = document.getElementById("sso-view-toggle");
   const ssoLabel = document.getElementById("sso-view-label");
-  if (!dashboard || !help || !proxies || !domains || !ipUsage || !sso || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ipUsageToggle || !ipUsageLabel || !ssoToggle || !ssoLabel) return;
+  const accountsToggle = document.getElementById("accounts-view-toggle");
+  const accountsLabel = document.getElementById("accounts-view-label");
+  if (!dashboard || !help || !proxies || !domains || !ipUsage || !sso || !accounts || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ipUsageToggle || !ipUsageLabel || !ssoToggle || !ssoLabel || !accountsToggle || !accountsLabel) return;
   const isHelp = view === "help";
   const isProxies = view === "proxies";
   const isDomains = view === "domains";
   const isIpUsage = view === "ip-usage";
   const isSso = view === "sso";
-  const isOverlay = isHelp || isProxies || isDomains || isIpUsage || isSso;
-  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== ipUsage && element !== sso);
+  const isAccounts = view === "accounts";
+  const isOverlay = isHelp || isProxies || isDomains || isIpUsage || isSso || isAccounts;
+  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== ipUsage && element !== sso && element !== accounts);
   dashboardChildren.forEach(element => {
     element.inert = isOverlay;
     if (isOverlay) element.setAttribute("aria-hidden", "true");
@@ -3130,11 +3367,14 @@ function setAppView(view, options = {}) {
   ipUsage.inert = !isIpUsage;
   sso.hidden = !isSso;
   sso.inert = !isSso;
+  accounts.hidden = !isAccounts;
+  accounts.inert = !isAccounts;
   document.body.classList.toggle("help-view-open", isHelp);
   document.body.classList.toggle("proxy-view-open", isProxies);
   document.body.classList.toggle("domain-view-open", isDomains);
   document.body.classList.toggle("ip-usage-view-open", isIpUsage);
   document.body.classList.toggle("sso-view-open", isSso);
+  document.body.classList.toggle("accounts-view-open", isAccounts);
   toggle.dataset.active = String(isHelp);
   toggle.setAttribute("aria-expanded", String(isHelp));
   toggle.setAttribute("aria-label", isHelp ? "返回控制台" : "打开问题和使用");
@@ -3160,6 +3400,11 @@ function setAppView(view, options = {}) {
   ssoToggle.setAttribute("aria-label", isSso ? "返回控制台" : "打开 SSO 风控");
   ssoToggle.title = isSso ? "返回控制台" : "SSO 风控";
   ssoLabel.textContent = isSso ? "返回控制台" : "SSO 风控";
+  accountsToggle.dataset.active = String(isAccounts);
+  accountsToggle.setAttribute("aria-expanded", String(isAccounts));
+  accountsToggle.setAttribute("aria-label", isAccounts ? "返回控制台" : "打开账号管理");
+  accountsToggle.title = isAccounts ? "返回控制台" : "账号管理";
+  accountsLabel.textContent = isAccounts ? "返回控制台" : "账号管理";
   if (options.persist !== false) {
     try { localStorage.setItem(APP_VIEW_KEY, view); } catch (e) {}
   }
@@ -3171,11 +3416,12 @@ function setAppView(view, options = {}) {
   }
   if (isIpUsage) refreshIpUsage();
   if (isSso) refreshSsoState();
+  if (isAccounts) refreshAccounts();
   if (options.focus) {
     requestAnimationFrame(() => {
       const target = isHelp
         ? document.querySelector('[data-help-tab][aria-selected="true"]')
-        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-usage-limit-page") : (isSso ? document.getElementById("sso-input") : (view === "dashboard" ? domainToggle : toggle)))));
+        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-usage-limit-page") : (isSso ? document.getElementById("sso-input") : (isAccounts ? document.getElementById("acc-search") : (view === "dashboard" ? domainToggle : toggle))))));
       if (target) target.focus();
     });
   }
@@ -3199,6 +3445,10 @@ function toggleIpUsageView() {
 function toggleSsoView() {
   const isSso = document.body.classList.contains("sso-view-open");
   setAppView(isSso ? "dashboard" : "sso", { focus: true });
+}
+function toggleAccountsView() {
+  const isAccounts = document.body.classList.contains("accounts-view-open");
+  setAppView(isAccounts ? "dashboard" : "accounts", { focus: true });
 }
 function setHelpTab(name) {
   if (name !== "guide" && name !== "faq") return;
@@ -3254,13 +3504,13 @@ function initHelp() {
     view = localStorage.getItem(APP_VIEW_KEY) || "dashboard";
     tab = localStorage.getItem(HELP_TAB_KEY) || "guide";
   } catch (e) {}
-  if (!["dashboard", "help", "proxies", "domains", "ip-usage", "sso"].includes(view)) view = "dashboard";
+  if (!["dashboard", "help", "proxies", "domains", "ip-usage", "sso", "accounts"].includes(view)) view = "dashboard";
   setHelpTab(tab);
   filterFaq("");
   setAppView(view, { persist: false, focus: false });
 }
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("ip-usage-view-open") || document.body.classList.contains("sso-view-open"))) {
+  if (event.key === "Escape" && (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("ip-usage-view-open") || document.body.classList.contains("sso-view-open") || document.body.classList.contains("accounts-view-open"))) {
     setAppView("dashboard", { focus: true });
   }
 });
@@ -4631,6 +4881,322 @@ async function exportSsoState(kind) {
     setMsg("sso-msg", "已导出 " + (data.lines || 0) + " 行 → " + (data.path || kind), "ok");
   } catch (e) { setMsg("sso-msg", String(e.message || e), "err"); }
 }
+
+// ---------------- 账号管理 ----------------
+const ACC_STATUS_OPTIONS = [["unused", "未使用"], ["used", "已使用"], ["disabled", "已禁用"]];
+const ACC_EXPORT_NAMES = { full: "accounts_export", sso: "accounts_sso", emails: "accounts_emails", jsonl: "accounts_grok2api" };
+let accState = {
+  page: 1, pageSize: 50, search: "", task: "", status: "", sort: "newest",
+  reveal: false, loading: false, data: null,
+  selection: new Set(), selectAllFiltered: false,
+};
+let accSearchTimer = null;
+function accSearchDebounced() {
+  clearTimeout(accSearchTimer);
+  accSearchTimer = setTimeout(() => accSetFilter("search", (document.getElementById("acc-search") || {}).value || ""), 350);
+}
+function accSetFilter(key, value) {
+  if (["search", "task", "status", "sort"].includes(key)) {
+    accState[key] = String(value || "");
+    accState.page = 1;
+    // 筛选变化后不可见账号不允许留在选择集里，避免误删/误标
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    refreshAccounts();
+  } else if (key === "page_size") {
+    accState.pageSize = Math.max(1, Math.min(200, Number(value) || 50));
+    accState.page = 1;
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    refreshAccounts();
+  }
+}
+function accPage(delta) {
+  const d = accState.data;
+  if (!d) return;
+  const next = Math.max(1, Math.min(d.pages || 1, (d.page || 1) + Number(delta || 0)));
+  if (next === accState.page) return;
+  accState.page = next;
+  refreshAccounts();
+}
+async function refreshAccounts(force = false, authHelp = true) {
+  if (accState.loading) return;
+  accState.loading = true;
+  const st = document.getElementById("accounts-heading-status");
+  if (st && force) st.textContent = "刷新中 ...";
+  try {
+    const params = new URLSearchParams({
+      page: String(accState.page), page_size: String(accState.pageSize),
+      search: accState.search, task: accState.task, status: accState.status,
+      sort: accState.sort, reveal: accState.reveal ? "1" : "0",
+      force: force ? "1" : "0", _: String(Date.now()),
+    });
+    const data = await api("/api/accounts?" + params.toString(), { authHelp });
+    accState.data = data;
+    renderAccounts();
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e).includes("令牌") ? "等待令牌" : "加载失败";
+  } finally { accState.loading = false; }
+}
+function accStatusSelect(it) {
+  const opts = ACC_STATUS_OPTIONS.map(([v, l]) =>
+    '<option value="' + v + '"' + (v === it.status ? " selected" : "") + ">" + l + "</option>").join("");
+  const title = it.status_updated_at ? ("更新于 " + esc(it.status_updated_at)) : "默认未使用";
+  return '<select class="acc-status ' + esc(it.status) + '" data-email="' + esc(it.email) + '" title="' + title + '" onchange="accSetRowStatus(this)">' + opts + "</select>";
+}
+function renderAccounts() {
+  const d = accState.data;
+  if (!d) return;
+  const stats = d.stats || {};
+  const setKpi = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
+  setKpi("acc-kpi-total", stats.total ?? 0);
+  setKpi("acc-kpi-tasks", (d.tasks || []).length);
+  setKpi("acc-kpi-unused", stats.unused ?? 0);
+  setKpi("acc-kpi-used", stats.used ?? 0);
+  setKpi("acc-kpi-disabled", stats.disabled ?? 0);
+  setKpi("acc-kpi-filtered", d.filtered ?? 0);
+
+  const taskSel = document.getElementById("acc-task");
+  if (taskSel && document.activeElement !== taskSel) {
+    const prev = accState.task;
+    taskSel.innerHTML = '<option value="">全部任务</option>' + (d.tasks || []).map(t =>
+      '<option value="' + esc(t.key) + '">' + esc(t.key === "__root__" ? "根目录(遗留)" : t.id) + " (" + t.count + ")</option>").join("");
+    taskSel.value = prev;
+    if (taskSel.value !== prev) { taskSel.value = ""; accState.task = ""; }
+  }
+  const sizeSel = document.getElementById("acc-page-size");
+  if (sizeSel && document.activeElement !== sizeSel) sizeSel.value = String(accState.pageSize);
+  const revealBtn = document.getElementById("acc-reveal");
+  if (revealBtn) {
+    revealBtn.setAttribute("aria-pressed", String(accState.reveal));
+    revealBtn.textContent = accState.reveal ? "脱敏显示" : "显示明文";
+  }
+
+  accRenderBulk();
+
+  const secretCls = () => "accounts-secret" + (accState.reveal ? " reveal" : "");
+  const body = document.getElementById("acc-body");
+  if (body) {
+    const items = d.items || [];
+    body.innerHTML = items.length ? items.map(it => {
+      const checked = accState.selection.has(it.email);
+      const taskLabel = it.task ? esc(it.task) : "根目录(遗留)";
+      const copies = it.copies > 1
+        ? ' <span class="accounts-job" title="同一邮箱在 ' + it.copies + ' 个目录出现，展示最新一份">×' + it.copies + "</span>"
+        : "";
+      return "<tr>" +
+        '<td><input type="checkbox" data-email="' + esc(it.email) + '" aria-label="选择 ' + esc(it.email) + '"' + (checked ? " checked" : "") + ' onchange="accRowCheck(this)"/></td>' +
+        '<td class="mono" title="' + esc(it.email) + '">' + esc(it.email) + "</td>" +
+        '<td><span class="' + secretCls() + '">' + esc(it.password || "-") + "</span></td>" +
+        '<td><span class="' + secretCls() + '" title="SSO 长度 ' + it.sso_len + '">' + esc(it.sso || "-") + "</span></td>" +
+        "<td>" + accStatusSelect(it) + "</td>" +
+        '<td class="mono" title="' + taskLabel + '">' + taskLabel + copies + "</td>" +
+        '<td class="mono" title="' + esc(it.registered_at) + '">' + esc(it.registered_at) + "</td>" +
+        '<td><div class="row-actions">' +
+          '<button type="button" onclick="accCopyOne(\'full\', this)" data-email="' + esc(it.email) + '">复制</button>' +
+          '<button type="button" onclick="accCopyOne(\'sso\', this)" data-email="' + esc(it.email) + '">SSO</button>' +
+        "</div></td>" +
+      "</tr>";
+    }).join("") : '<tr><td colspan="8" class="accounts-empty">没有匹配的账号（调整筛选或点"刷新"）</td></tr>';
+  }
+
+  const info = document.getElementById("acc-page-info");
+  if (info) info.textContent = "第 " + (d.page || 1) + " / " + (d.pages || 1) + " 页 · 共 " + (d.filtered || 0) + " 条";
+  const dirInfo = document.getElementById("acc-dir-info");
+  if (dirInfo) dirInfo.textContent = d.accounts_dir || "";
+  const st = document.getElementById("accounts-heading-status");
+  if (st) st.textContent = "共 " + (stats.total ?? 0) + " 个账号 · " + (d.tasks || []).length + " 个批次";
+}
+function accRenderBulk() {
+  const d = accState.data;
+  if (!d) return;
+  const picked = accState.selectAllFiltered ? (d.filtered || 0) : accState.selection.size;
+  const bulk = document.getElementById("accounts-bulk");
+  if (bulk) {
+    bulk.hidden = picked <= 0;
+    document.getElementById("acc-bulk-count").textContent =
+      accState.selectAllFiltered ? ("已选全部筛选 " + picked + " 条") : ("已选 " + picked + " 条");
+  }
+  const head = document.getElementById("acc-check-page");
+  if (head) {
+    const items = d.items || [];
+    const selCount = items.filter(it => accState.selection.has(it.email)).length;
+    head.checked = items.length > 0 && selCount === items.length;
+    head.indeterminate = selCount > 0 && selCount < items.length;
+  }
+}
+function accRowCheck(box) {
+  const email = String(box.dataset.email || "");
+  if (!email) return;
+  if (box.checked) accState.selection.add(email);
+  else accState.selection.delete(email);
+  accState.selectAllFiltered = false;
+  accRenderBulk();
+}
+function accToggleSelectPage(checked) {
+  const items = (accState.data && accState.data.items) || [];
+  items.forEach(it => {
+    if (checked) accState.selection.add(it.email);
+    else accState.selection.delete(it.email);
+  });
+  accState.selectAllFiltered = false;
+  // 仅同步行内勾选框，不重建表格，避免滚动位置/焦点丢失
+  document.querySelectorAll("#acc-body input[data-email]").forEach(box => {
+    box.checked = accState.selection.has(box.dataset.email);
+  });
+  accRenderBulk();
+}
+function accSelectAllFiltered() {
+  if (!accState.data || !(accState.data.filtered > 0)) {
+    setMsg("acc-msg", "当前筛选没有可选择的账号", "err");
+    return;
+  }
+  accState.selectAllFiltered = true;
+  renderAccounts();
+  setMsg("acc-msg", "已按当前筛选全选 " + accState.data.filtered + " 条（改动筛选会重置）", "ok");
+}
+async function copyTextToClipboard(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch (e) { return false; }
+}
+async function accCopy(fmt) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    const ok = await copyTextToClipboard(data.content || "");
+    const label = { full: "账号信息", sso: "SSO", emails: "邮箱" }[fmt] || fmt;
+    setMsg("acc-msg",
+      "已复制 " + (data.count || 0) + " 条" + label + (ok ? "到剪贴板" : "失败（浏览器限制，请改用导出）") +
+      (data.missing_count ? "；" + data.missing_count + " 条已不存在" : ""),
+      ok ? "ok" : "err");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accCopyOne(fmt, btn) {
+  const email = String((btn && btn.dataset.email) || "");
+  if (!email) return;
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({ emails: [email], fmt }),
+    });
+    const ok = await copyTextToClipboard(data.content || "");
+    setMsg("acc-msg", (ok ? "已复制 " : "复制失败 ") + email + (fmt === "sso" ? " 的 SSO" : " 的账号信息"), ok ? "ok" : "err");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accExport(fmt) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+    const ext = fmt === "jsonl" ? "jsonl" : "txt";
+    const blob = new Blob([data.content || ""], { type: fmt === "jsonl" ? "application/jsonl" : "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (ACC_EXPORT_NAMES[fmt] || "accounts_export") + "_" + stamp + "." + ext;
+    a.click();
+    URL.revokeObjectURL(url);
+    setMsg("acc-msg", "已导出 " + (data.count || 0) + " 条", "ok");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accSetStatus(target) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/status", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        target, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    setMsg("acc-msg", "已把 " + (data.changed || 0) + " 条标记为「" + (data.label || target) + "」", "ok");
+    await refreshAccounts();
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accSetRowStatus(select) {
+  const email = String((select && select.dataset.email) || "");
+  const target = String((select && select.value) || "");
+  if (!email || !target) return;
+  try {
+    await api("/api/accounts/status", {
+      method: "POST",
+      body: JSON.stringify({ emails: [email], target }),
+    });
+    const found = ACC_STATUS_OPTIONS.find(([v]) => v === target);
+    setMsg("acc-msg", "已把 " + email + " 标记为「" + ((found && found[1]) || target) + "」", "ok");
+  } catch (e) {
+    setMsg("acc-msg", String(e.message || e), "err");
+  }
+  await refreshAccounts();
+}
+async function accDelete() {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  // 先解析将要删除的完整名单，确认框里明示邮箱，避免误删不可见账号
+  let emails = [];
+  try {
+    const resolved = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt: "emails", search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    emails = String(resolved.content || "").split("\n").map(s => s.trim()).filter(Boolean);
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); return; }
+  if (!emails.length) { setMsg("acc-msg", "没有可删除的账号", "err"); return; }
+  const sample = emails.slice(0, 6).join("\n") + (emails.length > 6 ? ("\n... 共 " + emails.length + " 个") : "");
+  if (!confirm("确认删除 " + emails.length + " 个账号？将删除：\n" + sample + "\n\n对应账号文件会被删除，所在批次聚合导出（accounts_all.txt / grok2api 导入文件）自动重建，操作不可恢复。")) return;
+  try {
+    const data = await api("/api/accounts/delete", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    const taskCount = (data.tasks || []).length;
+    setMsg("acc-msg", "已删除 " + (data.deleted_count || 0) + " 个账号文件（涉及 " + taskCount + " 个目录，聚合已重建）", "ok");
+    await refreshAccounts(true);
+  } catch (e) {
+    setMsg("acc-msg", String(e.message || e), "err");
+    await refreshAccounts(true);
+  }
+}
+function accToggleReveal() {
+  accState.reveal = !accState.reveal;
+  refreshAccounts();
+}
 function renderBlacklist(bl, upd) {
   bl = bl || {};
   upd = upd || {};
@@ -4894,10 +5460,33 @@ setInterval(() => {
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
   if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
+setInterval(() => {
+  if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
+}, 10000);
 </script>
 </body>
 </html>
 """
+
+
+def _accounts_resolve_request_emails(payload: dict) -> list[str]:
+    """解析账号管理请求的邮箱集合：显式列表优先，否则按筛选条件全选。"""
+    emails = (payload or {}).get("emails")
+    if isinstance(emails, list) and emails:
+        return emails
+    if (payload or {}).get("all_filtered"):
+        return accounts_resolve_filtered(
+            search=str((payload or {}).get("search") or ""),
+            task=str((payload or {}).get("task") or ""),
+            status=str((payload or {}).get("status") or ""),
+        )
+    return []
+
+
+def _accounts_payload_from_request(body: dict, *, default_fmt: str) -> dict:
+    payload = body or {}
+    emails = _accounts_resolve_request_emails(payload)
+    return accounts_build_payload(emails, str(payload.get("fmt") or default_fmt))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5008,7 +5597,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -5121,6 +5710,25 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/sso-state":
             try:
                 self._json(200, sso_state_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts":
+            try:
+                query = parse_qs(u.query)
+                self._json(
+                    200,
+                    accounts_list(
+                        page=(query.get("page") or ["1"])[0],
+                        page_size=(query.get("page_size") or ["50"])[0],
+                        search=(query.get("search") or [""])[0],
+                        task=(query.get("task") or [""])[0],
+                        status=(query.get("status") or [""])[0],
+                        sort=(query.get("sort") or ["newest"])[0],
+                        reveal=(query.get("reveal") or ["0"])[0] in ("1", "true"),
+                        force=(query.get("force") or ["0"])[0] in ("1", "true"),
+                    ),
+                )
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -5326,6 +5934,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = read_sso_state_export(str((body or {}).get("kind") or "flagged"))
                 self._json(200 if result.get("ok") else 404, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/copy":
+            try:
+                result = _accounts_payload_from_request(body, default_fmt="full")
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/status":
+            try:
+                payload = body or {}
+                emails = _accounts_resolve_request_emails(payload)
+                result = accounts_set_status(emails or [], str(payload.get("target") or ""))
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/delete":
+            try:
+                payload = body or {}
+                emails = _accounts_resolve_request_emails(payload)
+                result = accounts_delete(emails or [])
+                self._json(200 if result.get("ok") else 400, result)
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
