@@ -72,6 +72,20 @@ OAuth 全程固定同一出口。
 才累计并按阈值拉黑；邮箱 API、验证码或网络异常不会处罚域名。对应 provider
 池耗尽时 worker 会停止该任务，不会回退到已被停用或拉黑的旧域名配置。
 
+### 自建邮箱服务的存储防涨满
+
+自建 cloudflare temp-email（Worker + D1）时，`raw_mails` 只增不减，D1 涨到
+500MB 上限后建号会批量失败。面板“邮箱服务”页提供「服务端邮件自动清理」：
+删除 N 天前的历史邮件（默认保留 1 天、每 24 小时自动一次，可随时点「立即
+清理」），清理凭据复用 `cloudflare_api_base` + `cloudflare_api_key`
+（x-admin-auth）。部署版本自带 `POST /admin/cleanup` 批量接口时一次调用完成；
+旧版部署没有该接口时自动退回分页拉列表、逐封删除（只动保留期外的邮件，
+正在注册的验证码邮件不会受影响）。
+
+彻底的长期方案是在 Worker 端启用原生自动清理：`wrangler.toml` 增加
+`[triggers] crons`（例如 `"0 3 * * *"`），并在后台设置里开启 mails 自动清理；
+重新部署后由 Cloudflare cron 定时触发，面板清理可作为不重新部署时的替代。
+
 ## 3. 发布前检查
 
 ```bash

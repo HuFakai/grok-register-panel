@@ -94,7 +94,7 @@ def test_help_and_faq_module():
     assert 'body.help-view-open #dashboard-view > :not(#help-view) { display: none; }' in html
     assert 'role="tablist"' in html
     assert 'id="faq-search"' in html
-    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 15
+    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 16
     assert 'policy=deny' in html
     assert '账号补录' in html
     assert '成功项会从待补录队列移除' in html
@@ -195,6 +195,31 @@ def test_email_service_and_domain_rotation_panel_structure():
     assert '邮箱域名池没有可用的' in worker
     assert 'on_email_domain_rejected' in flow
     assert 'on_email_accepted' in flow
+
+def test_mail_cleanup_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="mail-cleanup-label"' in html
+    assert 'id="mail-cleanup-count"' in html
+    assert 'id="mail-cleanup-keep-days"' in html
+    assert 'id="mail-cleanup-interval"' in html
+    assert 'id="mail-cleanup-enabled"' in html
+    assert 'id="mail-cleanup-clean-unknow"' in html
+    assert 'id="mail-cleanup-save-btn"' in html
+    assert 'id="mail-cleanup-run-btn"' in html
+    assert 'id="mail-cleanup-last"' in html
+    assert 'function refreshMailCleanup(' in mon
+    assert 'function renderMailCleanup(' in mon
+    assert 'function saveMailCleanupSettings(' in mon
+    assert 'function runMailCleanup(' in mon
+    assert '/api/mail-cleanup' in mon
+    assert '/api/mail-cleanup/run' in mon
+    assert '/api/mail-cleanup/settings' in mon
+    assert 'mail_cleanup_keep_days' in mon
+    assert 'mail_cleanup_interval_hours' in mon
+    # 定时线程随 monitor 启动
+    assert 'def _mail_cleanup_loop(' in mon
+    assert 'name="mail-cleanup"' in mon
 
 def test_panel_security_and_recovery_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
@@ -305,4 +330,5 @@ if __name__ == '__main__':
     test_panel_security_and_recovery_structure()
     test_embedded_scripts_parse()
     test_sso_state_panel_structure()
+    test_mail_cleanup_panel_structure()
     print('OK structure')

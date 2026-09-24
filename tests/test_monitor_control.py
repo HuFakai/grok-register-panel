@@ -110,8 +110,49 @@ def test_base_ok_persists_through_save_control():
             monitor.CONTROL_FILE = previous
 
 
+def test_mail_cleanup_settings_defaults_and_bounds():
+    """服务端邮件清理设置：默认开启保留 1 天；天数/间隔按范围夹紧。"""
+    previous = monitor.CONTROL_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
+        try:
+            defaults = monitor.load_control()
+            assert defaults["mail_cleanup_enabled"] is True
+            assert defaults["mail_cleanup_keep_days"] == 1
+            assert defaults["mail_cleanup_interval_hours"] == 24
+            assert defaults["mail_cleanup_clean_unknow"] is True
+
+            saved = monitor.save_control(
+                {
+                    "mail_cleanup_enabled": False,
+                    "mail_cleanup_keep_days": 7,
+                    "mail_cleanup_interval_hours": 6,
+                    "mail_cleanup_clean_unknow": False,
+                }
+            )
+            assert saved["mail_cleanup_enabled"] is False
+            assert saved["mail_cleanup_keep_days"] == 7
+            assert saved["mail_cleanup_interval_hours"] == 6
+            assert saved["mail_cleanup_clean_unknow"] is False
+
+            clamped = monitor.save_control(
+                {
+                    "mail_cleanup_keep_days": 0,
+                    "mail_cleanup_interval_hours": 999,
+                }
+            )
+            assert clamped["mail_cleanup_keep_days"] == 1
+            assert clamped["mail_cleanup_interval_hours"] == 168
+
+            dropped = monitor.save_control({"mail_cleanup_bad_key": "x"})
+            assert "mail_cleanup_bad_key" not in dropped
+        finally:
+            monitor.CONTROL_FILE = previous
+
+
 if __name__ == "__main__":
     test_ip_policy_control_round_trip_and_bounds()
     test_batch_and_add_count_are_bounded()
     test_base_ok_persists_through_save_control()
+    test_mail_cleanup_settings_defaults_and_bounds()
     print("OK monitor_control")

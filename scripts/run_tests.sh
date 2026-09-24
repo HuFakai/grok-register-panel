@@ -19,6 +19,7 @@ tests=(
   tests/test_bfs_ops.py
   tests/test_bfs_worker_integration.py
   tests/test_cloudflare_provider.py
+  tests/test_mail_cleanup.py
   tests/test_retry_policy.py
   tests/test_batch_traffic.py
   tests/test_orchestrator_policy.py

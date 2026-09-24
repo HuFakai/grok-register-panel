@@ -262,6 +262,11 @@ def load_control() -> dict:
         c.setdefault("ip_failure_rotate_threshold", 3)
         c.setdefault("ip_usage_limit", 0)  # 0=不限单 IP 累计使用次数
         c.setdefault("mode", "orch")  # orch | batch
+        # 服务端邮件自动清理（webui/mail_cleanup_ops.py）
+        c.setdefault("mail_cleanup_enabled", True)
+        c.setdefault("mail_cleanup_keep_days", 1)
+        c.setdefault("mail_cleanup_interval_hours", 24)
+        c.setdefault("mail_cleanup_clean_unknow", True)
         return c
 
 
@@ -279,6 +284,11 @@ def save_control(updates: dict) -> dict:
         "target_cpa",
         # 任务启动时的累计成功数基线（本次任务增量 = ok_count - base_ok）
         "base_ok",
+        # 服务端邮件自动清理
+        "mail_cleanup_enabled",
+        "mail_cleanup_keep_days",
+        "mail_cleanup_interval_hours",
+        "mail_cleanup_clean_unknow",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -318,6 +328,20 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["ip_usage_limit"] = 0
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
+        # 清理设置走 mail_cleanup_ops.normalize_settings 的范围（1-365 天 / 1-168 小时）
+        for key, default, low, high in (
+            ("mail_cleanup_keep_days", 1, 1, 365),
+            ("mail_cleanup_interval_hours", 24, 1, 168),
+        ):
+            try:
+                c[key] = max(low, min(high, int(c.get(key, default))))
+            except Exception:
+                c[key] = default
+        for key, default in (
+            ("mail_cleanup_enabled", True),
+            ("mail_cleanup_clean_unknow", True),
+        ):
+            c[key] = bool(c.get(key, default))
         for key in ("base_cpa", "target_cpa"):
             if c.get(key) is None or str(c.get(key)).strip() == "":
                 c.pop(key, None)
@@ -2611,6 +2635,10 @@ HTML = r"""<!DOCTYPE html>
             <summary>体验额度有多少，出现 429 怎么办</summary>
             <div class="faq-answer">体验额度由上游按账号分配，面板无法推算准确余额。429 通常表示额度耗尽或触发速率限制，需要等待恢复或更换仍有可用额度的 auth。</div>
           </details>
+          <details class="faq-item" data-faq-item data-search="邮件清理 清理 邮箱 涨满 d1 500mb raw_mails 磁盘 数据库 mail cleanup 保留天数">
+            <summary>服务端邮件越积越多 / D1 数据库涨满怎么办</summary>
+            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留天数删除自建邮箱服务（cloudflare temp-email）N 天前的历史邮件，防止 D1 涨满导致建号失败。默认保留 1 天、每 24 小时自动清理一次，也可点「立即清理」手动触发；部署版本较旧没有批量清理接口时自动退回逐封删除。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
+          </details>
         </div>
         <p class="faq-empty" id="faq-empty" hidden>没有匹配的问题，请换一个错误码或现象关键词。</p>
       </div>
@@ -2849,6 +2877,40 @@ HTML = r"""<!DOCTYPE html>
           </div>
           <div class="mail-provider-fields" id="email-profile-fields" style="margin-top:10px"></div>
         </div>
+      </section>
+
+      <section class="mail-provider-panel" aria-labelledby="mail-cleanup-label" style="margin-top:12px">
+        <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div class="mail-source-kicker">Server mail cleanup</div>
+            <h2 id="mail-cleanup-label">服务端邮件自动清理</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 天前的历史邮件，防止 D1 数据库涨满导致建号失败。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；部署版本较旧时自动退回逐封删除。</p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="badge mono" id="mail-cleanup-count">-- 封</span>
+            <button id="mail-cleanup-refresh-btn" onclick="refreshMailCleanup(false)">刷新</button>
+            <button class="danger" id="mail-cleanup-run-btn" onclick="runMailCleanup()">立即清理</button>
+          </div>
+        </div>
+        <div class="msg" id="mail-cleanup-msg" role="status" aria-live="polite"></div>
+        <div class="mail-provider-fields" style="margin-top:10px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+          <div class="field" style="width:150px">
+            <label for="mail-cleanup-keep-days">保留天数</label>
+            <input id="mail-cleanup-keep-days" type="number" min="1" max="365" step="1" autocomplete="off"/>
+          </div>
+          <div class="field" style="width:170px">
+            <label for="mail-cleanup-interval">自动清理间隔（小时）</label>
+            <input id="mail-cleanup-interval" type="number" min="1" max="168" step="1" autocomplete="off"/>
+          </div>
+          <div class="field" style="display:flex;gap:14px;align-items:center;padding-bottom:6px">
+            <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="mail-cleanup-enabled"/> 启用自动清理</label>
+            <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="mail-cleanup-clean-unknow"/> 含孤儿邮件</label>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;padding-bottom:2px">
+            <button class="primary" id="mail-cleanup-save-btn" onclick="saveMailCleanupSettings()">保存设置</button>
+          </div>
+        </div>
+        <p class="mail-provider-meta mono" id="mail-cleanup-last" style="margin:8px 0 0">上次清理：--</p>
       </section>
 
       <details class="domain-advanced" id="domain-advanced">
@@ -3413,6 +3475,7 @@ function setAppView(view, options = {}) {
     refreshEmailProvider();
     refreshEmailDomains();
     refreshEmailProfiles();
+    refreshMailCleanup();
   }
   if (isIpUsage) refreshIpUsage();
   if (isSso) refreshSsoState();
@@ -3956,6 +4019,87 @@ async function resetIpUsage() {
   } catch (e) {
     setMsg("ip-usage-limit-msg", String(e.message || e), "err");
   } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+let mailCleanupTimer = null;
+function mailCleanupSettingsToInputs(settings) {
+  if (!settings) return;
+  const keepDays = document.getElementById("mail-cleanup-keep-days");
+  const interval = document.getElementById("mail-cleanup-interval");
+  if (keepDays) keepDays.value = settings.mail_cleanup_keep_days ?? 1;
+  if (interval) interval.value = settings.mail_cleanup_interval_hours ?? 24;
+  const enabled = document.getElementById("mail-cleanup-enabled");
+  if (enabled) enabled.checked = !!settings.mail_cleanup_enabled;
+  const cleanUnknow = document.getElementById("mail-cleanup-clean-unknow");
+  if (cleanUnknow) cleanUnknow.checked = !!settings.mail_cleanup_clean_unknow;
+}
+function renderMailCleanup(data) {
+  data = data || {};
+  const countEl = document.getElementById("mail-cleanup-count");
+  if (countEl) countEl.textContent = (data.count === null || data.count === undefined) ? "未知" : (Number(data.count).toLocaleString() + " 封");
+  const lastEl = document.getElementById("mail-cleanup-last");
+  if (lastEl) {
+    const r = data.last_result;
+    if (data.last_error) {
+      lastEl.textContent = "上次清理失败：" + data.last_error;
+    } else if (r) {
+      lastEl.textContent = "上次清理：" + (r.finished_at || "--") + " · 删除 " + (r.deleted === null || r.deleted === undefined ? "--" : Number(r.deleted).toLocaleString()) + " 封 · " + (r.mode === "server_batch" ? "服务端批量" : "逐封删除") + " · 清理前 " + (r.before === null || r.before === undefined ? "--" : Number(r.before).toLocaleString()) + " 封";
+    } else {
+      lastEl.textContent = "上次清理：尚未运行";
+    }
+  }
+  const runBtn = document.getElementById("mail-cleanup-run-btn");
+  if (runBtn) runBtn.disabled = !!data.running;
+  mailCleanupSettingsToInputs(data.settings);
+}
+async function refreshMailCleanup(silent = false) {
+  try {
+    const data = await api("/api/mail-cleanup" + (silent ? "?_=" + Date.now() : ""));
+    renderMailCleanup(data);
+    if (data.count_error) {
+      setMsg("mail-cleanup-msg", "读取服务端邮件数失败：" + data.count_error, "err");
+    } else if (data.running) {
+      setMsg("mail-cleanup-msg", "清理进行中，5 秒后刷新状态…", "");
+      if (!mailCleanupTimer) mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 5000);
+    } else {
+      setMsg("mail-cleanup-msg", "", "");
+    }
+  } catch (e) {
+    if (!silent) setMsg("mail-cleanup-msg", String(e.message || e), "err");
+  }
+}
+async function saveMailCleanupSettings() {
+  const keepDays = Math.max(1, Math.min(365, Number((document.getElementById("mail-cleanup-keep-days") || {}).value || 1)));
+  const interval = Math.max(1, Math.min(168, Number((document.getElementById("mail-cleanup-interval") || {}).value || 24)));
+  const payload = {
+    mail_cleanup_keep_days: keepDays,
+    mail_cleanup_interval_hours: interval,
+    mail_cleanup_enabled: !!(document.getElementById("mail-cleanup-enabled") || {}).checked,
+    mail_cleanup_clean_unknow: !!(document.getElementById("mail-cleanup-clean-unknow") || {}).checked,
+  };
+  const btn = document.getElementById("mail-cleanup-save-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const j = await api("/api/mail-cleanup/settings", { method: "POST", body: JSON.stringify(payload) });
+    mailCleanupSettingsToInputs(j.settings);
+    setMsg("mail-cleanup-msg", j.settings && j.settings.mail_cleanup_enabled ? "清理设置已保存，后台将按间隔自动清理" : "清理设置已保存（自动清理已关闭）", "ok");
+  } catch (e) {
+    setMsg("mail-cleanup-msg", String(e.message || e), "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+async function runMailCleanup() {
+  const btn = document.getElementById("mail-cleanup-run-btn");
+  if (btn) btn.disabled = true;
+  try {
+    await api("/api/mail-cleanup/run", { method: "POST", body: JSON.stringify({}) });
+    setMsg("mail-cleanup-msg", "清理已启动，正在后台执行…", "");
+    if (mailCleanupTimer) { clearTimeout(mailCleanupTimer); }
+    mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 5000);
+  } catch (e) {
+    setMsg("mail-cleanup-msg", String(e.message || e), "err");
     if (btn) btn.disabled = false;
   }
 }
@@ -5457,7 +5601,7 @@ setInterval(() => {
 }, 2000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
-  if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
+  if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); refreshMailCleanup(true); }
   if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
 setInterval(() => {
@@ -5597,7 +5741,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -5713,6 +5857,41 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/mail-cleanup":
+            try:
+                from webui.mail_cleanup_ops import cleanup_status, fetch_mail_count
+
+                state = cleanup_status()
+                ctl = load_control()
+                payload = {
+                    "ok": True,
+                    "running": bool(state.get("running")),
+                    "last_result": state.get("last_result"),
+                    "last_error": state.get("last_error"),
+                    "settings": {
+                        "mail_cleanup_enabled": bool(
+                            ctl.get("mail_cleanup_enabled", True)
+                        ),
+                        "mail_cleanup_keep_days": ctl.get(
+                            "mail_cleanup_keep_days", 1
+                        ),
+                        "mail_cleanup_interval_hours": ctl.get(
+                            "mail_cleanup_interval_hours", 24
+                        ),
+                        "mail_cleanup_clean_unknow": bool(
+                            ctl.get("mail_cleanup_clean_unknow", True)
+                        ),
+                    },
+                    "count": None,
+                }
+                try:
+                    payload["count"] = fetch_mail_count()
+                except Exception as exc:
+                    payload["count_error"] = redact_log_line(str(exc))
+                self._json(200, payload)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/accounts":
             try:
                 query = parse_qs(u.query)
@@ -5787,6 +5966,45 @@ class Handler(BaseHTTPRequestHandler):
 
                 reset_ip_usage()
                 self._json(200, {"ok": True, "cleared": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/mail-cleanup/run":
+            try:
+                from webui.mail_cleanup_ops import start_cleanup
+
+                ctl = load_control()
+                keep_days = (body or {}).get("keep_days")
+                if keep_days in (None, ""):
+                    keep_days = ctl.get("mail_cleanup_keep_days", 1)
+                clean_unknow = bool((body or {}).get("clean_unknow", ctl.get("mail_cleanup_clean_unknow", True)))
+                outcome = start_cleanup(keep_days, clean_unknow=clean_unknow)
+                if not outcome.get("started"):
+                    self._json(409, {"ok": False, "error": outcome.get("error") or "无法启动清理"})
+                    return
+                self._json(200, {"ok": True, "running": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/mail-cleanup/settings":
+            try:
+                from webui.mail_cleanup_ops import normalize_settings
+
+                saved = save_control(normalize_settings(body))
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "settings": {
+                            "mail_cleanup_enabled": bool(saved.get("mail_cleanup_enabled", True)),
+                            "mail_cleanup_keep_days": saved.get("mail_cleanup_keep_days", 1),
+                            "mail_cleanup_interval_hours": saved.get("mail_cleanup_interval_hours", 24),
+                            "mail_cleanup_clean_unknow": bool(saved.get("mail_cleanup_clean_unknow", True)),
+                        },
+                    },
+                )
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": str(e)})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -6285,6 +6503,62 @@ def main():
         name="ip-pool-refresh",
         daemon=True,
     ).start()
+
+    # 服务端历史邮件自动清理：启动即按保留期清一次（只删 N 天前旧邮件，
+    # 不影响在用验证码），之后每次唤醒重读设置并按间隔等待。
+    def _mail_cleanup_loop(stop_event: threading.Event):
+        while True:
+            try:
+                ctl = load_control()
+                if bool(ctl.get("mail_cleanup_enabled", True)):
+                    from webui.mail_cleanup_ops import start_cleanup
+
+                    outcome = start_cleanup(
+                        ctl.get("mail_cleanup_keep_days", 1),
+                        clean_unknow=bool(
+                            ctl.get("mail_cleanup_clean_unknow", True)
+                        ),
+                    )
+                    if outcome.get("started"):
+                        print(
+                            f"[monitor] mail cleanup started "
+                            f"keep_days={outcome.get('keep_days')}",
+                            flush=True,
+                        )
+                    elif outcome.get("error"):
+                        print(
+                            f"[monitor] mail cleanup skipped: {outcome.get('error')}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(
+                    f"[monitor] mail cleanup loop error: {redact_log_line(str(exc))}",
+                    flush=True,
+                )
+            try:
+                hours = max(
+                    1,
+                    min(
+                        168,
+                        int(
+                            load_control().get(
+                                "mail_cleanup_interval_hours", 24
+                            )
+                        ),
+                    ),
+                )
+            except Exception:
+                hours = 24
+            if stop_event.wait(hours * 3600):
+                break
+
+    _mail_cleanup_stop = threading.Event()
+    threading.Thread(
+        target=_mail_cleanup_loop,
+        args=(_mail_cleanup_stop,),
+        name="mail-cleanup",
+        daemon=True,
+    ).start()
     stop_tasks_on_exit = os.environ.get(
         "MONITOR_STOP_TASKS_ON_EXIT",
         "1",
@@ -6305,6 +6579,7 @@ def main():
         pass
     finally:
         _ip_pool_stop.set()
+        _mail_cleanup_stop.set()
         httpd.server_close()
         if stop_tasks_on_exit:
             stopped = kill_all()

@@ -87,15 +87,15 @@ def test_panel_registration_env_enables_guarded_cache():
             os.environ["GROK_STATIC_CACHE_DIR"] = previous_dir
 
 
-def request(url: str, *, token: str = "", method: str = "GET", body: bytes | None = None):
+def request(url: str, *, token: str = "", method: str = "GET", body: bytes | None = None, timeout: float = 5):
     headers = {}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = "Bearer " + token
     if body is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        response = urllib.request.urlopen(req, timeout=5)
+        response = urllib.request.urlopen(req, timeout=timeout)
         return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
@@ -190,7 +190,8 @@ def test_monitor_http_auth_and_headers():
 
         status, _, _ = request(base + "/api/recovery")
         assert status == 401
-        status, _, body = request(base + "/api/recovery", token=token)
+        # recovery_status 全量扫描账号目录（5 万+记录时约 6s），放宽客户端超时
+        status, _, body = request(base + "/api/recovery", token=token, timeout=30)
         assert status == 200
         assert "pending_count" in json.loads(body)
 
