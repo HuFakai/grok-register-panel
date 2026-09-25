@@ -1,8 +1,14 @@
 """服务端历史邮件自动清理（自建 cloudflare_temp_email Worker + D1）。
 
-背景：raw_mails 只增不减时 D1 会涨到 500MB 上限，address 建号批量失败。
-清理优先走 Worker 自带的批量端点（POST /admin/cleanup，cleanType+cleanDays），
-旧版部署没有该端点时退回分页拉列表 + 逐封 DELETE /admin/mails/{id}。
+背景：raw_mails 只增不减时 D1 会涨到 500MB 上限，address 建号批量失败；
+同时大表上的高频轮询会烧穿 D1 免费版每日行读取配额。
+
+清理策略按保留时长分流：
+- 整 24 小时倍数：走 Worker 自带 POST /admin/cleanup（cleanDays 为整数天，
+  实测一次调用可清空全部过期邮件）；
+- 不足 24 小时（如默认保留 1 小时）：不走批量端点——部署版本对小数天
+  cleanDays 的处理无法保证，直接分页拉 /admin/mails 逐封删（created_at
+  秒级字符串比较，行为可证明精确）。
 
 凭据复用注册配置：cloudflare_api_key 在 x-admin-auth 模式下即管理员密码，
 本模块不新增任何密钥，也不把凭据写进日志。
@@ -24,18 +30,19 @@ from email_providers.cloudflare import delete_mail
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MIN_KEEP_DAYS = 1
-MAX_KEEP_DAYS = 365
+MIN_KEEP_HOURS = 1
+MAX_KEEP_HOURS = 720
 SCAN_PAGE_SIZE = 100
 MAX_SCAN_PAGES = 200
 DELETE_CONCURRENCY = 6
 CLEANUP_TIMEOUT = 60
+BATCH_MAX_ROUNDS = 5
 
 # 与 monitor_control.json 键对齐；面板设置读写都经过这里归一化
 DEFAULT_SETTINGS = {
     "mail_cleanup_enabled": True,
-    "mail_cleanup_keep_days": 1,
-    "mail_cleanup_interval_hours": 24,
+    "mail_cleanup_keep_hours": 1,
+    "mail_cleanup_interval_hours": 1,
     "mail_cleanup_clean_unknow": True,
 }
 
@@ -90,16 +97,16 @@ def normalize_settings(payload: dict | None) -> dict:
         out["mail_cleanup_enabled"] = bool(body.get("mail_cleanup_enabled"))
     if "mail_cleanup_clean_unknow" in body:
         out["mail_cleanup_clean_unknow"] = bool(body.get("mail_cleanup_clean_unknow"))
-    if "mail_cleanup_keep_days" in body:
+    if "mail_cleanup_keep_hours" in body:
         try:
-            days = int(body.get("mail_cleanup_keep_days"))
+            hours = int(body.get("mail_cleanup_keep_hours"))
         except (TypeError, ValueError) as exc:
-            raise ValueError("保留天数必须是整数") from exc
-        if not MIN_KEEP_DAYS <= days <= MAX_KEEP_DAYS:
+            raise ValueError("保留时间必须是整数小时") from exc
+        if not MIN_KEEP_HOURS <= hours <= MAX_KEEP_HOURS:
             raise ValueError(
-                f"保留天数必须在 {MIN_KEEP_DAYS}-{MAX_KEEP_DAYS} 天之间"
+                f"保留时间必须在 {MIN_KEEP_HOURS}-{MAX_KEEP_HOURS} 小时之间"
             )
-        out["mail_cleanup_keep_days"] = days
+        out["mail_cleanup_keep_hours"] = hours
     if "mail_cleanup_interval_hours" in body:
         try:
             hours = int(body.get("mail_cleanup_interval_hours"))
@@ -138,55 +145,83 @@ def fetch_mail_count(
     return len(results) if isinstance(results, list) else 0
 
 
-def _cutoff_text(keep_days: int, now: float | None) -> str:
+def _cutoff_text(keep_hours: int, now: float | None) -> str:
     moment = float(time.time() if now is None else now)
     cutoff = _dt.datetime.fromtimestamp(moment, _dt.timezone.utc) - _dt.timedelta(
-        days=keep_days
+        hours=keep_hours
     )
     # raw_mails.created_at 由 D1 datetime('now') 生成，固定 UTC 'YYYY-MM-DD HH:MM:SS'
     return cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _post_cleanup_once(
+    creds: dict,
+    clean_type: str,
+    clean_days: int,
+    http_post: Callable[..., Any],
+) -> tuple[str, str]:
+    """单次 POST /admin/cleanup；返回 (状态, 说明)，状态为 ok/unsupported/error。"""
+    try:
+        resp = http_post(
+            f"{creds['api_base']}/admin/cleanup",
+            json={"cleanType": clean_type, "cleanDays": clean_days},
+            headers=_admin_headers(creds),
+            timeout=CLEANUP_TIMEOUT,
+        )
+    except Exception as exc:
+        return "error", str(exc)[:160]
+    if resp.status_code in (404, 405):
+        return "unsupported", f"部署版本无 /admin/cleanup（HTTP {resp.status_code}）"
+    if resp.status_code >= 400:
+        try:
+            detail = (resp.text or "")[:120]
+        except Exception:
+            detail = ""
+        return "error", f"HTTP {resp.status_code} {detail}"
+    return "ok", ""
+
+
 def _server_batch_cleanup(
     creds: dict,
-    keep_days: int,
+    clean_days: int,
     clean_unknow: bool,
     *,
     http_post: Callable[..., Any] | None,
+    http_get: Callable[..., Any] | None,
 ) -> tuple[bool, list[str]]:
-    """尝试 Worker 自带批量清理；端点缺失(404/405)或失败返回 False 走 fallback。"""
+    """整日保留走 Worker 批量端点。
+
+    部分部署受 CLEANUP_BATCH_SIZE（≤5000）限制单批删除量，重复调用直到
+    数量不再下降；端点缺失或失败返回 False，由调用方退回逐封删除。
+    """
     post = http_post or _default_post
-    types = ["mails"] + (["mails_unknow"] if clean_unknow else [])
+    get = http_get or _default_get
     errors: list[str] = []
-    for clean_type in types:
+    previous: int | None = None
+    for _ in range(BATCH_MAX_ROUNDS):
+        state, detail = _post_cleanup_once(creds, "mails", clean_days, post)
+        if state != "ok":
+            errors.append(f"mails: {detail}")
+            return False, errors
         try:
-            resp = post(
-                f"{creds['api_base']}/admin/cleanup",
-                json={"cleanType": clean_type, "cleanDays": keep_days},
-                headers=_admin_headers(creds),
-                timeout=CLEANUP_TIMEOUT,
-            )
+            remaining = fetch_mail_count(creds, http_get=get)
         except Exception as exc:
-            errors.append(f"{clean_type}: {exc}")
+            errors.append(f"mails: 删除后计数失败 {exc}")
             return False, errors
-        if resp.status_code in (404, 405):
-            errors.append(
-                f"{clean_type}: 部署版本无 /admin/cleanup（HTTP {resp.status_code}）"
-            )
-            return False, errors
-        if resp.status_code >= 400:
-            try:
-                detail = (resp.text or "")[:120]
-            except Exception:
-                detail = ""
-            errors.append(f"{clean_type}: HTTP {resp.status_code} {detail}")
+        if remaining == 0 or (previous is not None and remaining >= previous):
+            break
+        previous = remaining
+    if clean_unknow:
+        state, detail = _post_cleanup_once(creds, "mails_unknow", clean_days, post)
+        if state != "ok":
+            errors.append(f"mails_unknow: {detail}")
             return False, errors
     return True, errors
 
 
 def _local_paging_cleanup(
     creds: dict,
-    keep_days: int,
+    keep_hours: int,
     *,
     http_get: Callable[..., Any] | None,
     http_delete: Callable[..., Any] | None,
@@ -195,7 +230,7 @@ def _local_paging_cleanup(
     """分页扫描 /admin/mails，删除 created_at 早于保留期的邮件（单封失败不中断）。"""
     get = http_get or _default_get
     do_delete = http_delete or _default_delete
-    cutoff = _cutoff_text(keep_days, now)
+    cutoff = _cutoff_text(keep_hours, now)
     stale_ids: list[Any] = []
     scanned = 0
     fatal: list[str] = []
@@ -261,7 +296,7 @@ def _local_paging_cleanup(
 
 
 def run_mail_cleanup(
-    keep_days: object = 1,
+    keep_hours: object = 1,
     *,
     clean_unknow: bool = True,
     creds: dict | None = None,
@@ -273,27 +308,37 @@ def run_mail_cleanup(
 ) -> dict:
     """执行一次服务端历史邮件清理，返回统计（含前后 count 差值）。"""
     try:
-        days = int(keep_days)
+        hours = int(keep_hours)
     except (TypeError, ValueError) as exc:
-        raise MailCleanupError("保留天数必须是整数") from exc
-    if not MIN_KEEP_DAYS <= days <= MAX_KEEP_DAYS:
+        raise MailCleanupError("保留时间必须是整数小时") from exc
+    if not MIN_KEEP_HOURS <= hours <= MAX_KEEP_HOURS:
         raise MailCleanupError(
-            f"保留天数必须在 {MIN_KEEP_DAYS}-{MAX_KEEP_DAYS} 天之间"
+            f"保留时间必须在 {MIN_KEEP_HOURS}-{MAX_KEEP_HOURS} 小时之间"
         )
 
     c = creds or resolve_creds(config)
     before = fetch_mail_count(c, http_get=http_get)
 
-    server_ok, server_errors = _server_batch_cleanup(
-        c, days, clean_unknow, http_post=http_post
-    )
+    if hours % 24 == 0:
+        server_ok, server_errors = _server_batch_cleanup(
+            c,
+            hours // 24,
+            clean_unknow,
+            http_post=http_post,
+            http_get=http_get,
+        )
+    else:
+        # 不足整天：不赌部署对小数天 cleanDays 的处理，直接逐封删
+        server_ok = False
+        server_errors = [f"保留 {hours} 小时不足整天，走逐封删除"]
+
     if server_ok:
         mode = "server_batch"
-        detail = {"errors": server_errors}
+        detail: dict[str, Any] = {"errors": server_errors}
     else:
         mode = "local_paging"
         detail = _local_paging_cleanup(
-            c, days, http_get=http_get, http_delete=http_delete, now=now
+            c, hours, http_get=http_get, http_delete=http_delete, now=now
         )
         detail["server_batch_errors"] = server_errors
 
@@ -308,7 +353,7 @@ def run_mail_cleanup(
     return {
         "ok": not fatal,
         "mode": mode,
-        "keep_days": days,
+        "keep_hours": hours,
         "clean_unknow": bool(clean_unknow),
         "before": before,
         "after": after,
@@ -342,7 +387,7 @@ def cleanup_status() -> dict:
                 "before",
                 "after",
                 "deleted",
-                "keep_days",
+                "keep_hours",
                 "failed",
                 "finished_at",
             )
@@ -351,20 +396,20 @@ def cleanup_status() -> dict:
 
 
 def start_cleanup(
-    keep_days: object,
+    keep_hours: object,
     *,
     clean_unknow: bool = True,
     creds: dict | None = None,
 ) -> dict:
     """非阻塞启动一次清理；已有任务在跑时拒绝并提示。"""
     try:
-        days = int(keep_days)
+        hours = int(keep_hours)
     except (TypeError, ValueError):
-        return {"started": False, "error": "保留天数必须是整数"}
-    if not MIN_KEEP_DAYS <= days <= MAX_KEEP_DAYS:
+        return {"started": False, "error": "保留时间必须是整数小时"}
+    if not MIN_KEEP_HOURS <= hours <= MAX_KEEP_HOURS:
         return {
             "started": False,
-            "error": f"保留天数必须在 {MIN_KEEP_DAYS}-{MAX_KEEP_DAYS} 天之间",
+            "error": f"保留时间必须在 {MIN_KEEP_HOURS}-{MAX_KEEP_HOURS} 小时之间",
         }
     with _STATE_LOCK:
         if _STATE.get("running"):
@@ -373,17 +418,17 @@ def start_cleanup(
         _STATE["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     thread = threading.Thread(
         target=_run_and_record,
-        args=(days, bool(clean_unknow), creds),
+        args=(hours, bool(clean_unknow), creds),
         name="mail-cleanup",
         daemon=True,
     )
     thread.start()
-    return {"started": True, "keep_days": days}
+    return {"started": True, "keep_hours": hours}
 
 
-def _run_and_record(days: int, clean_unknow: bool, creds: dict | None):
+def _run_and_record(hours: int, clean_unknow: bool, creds: dict | None):
     try:
-        result = run_mail_cleanup(days, clean_unknow=clean_unknow, creds=creds)
+        result = run_mail_cleanup(hours, clean_unknow=clean_unknow, creds=creds)
         with _STATE_LOCK:
             _STATE["last_result"] = result
             _STATE["last_error"] = None if result.get("ok") else "; ".join(

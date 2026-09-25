@@ -263,9 +263,20 @@ def load_control() -> dict:
         c.setdefault("ip_usage_limit", 0)  # 0=不限单 IP 累计使用次数
         c.setdefault("mode", "orch")  # orch | batch
         # 服务端邮件自动清理（webui/mail_cleanup_ops.py）
+        # 迁移：旧单位 keep_days（天）→ keep_hours（小时）；旧默认（1天+24h间隔）
+        # 直接切到新默认（1h+1h），非默认值按 1 天=24 小时换算。
+        legacy_days = c.pop("mail_cleanup_keep_days", None)
+        if legacy_days is not None:
+            c.pop("mail_cleanup_interval_hours", None)
+            try:
+                legacy = int(legacy_days)
+            except (TypeError, ValueError):
+                legacy = 1
+            if legacy != 1:
+                c["mail_cleanup_keep_hours"] = max(1, legacy * 24)
+        c.setdefault("mail_cleanup_keep_hours", 1)
+        c.setdefault("mail_cleanup_interval_hours", 1)
         c.setdefault("mail_cleanup_enabled", True)
-        c.setdefault("mail_cleanup_keep_days", 1)
-        c.setdefault("mail_cleanup_interval_hours", 24)
         c.setdefault("mail_cleanup_clean_unknow", True)
         return c
 
@@ -286,7 +297,7 @@ def save_control(updates: dict) -> dict:
         "base_ok",
         # 服务端邮件自动清理
         "mail_cleanup_enabled",
-        "mail_cleanup_keep_days",
+        "mail_cleanup_keep_hours",
         "mail_cleanup_interval_hours",
         "mail_cleanup_clean_unknow",
     }
@@ -328,10 +339,10 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["ip_usage_limit"] = 0
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
-        # 清理设置走 mail_cleanup_ops.normalize_settings 的范围（1-365 天 / 1-168 小时）
+        # 清理设置走 mail_cleanup_ops.normalize_settings 的范围（1-720 小时 / 1-168 小时）
         for key, default, low, high in (
-            ("mail_cleanup_keep_days", 1, 1, 365),
-            ("mail_cleanup_interval_hours", 24, 1, 168),
+            ("mail_cleanup_keep_hours", 1, 1, 720),
+            ("mail_cleanup_interval_hours", 1, 1, 168),
         ):
             try:
                 c[key] = max(low, min(high, int(c.get(key, default))))
@@ -2637,7 +2648,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="邮件清理 清理 邮箱 涨满 d1 500mb raw_mails 磁盘 数据库 mail cleanup 保留天数">
             <summary>服务端邮件越积越多 / D1 数据库涨满怎么办</summary>
-            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留天数删除自建邮箱服务（cloudflare temp-email）N 天前的历史邮件，防止 D1 涨满导致建号失败。默认保留 1 天、每 24 小时自动清理一次，也可点「立即清理」手动触发；部署版本较旧没有批量清理接口时自动退回逐封删除。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
+            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发；保留不足 24 小时时走逐封删除，整 24 小时倍数走服务端批量接口。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
           </details>
         </div>
         <p class="faq-empty" id="faq-empty" hidden>没有匹配的问题，请换一个错误码或现象关键词。</p>
@@ -2884,7 +2895,7 @@ HTML = r"""<!DOCTYPE html>
           <div>
             <div class="mail-source-kicker">Server mail cleanup</div>
             <h2 id="mail-cleanup-label">服务端邮件自动清理</h2>
-            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 天前的历史邮件，防止 D1 数据库涨满导致建号失败。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；部署版本较旧时自动退回逐封删除。</p>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；保留不足 24 小时时走逐封删除，整 24 小时倍数走服务端批量接口。</p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span class="badge mono" id="mail-cleanup-count">-- 封</span>
@@ -2895,8 +2906,8 @@ HTML = r"""<!DOCTYPE html>
         <div class="msg" id="mail-cleanup-msg" role="status" aria-live="polite"></div>
         <div class="mail-provider-fields" style="margin-top:10px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
           <div class="field" style="width:150px">
-            <label for="mail-cleanup-keep-days">保留天数</label>
-            <input id="mail-cleanup-keep-days" type="number" min="1" max="365" step="1" autocomplete="off"/>
+            <label for="mail-cleanup-keep-hours">保留时间（小时）</label>
+            <input id="mail-cleanup-keep-hours" type="number" min="1" max="720" step="1" autocomplete="off"/>
           </div>
           <div class="field" style="width:170px">
             <label for="mail-cleanup-interval">自动清理间隔（小时）</label>
@@ -4025,10 +4036,10 @@ async function resetIpUsage() {
 let mailCleanupTimer = null;
 function mailCleanupSettingsToInputs(settings) {
   if (!settings) return;
-  const keepDays = document.getElementById("mail-cleanup-keep-days");
+  const keepHours = document.getElementById("mail-cleanup-keep-hours");
   const interval = document.getElementById("mail-cleanup-interval");
-  if (keepDays) keepDays.value = settings.mail_cleanup_keep_days ?? 1;
-  if (interval) interval.value = settings.mail_cleanup_interval_hours ?? 24;
+  if (keepHours) keepHours.value = settings.mail_cleanup_keep_hours ?? 1;
+  if (interval) interval.value = settings.mail_cleanup_interval_hours ?? 1;
   const enabled = document.getElementById("mail-cleanup-enabled");
   if (enabled) enabled.checked = !!settings.mail_cleanup_enabled;
   const cleanUnknow = document.getElementById("mail-cleanup-clean-unknow");
@@ -4070,10 +4081,10 @@ async function refreshMailCleanup(silent = false) {
   }
 }
 async function saveMailCleanupSettings() {
-  const keepDays = Math.max(1, Math.min(365, Number((document.getElementById("mail-cleanup-keep-days") || {}).value || 1)));
-  const interval = Math.max(1, Math.min(168, Number((document.getElementById("mail-cleanup-interval") || {}).value || 24)));
+  const keepHours = Math.max(1, Math.min(720, Number((document.getElementById("mail-cleanup-keep-hours") || {}).value || 1)));
+  const interval = Math.max(1, Math.min(168, Number((document.getElementById("mail-cleanup-interval") || {}).value || 1)));
   const payload = {
-    mail_cleanup_keep_days: keepDays,
+    mail_cleanup_keep_hours: keepHours,
     mail_cleanup_interval_hours: interval,
     mail_cleanup_enabled: !!(document.getElementById("mail-cleanup-enabled") || {}).checked,
     mail_cleanup_clean_unknow: !!(document.getElementById("mail-cleanup-clean-unknow") || {}).checked,
@@ -5872,11 +5883,11 @@ class Handler(BaseHTTPRequestHandler):
                         "mail_cleanup_enabled": bool(
                             ctl.get("mail_cleanup_enabled", True)
                         ),
-                        "mail_cleanup_keep_days": ctl.get(
-                            "mail_cleanup_keep_days", 1
+                        "mail_cleanup_keep_hours": ctl.get(
+                            "mail_cleanup_keep_hours", 1
                         ),
                         "mail_cleanup_interval_hours": ctl.get(
-                            "mail_cleanup_interval_hours", 24
+                            "mail_cleanup_interval_hours", 1
                         ),
                         "mail_cleanup_clean_unknow": bool(
                             ctl.get("mail_cleanup_clean_unknow", True)
@@ -5974,11 +5985,11 @@ class Handler(BaseHTTPRequestHandler):
                 from webui.mail_cleanup_ops import start_cleanup
 
                 ctl = load_control()
-                keep_days = (body or {}).get("keep_days")
-                if keep_days in (None, ""):
-                    keep_days = ctl.get("mail_cleanup_keep_days", 1)
+                keep_hours = (body or {}).get("keep_hours")
+                if keep_hours in (None, ""):
+                    keep_hours = ctl.get("mail_cleanup_keep_hours", 1)
                 clean_unknow = bool((body or {}).get("clean_unknow", ctl.get("mail_cleanup_clean_unknow", True)))
-                outcome = start_cleanup(keep_days, clean_unknow=clean_unknow)
+                outcome = start_cleanup(keep_hours, clean_unknow=clean_unknow)
                 if not outcome.get("started"):
                     self._json(409, {"ok": False, "error": outcome.get("error") or "无法启动清理"})
                     return
@@ -5997,8 +6008,8 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": True,
                         "settings": {
                             "mail_cleanup_enabled": bool(saved.get("mail_cleanup_enabled", True)),
-                            "mail_cleanup_keep_days": saved.get("mail_cleanup_keep_days", 1),
-                            "mail_cleanup_interval_hours": saved.get("mail_cleanup_interval_hours", 24),
+                            "mail_cleanup_keep_hours": saved.get("mail_cleanup_keep_hours", 1),
+                            "mail_cleanup_interval_hours": saved.get("mail_cleanup_interval_hours", 1),
                             "mail_cleanup_clean_unknow": bool(saved.get("mail_cleanup_clean_unknow", True)),
                         },
                     },
@@ -6514,7 +6525,7 @@ def main():
                     from webui.mail_cleanup_ops import start_cleanup
 
                     outcome = start_cleanup(
-                        ctl.get("mail_cleanup_keep_days", 1),
+                        ctl.get("mail_cleanup_keep_hours", 1),
                         clean_unknow=bool(
                             ctl.get("mail_cleanup_clean_unknow", True)
                         ),
@@ -6522,7 +6533,7 @@ def main():
                     if outcome.get("started"):
                         print(
                             f"[monitor] mail cleanup started "
-                            f"keep_days={outcome.get('keep_days')}",
+                            f"keep_hours={outcome.get('keep_hours')}",
                             flush=True,
                         )
                     elif outcome.get("error"):

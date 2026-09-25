@@ -74,16 +74,17 @@ OAuth 全程固定同一出口。
 
 ### 自建邮箱服务的存储防涨满
 
-自建 cloudflare temp-email（Worker + D1）时，`raw_mails` 只增不减，D1 涨到
-500MB 上限后建号会批量失败。面板“邮箱服务”页提供「服务端邮件自动清理」：
-删除 N 天前的历史邮件（默认保留 1 天、每 24 小时自动一次，可随时点「立即
-清理」），清理凭据复用 `cloudflare_api_base` + `cloudflare_api_key`
-（x-admin-auth）。部署版本自带 `POST /admin/cleanup` 批量接口时一次调用完成；
-旧版部署没有该接口时自动退回分页拉列表、逐封删除（只动保留期外的邮件，
-正在注册的验证码邮件不会受影响）。
+自建 cloudflare temp-email（Worker + D1）时，`raw_mails` 只增不减：D1 涨到
+500MB 上限后建号会批量失败；大表上的验证码轮询还会烧穿 D1 免费版每日行
+读取配额（5M rows read/day），导致收信接口批量 500。面板“邮箱服务”页提供
+「服务端邮件自动清理」：删除 N 小时前的历史邮件（默认保留 1 小时、每小时
+自动一次，可随时点「立即清理」），清理凭据复用 `cloudflare_api_base` +
+`cloudflare_api_key`（x-admin-auth）。保留期取整 24 小时倍数时走 Worker 的
+`POST /admin/cleanup` 批量接口；不足 24 小时时走分页拉列表、逐封删除
+（只动保留期外的邮件，正在注册的验证码邮件不会受影响）。
 
 彻底的长期方案是在 Worker 端启用原生自动清理：`wrangler.toml` 增加
-`[triggers] crons`（例如 `"0 3 * * *"`），并在后台设置里开启 mails 自动清理；
+`[triggers] crons`（例如 `"0 * * * *"`），并在后台设置里开启 mails 自动清理；
 重新部署后由 Cloudflare cron 定时触发，面板清理可作为不重新部署时的替代。
 
 ## 3. 发布前检查

@@ -201,7 +201,7 @@ def test_mail_cleanup_panel_structure():
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
     assert 'id="mail-cleanup-label"' in html
     assert 'id="mail-cleanup-count"' in html
-    assert 'id="mail-cleanup-keep-days"' in html
+    assert 'id="mail-cleanup-keep-hours"' in html
     assert 'id="mail-cleanup-interval"' in html
     assert 'id="mail-cleanup-enabled"' in html
     assert 'id="mail-cleanup-clean-unknow"' in html
@@ -215,7 +215,7 @@ def test_mail_cleanup_panel_structure():
     assert '/api/mail-cleanup' in mon
     assert '/api/mail-cleanup/run' in mon
     assert '/api/mail-cleanup/settings' in mon
-    assert 'mail_cleanup_keep_days' in mon
+    assert 'mail_cleanup_keep_hours' in mon
     assert 'mail_cleanup_interval_hours' in mon
     # 定时线程随 monitor 启动
     assert 'def _mail_cleanup_loop(' in mon
