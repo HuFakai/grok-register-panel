@@ -2648,7 +2648,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="邮件清理 清理 邮箱 涨满 d1 500mb raw_mails 磁盘 数据库 mail cleanup 保留天数">
             <summary>服务端邮件越积越多 / D1 数据库涨满怎么办</summary>
-            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发；保留不足 24 小时时走逐封删除，整 24 小时倍数走服务端批量接口。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
+            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发；保留不足 24 小时走逐封删除，达到 24 小时走服务端批量接口（非整天倍数向上取整到整天），邮件数仅在清理执行后更新、不做后台轮询。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
           </details>
         </div>
         <p class="faq-empty" id="faq-empty" hidden>没有匹配的问题，请换一个错误码或现象关键词。</p>
@@ -2895,7 +2895,7 @@ HTML = r"""<!DOCTYPE html>
           <div>
             <div class="mail-source-kicker">Server mail cleanup</div>
             <h2 id="mail-cleanup-label">服务端邮件自动清理</h2>
-            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；保留不足 24 小时时走逐封删除，整 24 小时倍数走服务端批量接口。</p>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；保留不足 24 小时走逐封删除，达到 24 小时走服务端批量接口（非整天倍数向上取整到整天）。上方邮件数仅在清理执行（定时/手动）后更新，面板不做后台轮询。</p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span class="badge mono" id="mail-cleanup-count">-- 封</span>
@@ -4048,7 +4048,7 @@ function mailCleanupSettingsToInputs(settings) {
 function renderMailCleanup(data, applySettings) {
   data = data || {};
   const countEl = document.getElementById("mail-cleanup-count");
-  if (countEl) countEl.textContent = (data.count === null || data.count === undefined) ? "未知" : (Number(data.count).toLocaleString() + " 封");
+  if (countEl) countEl.textContent = (data.count === null || data.count === undefined) ? "待清理后更新" : (Number(data.count).toLocaleString() + " 封");
   const lastEl = document.getElementById("mail-cleanup-last");
   if (lastEl) {
     const r = data.last_result;
@@ -5616,10 +5616,6 @@ setInterval(() => {
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
   if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
-// 邮件清理状态低频轮询（计数在服务端还有 60s 缓存，不会频繁打邮件服务）
-setInterval(() => {
-  if (document.body.classList.contains("domain-view-open")) refreshMailCleanup(true);
-}, 60000);
 setInterval(() => {
   if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
 }, 10000);
@@ -5875,15 +5871,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/mail-cleanup":
             try:
-                from webui.mail_cleanup_ops import (
-                    cleanup_status,
-                    fetch_mail_count_cached,
-                )
+                from webui.mail_cleanup_ops import cleanup_status, last_known_count
 
                 state = cleanup_status()
                 ctl = load_control()
-                # 计数走 60s 服务端缓存：面板怎么轮询都不会频繁打邮件服务
-                count_value, count_error = fetch_mail_count_cached()
+                # 计数只在清理执行（定时/手动）时更新，读接口只返回缓存值，
+                # 不发起任何对邮件服务的实时查询（保护 D1 每日行读取配额）
+                count_value, count_error = last_known_count()
                 payload = {
                     "ok": True,
                     "running": bool(state.get("running")),

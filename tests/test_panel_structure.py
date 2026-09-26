@@ -215,13 +215,10 @@ def test_mail_cleanup_panel_structure():
     # 设置只在打开页面/保存成功后回填，后台轮询绝不覆盖编辑中的输入框
     assert 'if (applySettings) mailCleanupSettingsToInputs(data.settings);' in mon
     assert 'refreshMailCleanup(false, true)' in mon
-    # 计数轮询 60s 一次，且不再挂在 3s 轮询里（计数服务端还有 60s 缓存）
-    assert re.search(
-        r'setInterval\(\(\) => \{\s*'
-        r'if \(document\.body\.classList\.contains\("domain-view-open"\)\) '
-        r'refreshMailCleanup\(true\);\s*\}, 60000\)',
-        mon,
-    )
+    # 计数不做任何周期轮询（含 60s）：只在清理执行（定时/手动）后随结果更新
+    assert '}, 60000);' not in mon
+    assert '待清理后更新' in mon
+    assert 'last_known_count' in mon
     interval_3s = re.search(r'setInterval\(\(\) => \{.*?\}, 3000\);', mon, re.S)
     assert interval_3s and 'MailCleanup' not in interval_3s.group(0)
     assert '/api/mail-cleanup' in mon

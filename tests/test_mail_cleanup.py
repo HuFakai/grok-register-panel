@@ -60,6 +60,8 @@ def _reset_state():
                 "last_error": None,
             }
         )
+    with mail_cleanup_ops._COUNT_LOCK:
+        mail_cleanup_ops._LAST_COUNT.update({"value": None, "error": None})
 
 
 def test_resolve_creds_requires_base_and_key():
@@ -155,6 +157,26 @@ def test_batch_capped_deployment_repeats_until_no_progress():
         {"cleanType": "mails", "cleanDays": 1},
     ]
     assert result["deleted"] == 7000
+
+
+def test_batch_ceil_rounds_non_day_multiples_up():
+    """≥24h 非整天倍数向上取整到整天（36h → cleanDays=2），绝不提前删。"""
+    posts = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append(json)
+        return FakeResponse(200, data={"success": True})
+
+    result = mail_cleanup_ops.run_mail_cleanup(
+        36,
+        clean_unknow=False,
+        creds=CREDS,
+        http_get=_count_get([9, 0, 9], []),
+        http_post=fake_post,
+        now=NOW,
+    )
+    assert result["mode"] == "server_batch"
+    assert posts == [{"cleanType": "mails", "cleanDays": 2}]
 
 
 def test_sub_day_retention_uses_local_paging_without_batch_post():
@@ -391,55 +413,50 @@ def test_start_cleanup_records_result_in_background():
         _reset_state()
 
 
-def _reset_count_cache():
-    with mail_cleanup_ops._COUNT_CACHE_LOCK:
-        mail_cleanup_ops._COUNT_CACHE.update({"ts": 0.0, "value": None, "error": None})
 
+def test_last_known_count_snapshot_and_run_update():
+    """邮件数缓存只在清理执行时写入：初始为空，跑完取 after，after 失败取 before。"""
+    _reset_state()
+    assert mail_cleanup_ops.last_known_count() == (None, None)
 
-def test_fetch_mail_count_cached_reuses_result_within_ttl():
-    _reset_count_cache()
-    calls = []
-    original = mail_cleanup_ops.fetch_mail_count
-    mail_cleanup_ops.fetch_mail_count = (
-        lambda creds=None, *, config=None, http_get=None: (
-            calls.append("fetch") or 44
-        )
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return FakeResponse(200, data={"success": True})
+
+    mail_cleanup_ops.run_mail_cleanup(
+        24,
+        clean_unknow=False,
+        creds=CREDS,
+        http_get=_count_get([50, 0, 3], []),
+        http_post=fake_post,
+        now=NOW,
     )
-    try:
-        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=60)
-        assert (value, error) == (44, None)
-        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=60)
-        assert (value, error) == (44, None)
-        assert len(calls) == 1, "TTL 内第二次调用不应再请求服务端"
-    finally:
-        mail_cleanup_ops.fetch_mail_count = original
-        _reset_count_cache()
+    assert mail_cleanup_ops.last_known_count() == (3, None)
+    _reset_state()
 
+    # 清理后计数拉取失败：缓存回退为清理前读数并带错误说明
+    pages = [{"results": [{"id": 9, "created_at": "2023-01-01 00:00:00"}]}, {"results": [], "count": 0}]
 
-def test_fetch_mail_count_cached_expires_and_caches_errors():
-    _reset_count_cache()
-    calls = []
+    def flaky_get(url, params=None, headers=None, timeout=None):
+        if int((params or {}).get("limit") or 0) == 1:
+            count = counts.pop(0)
+            if count is None:
+                return FakeResponse(500, body="d1 error")
+            return FakeResponse(200, data={"results": [{"id": 0}], "count": count})
+        return FakeResponse(200, data=pages.pop(0))
 
-    def flaky_fetch(creds=None, *, config=None, http_get=None):
-        calls.append("fetch")
-        if len(calls) == 1:
-            raise RuntimeError("500 Server Error")
-        return 7
-
-    original = mail_cleanup_ops.fetch_mail_count
-    mail_cleanup_ops.fetch_mail_count = flaky_fetch
-    try:
-        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
-        assert value is None and "500 Server Error" in (error or "")
-        # 失败结果同样缓存：TTL 内不再打服务端
-        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
-        assert value is None and len(calls) == 1
-        time.sleep(0.06)
-        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
-        assert (value, error) == (7, None)
-    finally:
-        mail_cleanup_ops.fetch_mail_count = original
-        _reset_count_cache()
+    counts = [2, None]
+    mail_cleanup_ops.run_mail_cleanup(
+        1,
+        creds=CREDS,
+        http_get=flaky_get,
+        http_post=fake_post,
+        http_delete=lambda url, headers=None, timeout=10: FakeResponse(200, data={}),
+        now=NOW,
+    )
+    value, error = mail_cleanup_ops.last_known_count()
+    assert value == 2
+    assert "HTTP 500" in (error or "")
+    _reset_state()
 
 
 if __name__ == "__main__":
@@ -447,6 +464,7 @@ if __name__ == "__main__":
     test_server_batch_cleanup_reports_deleted_diff()
     test_server_batch_without_unknow_sends_single_type()
     test_batch_capped_deployment_repeats_until_no_progress()
+    test_batch_ceil_rounds_non_day_multiples_up()
     test_sub_day_retention_uses_local_paging_without_batch_post()
     test_batch_endpoint_error_falls_back_to_paging()
     test_fallback_single_delete_failure_does_not_abort()
@@ -455,6 +473,5 @@ if __name__ == "__main__":
     test_normalize_settings_roundtrip_and_bounds()
     test_start_cleanup_rejects_invalid_hours_and_double_run()
     test_start_cleanup_records_result_in_background()
-    test_fetch_mail_count_cached_reuses_result_within_ttl()
-    test_fetch_mail_count_cached_expires_and_caches_errors()
+    test_last_known_count_snapshot_and_run_update()
     print("test_mail_cleanup: all tests passed")

@@ -4,11 +4,15 @@
 同时大表上的高频轮询会烧穿 D1 免费版每日行读取配额。
 
 清理策略按保留时长分流：
-- 整 24 小时倍数：走 Worker 自带 POST /admin/cleanup（cleanDays 为整数天，
-  实测一次调用可清空全部过期邮件）；
 - 不足 24 小时（如默认保留 1 小时）：不走批量端点——部署版本对小数天
   cleanDays 的处理无法保证，直接分页拉 /admin/mails 逐封删（created_at
-  秒级字符串比较，行为可证明精确）。
+  秒级字符串比较，行为可证明精确）；
+- 达到 24 小时：走 Worker 自带 POST /admin/cleanup（cleanDays 向上取整到
+  整天，保证绝不删除保留期内的邮件；单批删除量受 CLEANUP_BATCH_SIZE
+  限制的部署会循环调用直到数量不再下降）。
+
+面板展示的邮件数只在清理执行（定时/手动）时更新，读接口只返回缓存值，
+不做任何后台轮询——每次对 /admin/mails 的查询都消耗 D1 每日行读取配额。
 
 凭据复用注册配置：cloudflare_api_key 在 x-admin-auth 模式下即管理员密码，
 本模块不新增任何密钥，也不把凭据写进日志。
@@ -145,32 +149,20 @@ def fetch_mail_count(
     return len(results) if isinstance(results, list) else 0
 
 
-# ---- 面板轮询用的计数缓存：TTL 内复用结果，避免每次刷新都打邮件服务 ----
+# ---- 最近一次已知的服务端邮件数（仅清理执行时更新；面板只读缓存） ----
 
-_COUNT_CACHE_LOCK = threading.Lock()
-_COUNT_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "error": None}
-COUNT_CACHE_TTL = 60.0
+_COUNT_LOCK = threading.Lock()
+_LAST_COUNT: dict[str, Any] = {"value": None, "error": None}
 
 
-def fetch_mail_count_cached(
-    creds: dict | None = None,
-    *,
-    ttl: float = COUNT_CACHE_TTL,
-) -> tuple[int | None, str | None]:
-    """返回 (count, error)；TTL 内直接复用上次结果（含失败结果）。"""
-    now = time.time()
-    with _COUNT_CACHE_LOCK:
-        cached = dict(_COUNT_CACHE)
-    if cached["ts"] and now - cached["ts"] < ttl:
-        return cached["value"], cached["error"]
-    try:
-        value: int | None = int(fetch_mail_count(creds))
-        error: str | None = None
-    except Exception as exc:
-        value, error = None, str(exc)[:200]
-    with _COUNT_CACHE_LOCK:
-        _COUNT_CACHE.update({"ts": now, "value": value, "error": error})
-    return value, error
+def record_count_snapshot(value: int | None, error: str | None = None) -> None:
+    with _COUNT_LOCK:
+        _LAST_COUNT.update({"value": value, "error": error})
+
+
+def last_known_count() -> tuple[int | None, str | None]:
+    with _COUNT_LOCK:
+        return _LAST_COUNT["value"], _LAST_COUNT["error"]
 
 
 def _cutoff_text(keep_hours: int, now: float | None) -> str:
@@ -347,18 +339,20 @@ def run_mail_cleanup(
     c = creds or resolve_creds(config)
     before = fetch_mail_count(c, http_get=http_get)
 
-    if hours % 24 == 0:
+    if hours < 24:
+        # 不足 24 小时：不赌部署对小数天 cleanDays 的处理，直接逐封删
+        server_ok = False
+        server_errors = [f"保留 {hours} 小时不足 24 小时，走逐封删除"]
+    else:
+        # 非整天倍数向上取整到整天（36h→2 天），保证绝不删除保留期内的邮件
+        clean_days = max(1, -(-hours // 24))
         server_ok, server_errors = _server_batch_cleanup(
             c,
-            hours // 24,
+            clean_days,
             clean_unknow,
             http_post=http_post,
             http_get=http_get,
         )
-    else:
-        # 不足整天：不赌部署对小数天 cleanDays 的处理，直接逐封删
-        server_ok = False
-        server_errors = [f"保留 {hours} 小时不足整天，走逐封删除"]
 
     if server_ok:
         mode = "server_batch"
@@ -378,6 +372,11 @@ def run_mail_cleanup(
 
     deleted = max(0, before - after) if after is not None else None
     fatal = detail.get("fatal") or []
+    # 面板展示的邮件数只在清理执行时更新，读接口不做任何实时查询
+    if after is not None:
+        record_count_snapshot(after)
+    else:
+        record_count_snapshot(before, detail.get("count_after_error"))
     return {
         "ok": not fatal,
         "mode": mode,
