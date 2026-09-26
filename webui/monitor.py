@@ -3486,7 +3486,7 @@ function setAppView(view, options = {}) {
     refreshEmailProvider();
     refreshEmailDomains();
     refreshEmailProfiles();
-    refreshMailCleanup();
+    refreshMailCleanup(false, true);
   }
   if (isIpUsage) refreshIpUsage();
   if (isSso) refreshSsoState();
@@ -4045,7 +4045,7 @@ function mailCleanupSettingsToInputs(settings) {
   const cleanUnknow = document.getElementById("mail-cleanup-clean-unknow");
   if (cleanUnknow) cleanUnknow.checked = !!settings.mail_cleanup_clean_unknow;
 }
-function renderMailCleanup(data) {
+function renderMailCleanup(data, applySettings) {
   data = data || {};
   const countEl = document.getElementById("mail-cleanup-count");
   if (countEl) countEl.textContent = (data.count === null || data.count === undefined) ? "未知" : (Number(data.count).toLocaleString() + " 封");
@@ -4062,12 +4062,13 @@ function renderMailCleanup(data) {
   }
   const runBtn = document.getElementById("mail-cleanup-run-btn");
   if (runBtn) runBtn.disabled = !!data.running;
-  mailCleanupSettingsToInputs(data.settings);
+  // 仅在打开页面/保存成功后回填设置，后台轮询绝不覆盖正在编辑的输入框
+  if (applySettings) mailCleanupSettingsToInputs(data.settings);
 }
-async function refreshMailCleanup(silent = false) {
+async function refreshMailCleanup(silent = false, applySettings = false) {
   try {
     const data = await api("/api/mail-cleanup" + (silent ? "?_=" + Date.now() : ""));
-    renderMailCleanup(data);
+    renderMailCleanup(data, applySettings);
     if (data.count_error) {
       setMsg("mail-cleanup-msg", "读取服务端邮件数失败：" + data.count_error, "err");
     } else if (data.running) {
@@ -5612,9 +5613,13 @@ setInterval(() => {
 }, 2000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
-  if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); refreshMailCleanup(true); }
+  if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
   if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
+// 邮件清理状态低频轮询（计数在服务端还有 60s 缓存，不会频繁打邮件服务）
+setInterval(() => {
+  if (document.body.classList.contains("domain-view-open")) refreshMailCleanup(true);
+}, 60000);
 setInterval(() => {
   if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
 }, 10000);
@@ -5870,10 +5875,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/mail-cleanup":
             try:
-                from webui.mail_cleanup_ops import cleanup_status, fetch_mail_count
+                from webui.mail_cleanup_ops import (
+                    cleanup_status,
+                    fetch_mail_count_cached,
+                )
 
                 state = cleanup_status()
                 ctl = load_control()
+                # 计数走 60s 服务端缓存：面板怎么轮询都不会频繁打邮件服务
+                count_value, count_error = fetch_mail_count_cached()
                 payload = {
                     "ok": True,
                     "running": bool(state.get("running")),
@@ -5893,12 +5903,10 @@ class Handler(BaseHTTPRequestHandler):
                             ctl.get("mail_cleanup_clean_unknow", True)
                         ),
                     },
-                    "count": None,
+                    "count": count_value,
                 }
-                try:
-                    payload["count"] = fetch_mail_count()
-                except Exception as exc:
-                    payload["count_error"] = redact_log_line(str(exc))
+                if count_error:
+                    payload["count_error"] = redact_log_line(count_error)
                 self._json(200, payload)
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})

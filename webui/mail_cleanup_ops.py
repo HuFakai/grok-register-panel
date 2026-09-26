@@ -145,6 +145,34 @@ def fetch_mail_count(
     return len(results) if isinstance(results, list) else 0
 
 
+# ---- 面板轮询用的计数缓存：TTL 内复用结果，避免每次刷新都打邮件服务 ----
+
+_COUNT_CACHE_LOCK = threading.Lock()
+_COUNT_CACHE: dict[str, Any] = {"ts": 0.0, "value": None, "error": None}
+COUNT_CACHE_TTL = 60.0
+
+
+def fetch_mail_count_cached(
+    creds: dict | None = None,
+    *,
+    ttl: float = COUNT_CACHE_TTL,
+) -> tuple[int | None, str | None]:
+    """返回 (count, error)；TTL 内直接复用上次结果（含失败结果）。"""
+    now = time.time()
+    with _COUNT_CACHE_LOCK:
+        cached = dict(_COUNT_CACHE)
+    if cached["ts"] and now - cached["ts"] < ttl:
+        return cached["value"], cached["error"]
+    try:
+        value: int | None = int(fetch_mail_count(creds))
+        error: str | None = None
+    except Exception as exc:
+        value, error = None, str(exc)[:200]
+    with _COUNT_CACHE_LOCK:
+        _COUNT_CACHE.update({"ts": now, "value": value, "error": error})
+    return value, error
+
+
 def _cutoff_text(keep_hours: int, now: float | None) -> str:
     moment = float(time.time() if now is None else now)
     cutoff = _dt.datetime.fromtimestamp(moment, _dt.timezone.utc) - _dt.timedelta(

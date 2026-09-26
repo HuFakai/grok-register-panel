@@ -391,6 +391,57 @@ def test_start_cleanup_records_result_in_background():
         _reset_state()
 
 
+def _reset_count_cache():
+    with mail_cleanup_ops._COUNT_CACHE_LOCK:
+        mail_cleanup_ops._COUNT_CACHE.update({"ts": 0.0, "value": None, "error": None})
+
+
+def test_fetch_mail_count_cached_reuses_result_within_ttl():
+    _reset_count_cache()
+    calls = []
+    original = mail_cleanup_ops.fetch_mail_count
+    mail_cleanup_ops.fetch_mail_count = (
+        lambda creds=None, *, config=None, http_get=None: (
+            calls.append("fetch") or 44
+        )
+    )
+    try:
+        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=60)
+        assert (value, error) == (44, None)
+        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=60)
+        assert (value, error) == (44, None)
+        assert len(calls) == 1, "TTL 内第二次调用不应再请求服务端"
+    finally:
+        mail_cleanup_ops.fetch_mail_count = original
+        _reset_count_cache()
+
+
+def test_fetch_mail_count_cached_expires_and_caches_errors():
+    _reset_count_cache()
+    calls = []
+
+    def flaky_fetch(creds=None, *, config=None, http_get=None):
+        calls.append("fetch")
+        if len(calls) == 1:
+            raise RuntimeError("500 Server Error")
+        return 7
+
+    original = mail_cleanup_ops.fetch_mail_count
+    mail_cleanup_ops.fetch_mail_count = flaky_fetch
+    try:
+        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
+        assert value is None and "500 Server Error" in (error or "")
+        # 失败结果同样缓存：TTL 内不再打服务端
+        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
+        assert value is None and len(calls) == 1
+        time.sleep(0.06)
+        value, error = mail_cleanup_ops.fetch_mail_count_cached(CREDS, ttl=0.05)
+        assert (value, error) == (7, None)
+    finally:
+        mail_cleanup_ops.fetch_mail_count = original
+        _reset_count_cache()
+
+
 if __name__ == "__main__":
     test_resolve_creds_requires_base_and_key()
     test_server_batch_cleanup_reports_deleted_diff()
@@ -404,4 +455,6 @@ if __name__ == "__main__":
     test_normalize_settings_roundtrip_and_bounds()
     test_start_cleanup_rejects_invalid_hours_and_double_run()
     test_start_cleanup_records_result_in_background()
+    test_fetch_mail_count_cached_reuses_result_within_ttl()
+    test_fetch_mail_count_cached_expires_and_caches_errors()
     print("test_mail_cleanup: all tests passed")
