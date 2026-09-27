@@ -210,8 +210,14 @@ def test_mail_cleanup_panel_structure():
     assert 'id="mail-cleanup-last"' in html
     assert 'function refreshMailCleanup(' in mon
     assert 'function renderMailCleanup(data, applySettings)' in mon
+    assert 'function mailCleanupProgressText(' in mon
     assert 'function saveMailCleanupSettings(' in mon
     assert 'function runMailCleanup(' in mon
+    # 运行中显示实时进度（scan/delete/batch 阶段），清理可能持续数分钟
+    assert 'p.phase === "scan"' in mon
+    assert 'p.phase === "delete"' in mon
+    assert 'p.phase === "batch"' in mon
+    assert '"progress": state.get("progress")' in mon
     # 设置只在打开页面/保存成功后回填，后台轮询绝不覆盖编辑中的输入框
     assert 'if (applySettings) mailCleanupSettingsToInputs(data.settings);' in mon
     assert 'refreshMailCleanup(false, true)' in mon

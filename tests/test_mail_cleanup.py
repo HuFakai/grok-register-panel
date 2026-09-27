@@ -383,7 +383,7 @@ def test_start_cleanup_records_result_in_background():
     _reset_state()
     captured = {}
 
-    def fake_run(hours, *, clean_unknow, creds):
+    def fake_run(hours, *, clean_unknow, creds, progress_cb=None):
         captured["hours"] = hours
         captured["clean_unknow"] = clean_unknow
         return {
@@ -459,6 +459,51 @@ def test_last_known_count_snapshot_and_run_update():
     _reset_state()
 
 
+def test_progress_callback_reports_scan_and_delete():
+    """逐封删路径要跑几分钟，进度必须实时上报（scan 分页 / delete 删除）。"""
+    _reset_state()
+    pages = [
+        {
+            "results": [
+                {"id": i, "created_at": "2023-01-01 00:00:00"} for i in range(1, 51)
+            ]
+        },
+        {"results": [], "count": 0},
+    ]
+    events = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return FakeResponse(404, body="not found")
+
+    def fake_delete(url, headers=None, timeout=10):
+        return FakeResponse(200, data={})
+
+    result = mail_cleanup_ops.run_mail_cleanup(
+        1,
+        creds=CREDS,
+        http_get=_count_get([50, 0], pages),
+        http_post=fake_post,
+        http_delete=fake_delete,
+        now=NOW,
+        progress_cb=lambda fields: events.append(dict(fields)),
+    )
+    assert result["deleted_by_api"] == 50
+    scan_events = [e for e in events if e.get("phase") == "scan"]
+    delete_events = [e for e in events if e.get("phase") == "delete"]
+    assert scan_events and scan_events[-1]["scanned"] == 50
+    assert scan_events[-1]["stale"] == 50
+    assert delete_events and delete_events[-1]["done"] == 50
+    assert delete_events[-1]["total"] == 50
+    assert delete_events[-1]["deleted"] == 50
+    assert delete_events[-1]["failed"] == 0
+    # 进度上报间隔不超过 REPORT_STEP，长时间任务不会长时间静默
+    assert max(
+        delete_events[i + 1]["done"] - delete_events[i]["done"]
+        for i in range(len(delete_events) - 1)
+    ) <= mail_cleanup_ops.PROGRESS_REPORT_STEP
+    _reset_state()
+
+
 if __name__ == "__main__":
     test_resolve_creds_requires_base_and_key()
     test_server_batch_cleanup_reports_deleted_diff()
@@ -474,4 +519,5 @@ if __name__ == "__main__":
     test_start_cleanup_rejects_invalid_hours_and_double_run()
     test_start_cleanup_records_result_in_background()
     test_last_known_count_snapshot_and_run_update()
+    test_progress_callback_reports_scan_and_delete()
     print("test_mail_cleanup: all tests passed")

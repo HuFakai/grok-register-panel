@@ -24,7 +24,7 @@ import datetime as _dt
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,9 +38,10 @@ MIN_KEEP_HOURS = 1
 MAX_KEEP_HOURS = 720
 SCAN_PAGE_SIZE = 100
 MAX_SCAN_PAGES = 200
-DELETE_CONCURRENCY = 6
+DELETE_CONCURRENCY = 8
 CLEANUP_TIMEOUT = 60
 BATCH_MAX_ROUNDS = 5
+PROGRESS_REPORT_STEP = 25
 
 # 与 monitor_control.json 键对齐；面板设置读写都经过这里归一化
 DEFAULT_SETTINGS = {
@@ -201,6 +202,15 @@ def _post_cleanup_once(
     return "ok", ""
 
 
+def _safe_progress(progress_cb: Callable[[dict], None] | None, **fields: Any) -> None:
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(fields)
+    except Exception:
+        pass
+
+
 def _server_batch_cleanup(
     creds: dict,
     clean_days: int,
@@ -208,6 +218,7 @@ def _server_batch_cleanup(
     *,
     http_post: Callable[..., Any] | None,
     http_get: Callable[..., Any] | None,
+    progress_cb: Callable[[dict], None] | None = None,
 ) -> tuple[bool, list[str]]:
     """整日保留走 Worker 批量端点。
 
@@ -217,6 +228,7 @@ def _server_batch_cleanup(
     post = http_post or _default_post
     get = http_get or _default_get
     errors: list[str] = []
+    _safe_progress(progress_cb, phase="batch", clean_days=clean_days)
     previous: int | None = None
     for _ in range(BATCH_MAX_ROUNDS):
         state, detail = _post_cleanup_once(creds, "mails", clean_days, post)
@@ -228,6 +240,7 @@ def _server_batch_cleanup(
         except Exception as exc:
             errors.append(f"mails: 删除后计数失败 {exc}")
             return False, errors
+        _safe_progress(progress_cb, phase="batch", clean_days=clean_days, remaining=remaining)
         if remaining == 0 or (previous is not None and remaining >= previous):
             break
         previous = remaining
@@ -246,6 +259,7 @@ def _local_paging_cleanup(
     http_get: Callable[..., Any] | None,
     http_delete: Callable[..., Any] | None,
     now: float | None,
+    progress_cb: Callable[[dict], None] | None = None,
 ) -> dict:
     """分页扫描 /admin/mails，删除 created_at 早于保留期的邮件（单封失败不中断）。"""
     get = http_get or _default_get
@@ -282,11 +296,15 @@ def _local_paging_cleanup(
             if not created or created >= cutoff:
                 continue
             stale_ids.append(mail_id)
+        _safe_progress(
+            progress_cb, phase="scan", scanned=scanned, stale=len(stale_ids)
+        )
         if len(results) < SCAN_PAGE_SIZE:
             break
 
     deleted = 0
     failed = 0
+    total = len(stale_ids)
 
     def _delete_one(mail_id) -> bool:
         try:
@@ -302,13 +320,28 @@ def _local_paging_cleanup(
             return False
 
     if stale_ids:
+        done = 0
         with ThreadPoolExecutor(max_workers=DELETE_CONCURRENCY) as pool:
-            outcomes = list(pool.map(_delete_one, stale_ids))
-        deleted = sum(1 for ok in outcomes if ok)
-        failed = len(outcomes) - deleted
+            futures = [pool.submit(_delete_one, mail_id) for mail_id in stale_ids]
+            for future in as_completed(futures):
+                ok = future.result()
+                done += 1
+                if ok:
+                    deleted += 1
+                else:
+                    failed += 1
+                if done % PROGRESS_REPORT_STEP == 0 or done == total:
+                    _safe_progress(
+                        progress_cb,
+                        phase="delete",
+                        done=done,
+                        total=total,
+                        deleted=deleted,
+                        failed=failed,
+                    )
     return {
         "scanned": scanned,
-        "stale": len(stale_ids),
+        "stale": total,
         "deleted_by_api": deleted,
         "failed": failed,
         "fatal": fatal,
@@ -325,6 +358,7 @@ def run_mail_cleanup(
     http_post: Callable[..., Any] | None = None,
     http_delete: Callable[..., Any] | None = None,
     now: float | None = None,
+    progress_cb: Callable[[dict], None] | None = None,
 ) -> dict:
     """执行一次服务端历史邮件清理，返回统计（含前后 count 差值）。"""
     try:
@@ -352,6 +386,7 @@ def run_mail_cleanup(
             clean_unknow,
             http_post=http_post,
             http_get=http_get,
+            progress_cb=progress_cb,
         )
 
     if server_ok:
@@ -360,7 +395,12 @@ def run_mail_cleanup(
     else:
         mode = "local_paging"
         detail = _local_paging_cleanup(
-            c, hours, http_get=http_get, http_delete=http_delete, now=now
+            c,
+            hours,
+            http_get=http_get,
+            http_delete=http_delete,
+            now=now,
+            progress_cb=progress_cb,
         )
         detail["server_batch_errors"] = server_errors
 
@@ -398,12 +438,22 @@ _STATE: dict[str, Any] = {
     "started_at": None,
     "last_result": None,
     "last_error": None,
+    "progress": {},
 }
+
+
+def _set_progress(**fields: Any) -> None:
+    """更新运行中任务的进度（逐封删除一次要几分钟，面板靠它反馈）。"""
+    with _STATE_LOCK:
+        current = dict(_STATE.get("progress") or {})
+        current.update(fields)
+        _STATE["progress"] = current
 
 
 def cleanup_status() -> dict:
     with _STATE_LOCK:
         state = dict(_STATE)
+        state["progress"] = dict(state.get("progress") or {})
     result = state.get("last_result")
     if isinstance(result, dict):
         state["last_result"] = {
@@ -443,6 +493,7 @@ def start_cleanup(
             return {"started": False, "error": "已有清理任务在运行"}
         _STATE["running"] = True
         _STATE["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _STATE["progress"] = {}
     thread = threading.Thread(
         target=_run_and_record,
         args=(hours, bool(clean_unknow), creds),
@@ -455,7 +506,9 @@ def start_cleanup(
 
 def _run_and_record(hours: int, clean_unknow: bool, creds: dict | None):
     try:
-        result = run_mail_cleanup(hours, clean_unknow=clean_unknow, creds=creds)
+        result = run_mail_cleanup(
+            hours, clean_unknow=clean_unknow, creds=creds, progress_cb=_set_progress
+        )
         with _STATE_LOCK:
             _STATE["last_result"] = result
             _STATE["last_error"] = None if result.get("ok") else "; ".join(

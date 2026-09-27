@@ -4072,14 +4072,28 @@ async function refreshMailCleanup(silent = false, applySettings = false) {
     if (data.count_error) {
       setMsg("mail-cleanup-msg", "读取服务端邮件数失败：" + data.count_error, "err");
     } else if (data.running) {
-      setMsg("mail-cleanup-msg", "清理进行中，5 秒后刷新状态…", "");
-      if (!mailCleanupTimer) mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 5000);
+      setMsg("mail-cleanup-msg", mailCleanupProgressText(data.progress), "");
+      if (!mailCleanupTimer) mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 3000);
     } else {
       setMsg("mail-cleanup-msg", "", "");
     }
   } catch (e) {
     if (!silent) setMsg("mail-cleanup-msg", String(e.message || e), "err");
   }
+}
+function mailCleanupProgressText(progress) {
+  const p = progress || {};
+  let text;
+  if (p.phase === "scan") {
+    text = "清理进行中：正在扫描服务端邮件（已拉取 " + Number(p.scanned || 0).toLocaleString() + " 封，发现待删 " + Number(p.stale || 0).toLocaleString() + " 封）";
+  } else if (p.phase === "delete") {
+    text = "清理进行中：正在逐封删除（已处理 " + Number(p.done || 0).toLocaleString() + "/" + Number(p.total || 0).toLocaleString() + "，成功 " + Number(p.deleted || 0).toLocaleString() + "，失败 " + Number(p.failed || 0).toLocaleString() + "）";
+  } else if (p.phase === "batch") {
+    text = "清理进行中：已调用服务端批量接口（cleanDays=" + Number(p.clean_days || 0) + "），等待结果…";
+  } else {
+    text = "清理进行中…";
+  }
+  return text + "，3 秒后刷新…";
 }
 async function saveMailCleanupSettings() {
   const keepHours = Math.max(1, Math.min(720, Number((document.getElementById("mail-cleanup-keep-hours") || {}).value || 1)));
@@ -4109,7 +4123,7 @@ async function runMailCleanup() {
     await api("/api/mail-cleanup/run", { method: "POST", body: JSON.stringify({}) });
     setMsg("mail-cleanup-msg", "清理已启动，正在后台执行…", "");
     if (mailCleanupTimer) { clearTimeout(mailCleanupTimer); }
-    mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 5000);
+    mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 3000);
   } catch (e) {
     setMsg("mail-cleanup-msg", String(e.message || e), "err");
     if (btn) btn.disabled = false;
@@ -5881,6 +5895,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {
                     "ok": True,
                     "running": bool(state.get("running")),
+                    "progress": state.get("progress") or {},
                     "last_result": state.get("last_result"),
                     "last_error": state.get("last_error"),
                     "settings": {
