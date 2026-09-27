@@ -2648,7 +2648,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="邮件清理 清理 邮箱 涨满 d1 500mb raw_mails 磁盘 数据库 mail cleanup 保留天数">
             <summary>服务端邮件越积越多 / D1 数据库涨满怎么办</summary>
-            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发；保留不足 24 小时走逐封删除，达到 24 小时走服务端批量接口（非整天倍数向上取整到整天），邮件数仅在清理执行后更新、不做后台轮询。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
+            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发。清理是组合策略：先调 Worker 批量接口删整数天前的大头（保留不足 24 小时也先删 1 天前的），再分页逐封删剩余窗口；批量接口不可用时整体退回逐封删。邮件数仅在清理执行后更新、不做后台轮询。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
           </details>
         </div>
         <p class="faq-empty" id="faq-empty" hidden>没有匹配的问题，请换一个错误码或现象关键词。</p>
@@ -2895,7 +2895,7 @@ HTML = r"""<!DOCTYPE html>
           <div>
             <div class="mail-source-kicker">Server mail cleanup</div>
             <h2 id="mail-cleanup-label">服务端邮件自动清理</h2>
-            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理；保留不足 24 小时走逐封删除，达到 24 小时走服务端批量接口（非整天倍数向上取整到整天）。上方邮件数仅在清理执行（定时/手动）后更新，面板不做后台轮询。</p>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。清理用组合策略：先调 Worker 批量接口删整数天前的大头（保留不足 24 小时也先删 1 天前的），再分页逐封删剩余窗口，把 D1 查询次数压到最低；批量接口不可用时整体退回逐封删。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理。上方邮件数仅在清理执行（定时/手动）后更新，面板不做后台轮询。</p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span class="badge mono" id="mail-cleanup-count">-- 封</span>
@@ -4055,7 +4055,7 @@ function renderMailCleanup(data, applySettings) {
     if (data.last_error) {
       lastEl.textContent = "上次清理失败：" + data.last_error;
     } else if (r) {
-      lastEl.textContent = "上次清理：" + (r.finished_at || "--") + " · 删除 " + (r.deleted === null || r.deleted === undefined ? "--" : Number(r.deleted).toLocaleString()) + " 封 · " + (r.mode === "server_batch" ? "服务端批量" : "逐封删除") + " · 清理前 " + (r.before === null || r.before === undefined ? "--" : Number(r.before).toLocaleString()) + " 封";
+      lastEl.textContent = "上次清理：" + (r.finished_at || "--") + " · 删除 " + (r.deleted === null || r.deleted === undefined ? "--" : Number(r.deleted).toLocaleString()) + " 封 · " + (r.mode === "server_batch" ? "服务端批量+逐封扫尾" : "纯逐封删除") + " · 清理前 " + (r.before === null || r.before === undefined ? "--" : Number(r.before).toLocaleString()) + " 封";
     } else {
       lastEl.textContent = "上次清理：尚未运行";
     }

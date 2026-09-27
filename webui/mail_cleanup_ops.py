@@ -3,13 +3,13 @@
 背景：raw_mails 只增不减时 D1 会涨到 500MB 上限，address 建号批量失败；
 同时大表上的高频轮询会烧穿 D1 免费版每日行读取配额。
 
-清理策略按保留时长分流：
-- 不足 24 小时（如默认保留 1 小时）：不走批量端点——部署版本对小数天
-  cleanDays 的处理无法保证，直接分页拉 /admin/mails 逐封删（created_at
-  秒级字符串比较，行为可证明精确）；
-- 达到 24 小时：走 Worker 自带 POST /admin/cleanup（cleanDays 向上取整到
-  整天，保证绝不删除保留期内的邮件；单批删除量受 CLEANUP_BATCH_SIZE
-  限制的部署会循环调用直到数量不再下降）。
+清理策略（批量 + 逐封组合，尽量少打 D1 查询）：
+1. 先走 Worker 自带 POST /admin/cleanup 批量删除整数天前的邮件
+   （cleanDays = max(1, 保留小时数 // 24)：保留不足 24 小时也先删
+   1 天前的大头；带批上限收敛循环）；
+2. 再分页拉 /admin/mails 逐封删掉保留期内的剩余窗口（批量后表已很小，
+   扫尾成本低；created_at 秒级字符串比较，行为可证明精确）；
+3. 批量端点缺失或失败时整体退回纯逐封删。
 
 面板展示的邮件数只在清理执行（定时/手动）时更新，读接口只返回缓存值，
 不做任何后台轮询——每次对 /admin/mails 的查询都消耗 D1 每日行读取配额。
@@ -373,36 +373,28 @@ def run_mail_cleanup(
     c = creds or resolve_creds(config)
     before = fetch_mail_count(c, http_get=http_get)
 
-    if hours < 24:
-        # 不足 24 小时：不赌部署对小数天 cleanDays 的处理，直接逐封删
-        server_ok = False
-        server_errors = [f"保留 {hours} 小时不足 24 小时，走逐封删除"]
-    else:
-        # 非整天倍数向上取整到整天（36h→2 天），保证绝不删除保留期内的邮件
-        clean_days = max(1, -(-hours // 24))
-        server_ok, server_errors = _server_batch_cleanup(
-            c,
-            clean_days,
-            clean_unknow,
-            http_post=http_post,
-            http_get=http_get,
-            progress_cb=progress_cb,
-        )
-
-    if server_ok:
-        mode = "server_batch"
-        detail: dict[str, Any] = {"errors": server_errors}
-    else:
-        mode = "local_paging"
-        detail = _local_paging_cleanup(
-            c,
-            hours,
-            http_get=http_get,
-            http_delete=http_delete,
-            now=now,
-            progress_cb=progress_cb,
-        )
-        detail["server_batch_errors"] = server_errors
+    # 组合策略：先批量删整数天前的大头（保留不足 24 小时也先删 1 天前的，
+    # 大积压时一次调用删掉绝大部分），再分页逐封删保留期内的剩余窗口
+    # （批量后表已很小，扫尾成本低）；批量端点不可用时整体退回纯逐封删。
+    clean_days = max(1, hours // 24)
+    server_ok, server_errors = _server_batch_cleanup(
+        c,
+        clean_days,
+        clean_unknow,
+        http_post=http_post,
+        http_get=http_get,
+        progress_cb=progress_cb,
+    )
+    mode = "server_batch" if server_ok else "local_paging"
+    detail: dict[str, Any] = _local_paging_cleanup(
+        c,
+        hours,
+        http_get=http_get,
+        http_delete=http_delete,
+        now=now,
+        progress_cb=progress_cb,
+    )
+    detail["server_batch_errors"] = server_errors
 
     try:
         after = fetch_mail_count(c, http_get=http_get)

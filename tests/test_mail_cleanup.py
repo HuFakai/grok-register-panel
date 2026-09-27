@@ -159,8 +159,8 @@ def test_batch_capped_deployment_repeats_until_no_progress():
     assert result["deleted"] == 7000
 
 
-def test_batch_ceil_rounds_non_day_multiples_up():
-    """≥24h 非整天倍数向上取整到整天（36h → cleanDays=2），绝不提前删。"""
+def test_batch_uses_floor_days_for_over_day_retention():
+    """≥24h 的保留期：批量 cleanDays 取整天数（floor），36h → 1 天。"""
     posts = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -176,55 +176,60 @@ def test_batch_ceil_rounds_non_day_multiples_up():
         now=NOW,
     )
     assert result["mode"] == "server_batch"
-    assert posts == [{"cleanType": "mails", "cleanDays": 2}]
+    assert posts == [{"cleanType": "mails", "cleanDays": 1}]
 
 
-def test_sub_day_retention_uses_local_paging_without_batch_post():
-    """不足 24 小时的保留期不走批量端点（部署对小数天行为不可保证）。"""
+def test_sub_day_combo_batch_first_then_sweep_residual():
+    """保留 <24h：先批量删 1 天前的大头，再逐封删 [保留期, 24h) 窗口剩余。"""
     posts = []
+    deletes = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        posts.append((url, json))
+        posts.append(json)
         return FakeResponse(200, data={"success": True})
-
-    pages = [
-        {
-            "results": [
-                {"id": 1, "created_at": "2023-11-14 20:00:00"},
-                {"id": 2, "created_at": "2023-11-14 21:00:00"},
-                {"id": 3, "created_at": "2023-11-14 22:00:00"},
-                {"id": 4},
-                {"id": "5", "created_at": "not-a-date 99:99:99"},
-            ],
-            "count": 5,
-        },
-        {"results": [], "count": 5},
-    ]
-    deletes = []
 
     def fake_delete(url, headers=None, timeout=10):
         deletes.append(url)
         return FakeResponse(200, data={})
 
+    # NOW=2023-11-14 22:13:20 UTC；H=1 → cutoff 21:13。
+    # 批量（cleanDays=1）后服务端剩 8 封：6 封在 [1h,24h) 窗口内（待逐封删）、
+    # 2 封是 1 小时内的新邮件（保留）。
+    window_mail = {"id": 1, "created_at": "2023-11-14 10:00:00"}
+    pages = [
+        {
+            "results": [dict(window_mail, id=i) for i in range(1, 7)]
+            + [
+                {"id": 7, "created_at": "2023-11-14 22:00:00"},
+                {"id": 8, "created_at": "2023-11-14 22:05:00"},
+            ],
+            "count": 8,
+        },
+        {"results": [], "count": 8},
+    ]
     result = mail_cleanup_ops.run_mail_cleanup(
         1,
         clean_unknow=True,
         creds=CREDS,
-        http_get=_count_get([5, 3], pages),
+        http_get=_count_get([10, 8, 8, 2], pages),
         http_post=fake_post,
         http_delete=fake_delete,
         now=NOW,
     )
-    # NOW cutoff ≈ 2023-11-14 21:13 → 仅 id 1、2 过期
-    assert posts == []
-    assert result["mode"] == "local_paging"
+    assert result["mode"] == "server_batch"
     assert result["ok"] is True
-    assert result["deleted_by_api"] == 2
-    assert result["deleted"] == 2
-    assert deletes == [
-        "https://mail.example/admin/mails/1",
-        "https://mail.example/admin/mails/2",
+    # 批量先删 1 天前的（count 10→8）；收敛循环停在无进展；再清 unknow
+    assert posts == [
+        {"cleanType": "mails", "cleanDays": 1},
+        {"cleanType": "mails", "cleanDays": 1},
+        {"cleanType": "mails_unknow", "cleanDays": 1},
     ]
+    # 扫尾只删窗口内的 6 封，1 小时内的新邮件保留
+    assert result["deleted_by_api"] == 6
+    assert result["deleted"] == 8
+    assert sorted(deletes) == sorted(
+        f"https://mail.example/admin/mails/{i}" for i in range(1, 7)
+    )
 
 
 def test_batch_endpoint_error_falls_back_to_paging():
@@ -433,8 +438,12 @@ def test_last_known_count_snapshot_and_run_update():
     assert mail_cleanup_ops.last_known_count() == (3, None)
     _reset_state()
 
-    # 清理后计数拉取失败：缓存回退为清理前读数并带错误说明
+    # 清理后计数拉取失败：缓存回退为清理前读数并带错误说明。
+    # 批量端点 404（不消耗 count 队列）→ 整体退回逐封删。
     pages = [{"results": [{"id": 9, "created_at": "2023-01-01 00:00:00"}]}, {"results": [], "count": 0}]
+
+    def unsupported_post(url, json=None, headers=None, timeout=None):
+        return FakeResponse(404, body="not found")
 
     def flaky_get(url, params=None, headers=None, timeout=None):
         if int((params or {}).get("limit") or 0) == 1:
@@ -449,7 +458,7 @@ def test_last_known_count_snapshot_and_run_update():
         1,
         creds=CREDS,
         http_get=flaky_get,
-        http_post=fake_post,
+        http_post=unsupported_post,
         http_delete=lambda url, headers=None, timeout=10: FakeResponse(200, data={}),
         now=NOW,
     )
@@ -509,8 +518,8 @@ if __name__ == "__main__":
     test_server_batch_cleanup_reports_deleted_diff()
     test_server_batch_without_unknow_sends_single_type()
     test_batch_capped_deployment_repeats_until_no_progress()
-    test_batch_ceil_rounds_non_day_multiples_up()
-    test_sub_day_retention_uses_local_paging_without_batch_post()
+    test_batch_uses_floor_days_for_over_day_retention()
+    test_sub_day_combo_batch_first_then_sweep_residual()
     test_batch_endpoint_error_falls_back_to_paging()
     test_fallback_single_delete_failure_does_not_abort()
     test_fallback_list_failure_stops_without_deleting()
