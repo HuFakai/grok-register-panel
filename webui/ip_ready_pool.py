@@ -108,6 +108,44 @@ def _stats(items: list[dict], now: float | None = None) -> dict[str, int]:
     }
 
 
+def _datacenter_filter_enabled() -> bool:
+    """面板「数据中心出口过滤」开关；异常一律视为关闭。"""
+    try:
+        from webui.proxy_store import datacenter_filter_enabled
+
+        return datacenter_filter_enabled()
+    except Exception:
+        return False
+
+
+def _is_datacenter_org(asn_org: object) -> bool:
+    try:
+        from webui.proxy_store import is_datacenter_org
+
+        return is_datacenter_org(asn_org)
+    except Exception:
+        return False
+
+
+def _lookup_asn_org(exit_ip: str, timeout: float = 5.0) -> str:
+    """按出口 IP 尽力查一次 ASN 组织名（ipwho.is）；失败返回空串。"""
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return ""
+    try:
+        import requests
+
+        resp = requests.get(f"https://ipwho.is/{ip}", timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        connection = payload.get("connection") if isinstance(payload, dict) else None
+        if isinstance(connection, dict):
+            return str(connection.get("org") or connection.get("isp") or "").strip()
+        return str(payload.get("org") or payload.get("isp") or "").strip()
+    except Exception:
+        return ""
+
+
 def _usage_limit(ip: str) -> int:
     """每 IP 覆盖优先，未设置回退 config.json 的 ip_usage_limit（0..100000）。
 
@@ -175,6 +213,14 @@ def probe_one(
     except Exception:
         limit = 0
         used = 0
+    # 机房过滤（面板开关）：入池前按出口 IP 查一次 ASN 组织名，命中关键词不入池。
+    # 查询失败/限流不拦（保留条目），避免误杀。
+    if _datacenter_filter_enabled():
+        asn_org = _lookup_asn_org(exit_ip)
+        if _is_datacenter_org(asn_org):
+            if log_callback:
+                log_callback(f"[ip-pool] skip datacenter {exit_ip} ({asn_org})")
+            return None
     now = time.time()
     return {
         "id": _item_id(expanded_url),

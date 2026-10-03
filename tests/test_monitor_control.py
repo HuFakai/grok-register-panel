@@ -145,6 +145,13 @@ def test_mail_cleanup_settings_defaults_and_bounds():
             assert clamped["mail_cleanup_keep_hours"] == 1
             assert clamped["mail_cleanup_interval_hours"] == 168
 
+            defaults["ip_pool_filter_datacenter"] = False
+            dc_on = monitor.save_control({"ip_pool_filter_datacenter": True})
+            assert dc_on["ip_pool_filter_datacenter"] is True
+            dc_off = monitor.save_control({"ip_pool_filter_datacenter": "x"})
+            assert dc_off["ip_pool_filter_datacenter"] is True  # 非空真值仍为真
+            assert monitor.load_control()["ip_pool_filter_datacenter"] is True
+
             dropped = monitor.save_control({"mail_cleanup_bad_key": "x"})
             assert "mail_cleanup_bad_key" not in dropped
         finally:

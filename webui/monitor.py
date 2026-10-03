@@ -277,6 +277,7 @@ def load_control() -> dict:
         c.setdefault("mail_cleanup_keep_hours", 1)
         c.setdefault("mail_cleanup_interval_hours", 1)
         c.setdefault("mail_cleanup_enabled", True)
+        c.setdefault("ip_pool_filter_datacenter", False)
         c.setdefault("mail_cleanup_clean_unknow", True)
         return c
 
@@ -300,6 +301,8 @@ def save_control(updates: dict) -> dict:
         "mail_cleanup_keep_hours",
         "mail_cleanup_interval_hours",
         "mail_cleanup_clean_unknow",
+        # 数据中心出口过滤开关（IP 使用页手动切换）
+        "ip_pool_filter_datacenter",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -351,6 +354,7 @@ def save_control(updates: dict) -> dict:
         for key, default in (
             ("mail_cleanup_enabled", True),
             ("mail_cleanup_clean_unknow", True),
+            ("ip_pool_filter_datacenter", False),
         ):
             c[key] = bool(c.get(key, default))
         for key in ("base_cpa", "target_cpa"):
@@ -508,6 +512,8 @@ def parse_log(path, max_tail=400_000):
             fm = RE_FAIL_KIND.search(line)
             kind = fm.group(1) if fm else "其它"
             msg = fm.group(2) if fm else line[-120:]
+            if "Email sign-up isn't available" in msg or "邮箱注册被限流" in msg:
+                kind = "注册限流"
             if "inputs=none" in msg:
                 kind = "空页UI"
             if "Turnstile" in msg or "Turnstile" in kind:
@@ -2754,6 +2760,9 @@ HTML = r"""<!DOCTYPE html>
             </p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <label style="display:inline-flex;gap:6px;align-items:center" title="开启后 worker 取口与入池探测都跳过机房/云厂商 ASN 段（Oracle/AWS/Hetzner 等），只用住宅出口">
+              <input type="checkbox" id="ip-pool-filter-dc" onchange="saveIpPoolDatacenterFilter(this.checked)"/> 只用住宅出口（过滤机房 IP）
+            </label>
             <button class="primary" id="ip-pool-probe-btn" onclick="probeIpPool()">立即探测</button>
             <span class="mail-provider-meta mono" id="ip-pool-status">--</span>
           </div>
@@ -4129,6 +4138,16 @@ async function runMailCleanup() {
     if (btn) btn.disabled = false;
   }
 }
+async function saveIpPoolDatacenterFilter(enabled) {
+  try {
+    await api("/api/control", { method: "POST", body: JSON.stringify({ ip_pool_filter_datacenter: !!enabled }) });
+    setMsg("ip-usage-limit-msg", enabled ? "已开启只住宅出口：换口与入池探测将跳过机房/云段" : "已关闭只住宅出口", "ok");
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+    const box = document.getElementById("ip-pool-filter-dc");
+    if (box) box.checked = !enabled;
+  }
+}
 async function saveIpUsageLimit() {
   const input = document.getElementById("ip-usage-limit-page");
   const value = Math.max(0, Math.min(100000, Number(input.value || 0)));
@@ -4658,6 +4677,8 @@ function fillControl(d) {
   if (c.ip_failure_rotate_threshold != null) document.getElementById("ip_failure_rotate_threshold").value = c.ip_failure_rotate_threshold;
   if (c.ip_usage_limit != null && document.getElementById("ip_usage_limit")) document.getElementById("ip_usage_limit").value = c.ip_usage_limit;
   if (c.mode) document.getElementById("mode").value = c.mode;
+  const dcFilter = document.getElementById("ip-pool-filter-dc");
+  if (dcFilter && document.activeElement !== dcFilter) dcFilter.checked = !!c.ip_pool_filter_datacenter;
   syncIpPolicyUi();
 }
 function controlBody() {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import threading
@@ -122,6 +123,71 @@ def is_home_proxy(url: object) -> bool:
     return host in {"127.0.0.1", "localhost", "::1"}
 
 
+# 数据中心/云厂商 ASN 组织名关键词（小写匹配 asn_org）；
+# xAI 封控收紧时空页多集中在机房段，住宅出口成功率更高。
+DATACENTER_ORG_KEYWORDS = (
+    "oracle",
+    "amazon",
+    "aws",
+    "google",
+    "microsoft",
+    "azure",
+    "hetzner",
+    "digitalocean",
+    "digital ocean",
+    "vultr",
+    "choopa",
+    "linode",
+    "akamai",
+    "ovh",
+    "contabo",
+    "alibaba",
+    "tencent",
+    "huawei",
+    "datacamp",
+    "hostinger",
+    "godaddy",
+    "hostwinds",
+    "kamatera",
+    "upcloud",
+    "leaseweb",
+    "ionos",
+    "scaleway",
+    "equinix",
+    "m247",
+    "psychz",
+    "colocation",
+    "data center",
+    "datacenter",
+    "hosting",
+)
+
+
+def is_datacenter_org(asn_org: object) -> bool:
+    """按出口 ASN 组织名判断是否机房/云段；组织名未知时返回 False（宁可不拦）。"""
+    text = str(asn_org or "").strip().lower()
+    if not text:
+        return False
+    return any(keyword in text for keyword in DATACENTER_ORG_KEYWORDS)
+
+
+MONITOR_CONTROL_PATH = ROOT / "log" / "monitor_control.json"
+
+
+def datacenter_filter_enabled() -> bool:
+    """读面板开关（monitor_control.json 的 ip_pool_filter_datacenter）。
+
+    独立小读取，避免 proxy_store ↔ monitor 循环导入；任何异常视为关闭。
+    """
+    try:
+        raw = json.loads(
+            MONITOR_CONTROL_PATH.read_text(encoding="utf-8") or "{}"
+        )
+        return bool(raw.get("ip_pool_filter_datacenter"))
+    except Exception:
+        return False
+
+
 def _item_usable_for_workers(item: dict) -> bool:
     if not item.get("enabled"):
         return False
@@ -171,13 +237,21 @@ def note_proxy_exit(url: object, exit_ip: object) -> bool:
 
 
 def worker_proxy_details() -> list[dict]:
-    """Worker 可选出口：url + 最近出口 IP + 上次使用时间。"""
+    """Worker 可选出口：url + 最近出口 IP + 上次使用时间。
+
+    面板开启「数据中心出口过滤」时跳过机房/云段（asn_org 命中关键词）；
+    出口没有 ASN 数据时保留（宁可不拦不误杀）。
+    """
+    filter_dc = datacenter_filter_enabled()
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
         changed = _release_expired_cooldowns(state)
         rows = []
         for item in state["items"]:
             if not _item_usable_for_workers(item):
+                continue
+            asn_org = str(item.get("asn_org") or "")
+            if filter_dc and is_datacenter_org(asn_org):
                 continue
             rows.append(
                 {
@@ -186,6 +260,8 @@ def worker_proxy_details() -> list[dict]:
                     "last_used_at": str(item.get("last_used_at") or ""),
                     "status": item.get("status") or "",
                     "home": is_home_proxy(item["url"]),
+                    "asn": item.get("asn"),
+                    "asn_org": asn_org,
                 }
             )
         if changed:

@@ -715,6 +715,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         if not _reload_signup_and_open_email(log_callback=log_callback, cancel_callback=cancel_callback):
             raise Exception(
                 f"打开注册页后页面空白: url={active_page().url if active_page() else ''}; inputs=none; buttons=none"
+                f"; text={page_notice_text()}"
             )
         return
     if _page_has_email_form():
@@ -730,6 +731,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         if not _reload_signup_and_open_email(log_callback=log_callback, cancel_callback=cancel_callback):
             raise Exception(
                 f"未找到邮箱输入框或注册按钮，最后页面: url={active_page().url if active_page() else ''}; inputs=none; buttons=none"
+                f"; text={page_notice_text()}"
             )
 
 
@@ -902,6 +904,35 @@ return false;
         if type(_exc).__name__ == "EmailDomainRejected":
             raise
         return False
+
+
+SIGNUP_THROTTLE_MARKERS = (
+    "email sign-up isn't available",
+    "email sign-up is not available",
+    "sign up another way",
+)
+
+
+def page_notice_text(limit: int = 160) -> str:
+    """抓注册页正文前 N 个字符（诊断空页/被拒时页面实际显示什么）。"""
+    try:
+        page = active_page()
+        if not page:
+            return ""
+        raw = page.run_js("return (document.body ? document.body.innerText : '') || '';")
+        collapsed = re.sub(r"\s+", " ", str(raw or "")).strip()
+        return collapsed[: max(40, int(limit))]
+    except Exception:
+        return ""
+
+
+def page_signup_throttled() -> bool:
+    """页面是否出现「Email sign-up isn't available」限流提示。"""
+    try:
+        text = (page_notice_text(400) or "").lower()
+    except Exception:
+        return False
+    return any(marker in text for marker in SIGNUP_THROTTLE_MARKERS)
 
 
 def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
@@ -1252,6 +1283,12 @@ return 'enter';
                 last_diag_time = time.time()
                 log_callback(f"[Debug] 已点击注册但页面未前进，重试提交: {email}")
             raise_if_email_domain_rejected(email)
+            if page_signup_throttled():
+                notice = page_notice_text()
+                raise Exception(
+                    "Email sign-up isn't available（邮箱注册被限流，稍后重试）"
+                    f"; url={active_page().url if active_page() else ''}; text={notice}"
+                )
         sleep_with_cancel(0.5, cancel_callback)
     raise_if_email_domain_rejected(email)
     # 超时前最后一次硬恢复
@@ -1293,6 +1330,7 @@ return false;
         url = last_snapshot.get("url", page.url if page else "")
         raise Exception(
             f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
+            f"; text={page_notice_text()}"
         )
     raise Exception("未找到邮箱输入框或注册按钮")
 

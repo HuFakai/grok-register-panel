@@ -316,6 +316,54 @@ def test_async_probe_job_persists_health():
             proxy_store.probe_proxy = previous_probe
 
 
+def test_worker_proxy_details_datacenter_filter():
+    """面板开关开启时跳过机房/云段出口；关闭或无 ASN 数据时不拦。"""
+    with IsolatedStore():
+        imported = proxy_store.import_proxies(
+            "dc.example:8080:user:pass\nhome.example:8080:user:pass\nunknown.example:8080:u:p"
+        )
+        ids = imported["imported_ids"]
+        proxy_store._apply_probe_result(
+            ids[0],
+            {"ok": True, "exit_ip": "64.176.21.9", "asn": 6185,
+             "asn_org": "Oracle Cloud, Inc", "latency_ms": 100,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+        proxy_store._apply_probe_result(
+            ids[1],
+            {"ok": True, "exit_ip": "2.27.109.9", "asn": 2856,
+             "asn_org": "British Telecommunications PLC", "latency_ms": 120,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+        proxy_store._apply_probe_result(
+            ids[2],
+            {"ok": True, "exit_ip": "203.0.113.77", "latency_ms": 130,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+
+        # 开关关闭：三家都在（含无 ASN 数据的条目）
+        previous = proxy_store.MONITOR_CONTROL_PATH
+        try:
+            proxy_store.MONITOR_CONTROL_PATH = (
+                proxy_store.STATE_PATH.parent / "monitor_control.json"
+            )
+            proxy_store.MONITOR_CONTROL_PATH.write_text("{}", encoding="utf-8")
+            rows = proxy_store.worker_proxy_details()
+            assert len(rows) == 3
+            assert all("asn_org" in row and "asn" in row for row in rows)
+
+            # 开关开启：机房段被跳过；无 ASN 数据的条目保留（宁可不拦）
+            proxy_store.MONITOR_CONTROL_PATH.write_text(
+                '{"ip_pool_filter_datacenter": true}', encoding="utf-8"
+            )
+            assert proxy_store.datacenter_filter_enabled() is True
+            rows = proxy_store.worker_proxy_details()
+            ips = {row["exit_ip"] for row in rows}
+            assert ips == {"2.27.109.9", "203.0.113.77"}
+        finally:
+            proxy_store.MONITOR_CONTROL_PATH = previous
+
+
 def test_home_proxy_risk_stays_usable_and_cannot_disable():
     with IsolatedStore():
         imported = proxy_store.import_proxies("http://127.0.0.1:8003")
@@ -372,6 +420,7 @@ def test_1024_ports_never_enter_worker_pool():
 
 
 if __name__ == "__main__":
+    test_worker_proxy_details_datacenter_filter()
     test_normalize_proxy_formats_and_rejects_paths()
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_resin_session_template_is_safe_and_runtime_results_map_to_source()

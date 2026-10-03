@@ -81,6 +81,11 @@ FIELD_DEFINITIONS = {
         "type": "text",
         "placeholder": "mail.example.com, inbox.example.net",
     },
+    "cloudmail_domains": {
+        "label": "收信域名（CloudMail）",
+        "type": "text",
+        "placeholder": "mail.example.com, inbox.example.net",
+    },
     "cloudflare_path_domains": {
         "label": "域名接口",
         "type": "path",
@@ -208,6 +213,10 @@ FIELD_DEFINITIONS = {
     },
 }
 
+# 历史遗留键：旧版本 cloudmail 与 cloudflare 共用 defaultDomains，
+# 保存旧数据时仍放行（读取侧已改为优先 cloudmail_domains）。
+LEGACY_PROVIDER_FIELDS = {"cloudmail": ("defaultDomains",)}
+
 PROVIDER_FIELDS = {
     "cloudflare": (
         "cloudflare_api_base",
@@ -228,7 +237,7 @@ PROVIDER_FIELDS = {
         "cloudmail_url",
         "cloudmail_admin_email",
         "cloudmail_password",
-        "defaultDomains",
+        "cloudmail_domains",
     ),
     "moemail": (
         "moemail_api_base",
@@ -341,7 +350,7 @@ def _normalize_value(name: str, value: object):
             return normalize_domain(text)
         except EmailDomainValidationError as exc:
             raise EmailProviderConfigError(str(exc)) from exc
-    if name in {"defaultDomains", "inbucket_domain"}:
+    if name in {"defaultDomains", "cloudmail_domains", "inbucket_domain"}:
         return _normalize_domains(value)
     if field_type == "email":
         text = _string(value)
@@ -412,7 +421,7 @@ def _is_configured(provider: str, values: dict) -> bool:
                 "cloudmail_url",
                 "cloudmail_admin_email",
                 "cloudmail_password",
-                "defaultDomains",
+                "cloudmail_domains" if values.get("cloudmail_domains") else "defaultDomains",
             )
         )
     if provider == "moemail":
@@ -482,6 +491,7 @@ def _candidate_config(
     if not isinstance(settings, dict):
         raise EmailProviderConfigError("settings 必须是 JSON 对象")
     allowed = set(PROVIDER_FIELDS[normalized_provider])
+    allowed.update(LEGACY_PROVIDER_FIELDS.get(normalized_provider, ()))
     unknown = sorted(set(settings) - allowed)
     if unknown:
         raise EmailProviderConfigError(f"包含不支持的配置字段: {unknown[0]}")
@@ -717,6 +727,7 @@ def save_email_profile(
     if not isinstance(fields, dict):
         raise EmailProviderConfigError("fields 必须是 JSON 对象")
     allowed = set(PROVIDER_FIELDS[normalized_provider])
+    allowed.update(LEGACY_PROVIDER_FIELDS.get(normalized_provider, ()))
     unknown = sorted(set(fields) - allowed)
     if unknown:
         raise EmailProviderConfigError(f"包含不支持的配置字段: {unknown[0]}")

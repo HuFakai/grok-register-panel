@@ -196,6 +196,17 @@ def test_email_service_and_domain_rotation_panel_structure():
     assert 'on_email_domain_rejected' in flow
     assert 'on_email_accepted' in flow
 
+def test_ip_pool_datacenter_filter_toggle():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="ip-pool-filter-dc"' in html
+    assert '只用住宅出口' in html
+    assert 'function saveIpPoolDatacenterFilter(' in mon
+    assert 'ip_pool_filter_datacenter' in mon
+    # 注册限流失败分类
+    assert '注册限流' in mon
+
+
 def test_mail_cleanup_panel_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
@@ -345,5 +356,6 @@ if __name__ == '__main__':
     test_panel_security_and_recovery_structure()
     test_embedded_scripts_parse()
     test_sso_state_panel_structure()
+    test_ip_pool_datacenter_filter_toggle()
     test_mail_cleanup_panel_structure()
     print('OK structure')

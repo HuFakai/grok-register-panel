@@ -227,7 +227,7 @@ def create_mailbox(
     if not admin_password:
         raise Exception("CloudMail 管理员密码未配置")
     if not cleaned:
-        raise Exception("CloudMail 需要在 defaultDomains 中配置可用域名")
+        raise Exception("CloudMail 需要配置收信域名（cloudmail_domains）")
     domain = cleaned[_domain_index % len(cleaned)]
     _domain_index += 1
     address = f"{(username or generate_username(10))}@{domain}"

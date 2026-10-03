@@ -262,6 +262,7 @@ DEFAULT_CONFIG = {
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
     "cloudmail_password": "",
+    "cloudmail_domains": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -2115,7 +2116,10 @@ def cloudmail_get_email_and_token(domain=""):
     if selected_domain:
         domains = [selected_domain]
     else:
-        raw_domains = str(_profile_value("defaultDomains") or "")
+        # CloudMail 独立域名键优先；旧配置（与 CF 共用 defaultDomains）回退兼容
+        raw_domains = str(
+            _profile_value("cloudmail_domains") or _profile_value("defaultDomains") or ""
+        )
         domains = [
             item.strip()
             for item in re.split(r"[,，\s]+", raw_domains)
@@ -3566,7 +3570,8 @@ class GrokRegisterGUI:
         self.cloudmail_url_var = tk.StringVar(value=str(config.get("cloudmail_url", "")))
         self.cloudmail_admin_email_var = tk.StringVar(value=str(config.get("cloudmail_admin_email", "")))
         self.cloudmail_password_var = tk.StringVar(value=str(config.get("cloudmail_password", "")))
-        # CloudMail 也用 defaultDomains；与 CF 共用变量即可
+        # CloudMail 独立收信域名（旧版本与 CF 共用 defaultDomains，读取侧回退兼容）
+        self.cloudmail_domains_var = tk.StringVar(value=str(config.get("cloudmail_domains", "")))
         self._cloudmail_widgets = [
             p_label(0, 0, "站点 URL:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_url_var, width=52), 0, 1, columnspan=3),
@@ -3579,10 +3584,10 @@ class GrokRegisterGUI:
                 3,
             ),
             p_label(2, 0, "收信域名:"),
-            p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 2, 1),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_domains_var, width=34), 2, 1),
             p_label(2, 2, "说明:"),
             p_field(
-                tk_label(self.provider_frame, text="多个域名用逗号分隔", bg=UI_PANEL_BG),
+                tk_label(self.provider_frame, text="多个域名用逗号分隔（CloudMail 专用，不再与 Cloudflare 共用）", bg=UI_PANEL_BG),
                 2,
                 3,
                 sticky=tk.W,
@@ -4061,6 +4066,7 @@ class GrokRegisterGUI:
             config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
             config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
             config["defaultDomains"] = self.default_domains_var.get().strip()
+            config["cloudmail_domains"] = self.cloudmail_domains_var.get().strip()
             config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
             config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
             config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
@@ -4184,6 +4190,7 @@ class GrokRegisterGUI:
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
+        config["cloudmail_domains"] = self.cloudmail_domains_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
         config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
         config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
@@ -4290,8 +4297,8 @@ class GrokRegisterGUI:
                 missing.append("CloudMail 管理员邮箱")
             if not get_cloudmail_password():
                 missing.append("CloudMail 管理员密码")
-            if not config["defaultDomains"]:
-                missing.append("默认收信域名")
+            if not (config.get("cloudmail_domains") or config.get("defaultDomains")):
+                missing.append("CloudMail 收信域名")
             if missing:
                 self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
                 return
@@ -5210,6 +5217,24 @@ def run_registration_cli(count):
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
                         )
+                        throttled = "Email sign-up isn't available" in msg
+                        if throttled and retry < max_slot_retry:
+                            # xAI 邮箱注册限流（按时段/提交量节流，不是出口质量
+                            # 问题）：不记空页惩罚、不冷却/拉黑出口；退避后同
+                            # 槽位换口重试。
+                            retry += 1
+                            backoff = 90
+                            cli_log(
+                                f"[W{wid+1}] [!] 邮箱注册被限流"
+                                f"（Email sign-up isn't available），"
+                                f"退避 {backoff}s 后同槽位换口重试 "
+                                f"{retry}/{max_slot_retry}"
+                            )
+                            sleep_with_cancel(backoff, cancel_callback)
+                            if accounts_per_ip > 0:
+                                rotate_idx += 1
+                            retry_same_slot = True
+                            continue
                         if blank_ui:
                             # 空页（reload 已尝试仍空白/无表单）：直接判定槽位
                             # 失败，不再同槽位换口重试。首次空页只临时冷却该 IP
