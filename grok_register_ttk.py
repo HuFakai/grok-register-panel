@@ -5230,7 +5230,7 @@ def run_registration_cli(count):
                                 f"退避 {backoff}s 后同槽位换口重试 "
                                 f"{retry}/{max_slot_retry}"
                             )
-                            sleep_with_cancel(backoff, cancel_callback)
+                            sleep_with_cancel(backoff, controller.should_stop)
                             if accounts_per_ip > 0:
                                 rotate_idx += 1
                             retry_same_slot = True
