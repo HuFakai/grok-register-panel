@@ -191,6 +191,102 @@ def get_shared_token(
         return token
 
 
+def delete_mails(
+    http_post: HttpPost,
+    http_delete: HttpDelete,
+    url: str,
+    admin_email: str,
+    admin_password: str,
+    email_ids: List[Any],
+) -> int:
+    """永久删除指定邮件（DELETE /api/allEmail/delete?emailIds=1,2）。
+
+    每批 20 个逗号拼接；登录+删除保持原子（并发登录会使旧 JWT 失效），
+    认证失败重试一次。返回成功提交删除的数量。
+    """
+    ids = [str(item).strip() for item in email_ids if str(item).strip()]
+    if not url or not ids:
+        return 0
+    deleted = 0
+    for start in range(0, len(ids), 20):
+        batch = ids[start : start + 20]
+        last_error = None
+        with _admin_operation_lock:
+            for attempt in range(2):
+                try:
+                    jwt = login(http_post, url, admin_email, admin_password)
+                    resp = http_delete(
+                        f"{url}/api/allEmail/delete",
+                        params={"emailIds": ",".join(batch)},
+                        headers={"Content-Type": "application/json", "Authorization": jwt},
+                    )
+                    _response_data(resp, "删除邮件")
+                    deleted += len(batch)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).lower()
+                    is_auth_error = any(
+                        marker in message
+                        for marker in ("身份认证", "重新登录", "unauthorized", "401", "token")
+                    )
+                    if attempt == 0 and is_auth_error:
+                        continue
+                    raise
+    return deleted
+
+
+def purge_mailbox(
+    http_post: HttpPost,
+    http_delete: HttpDelete,
+    url: str,
+    admin_email: str,
+    admin_password: str,
+    email: str,
+    *,
+    max_rounds: int = 3,
+    size: int = 20,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> int:
+    """清空该地址的全部邮件（公开列表定位 + 管理端永久删除）。
+
+    单轮删除失败即停；返回成功删除的数量。用于验证码消费后/超时后
+    清理服务端残留，避免 CloudMail 邮件列表持续膨胀。
+    """
+    if not url or not email:
+        return 0
+    try:
+        public_token = get_shared_token(http_post, url, admin_email, admin_password)
+    except Exception:
+        return 0
+    deleted = 0
+    for _ in range(max(1, int(max_rounds))):
+        try:
+            messages = public_email_list(http_post, url, public_token, to_email=email, size=size)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CloudMail 清理邮件列表查询失败: {exc}")
+            break
+        ids = []
+        for msg in messages if isinstance(messages, list) else []:
+            if not isinstance(msg, dict):
+                continue
+            mid = msg.get("emailId") or msg.get("id") or msg.get("messageId")
+            if mid is not None and str(mid).strip():
+                ids.append(mid)
+        if not ids:
+            break
+        try:
+            deleted += delete_mails(http_post, http_delete, url, admin_email, admin_password, ids)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CloudMail 清理邮件删除失败: {exc}")
+            break
+        if len(messages) < size:
+            break
+    return deleted
+
+
 def cleanup_address(
     http_post: HttpPost,
     http_delete: HttpDelete,
@@ -336,6 +432,22 @@ def wait_for_code(
                 if code:
                     if log_callback:
                         log_callback(f"[*] CloudMail 从邮件中提取到验证码: {code}")
+                    # 验证码已到手，立即删除该封邮件（失败不阻塞取码）
+                    if msg_id:
+                        try:
+                            delete_mails(
+                                http_post,
+                                http_delete,
+                                url,
+                                admin_email,
+                                admin_password,
+                                [msg_id],
+                            )
+                            if log_callback:
+                                log_callback(f"[*] CloudMail 已删除验证码邮件 id={msg_id}")
+                        except Exception as exc:
+                            if log_callback:
+                                log_callback(f"[Debug] CloudMail 删除验证码邮件失败: {exc}")
                     return code
                 if log_callback:
                     log_callback(
@@ -345,4 +457,18 @@ def wait_for_code(
             sleep_with_cancel(poll_interval, cancel_callback)
         raise Exception(f"CloudMail 在 {timeout}s 内未收到验证码邮件")
     finally:
+        try:
+            purged = purge_mailbox(
+                http_post,
+                http_delete,
+                url,
+                admin_email,
+                admin_password,
+                email,
+                log_callback=log_callback,
+            )
+            if log_callback and purged:
+                log_callback(f"[*] CloudMail 已清理邮箱残留邮件 {purged} 封")
+        except Exception:
+            pass
         cleanup_address(http_post, http_delete, url, admin_email, admin_password, email)
