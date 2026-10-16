@@ -35,8 +35,10 @@ import sso_to_auth_json as _s2cpa
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
+from email_providers import inbucket as inbucket_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
+from email_providers import outlook_rt as outlook_rt_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
@@ -52,8 +54,17 @@ from account_exports import (
     consolidate_account_exports,
     save_account_record,
 )
-from ip_usage_store import get_ip_usage, get_per_ip_limit, record_ip_usage
+from ip_usage_store import (
+    get_ip_usage,
+    get_per_ip_limit,
+    is_soft_blacklisted,
+    record_blank_page,
+    record_ip_usage,
+    soft_blacklist_until,
+)
 from batch_supervisor import mark_slot_completed
+from batch_traffic import mark_successful_account
+from retry_policy import proxy_boot_rotations, slot_retries
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -63,8 +74,12 @@ from secure_files import (
     exclusive_file_lock,
 )
 from webui.proxy_store import (
+    IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
     mark_proxy_used as _mark_managed_proxy_used,
+    note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
+    restore_home_proxies as _restore_home_proxies,
+    worker_proxy_details as _managed_worker_proxy_details,
     worker_proxy_snapshot as _managed_worker_proxy_snapshot,
 )
 from webui.email_domain_store import (
@@ -74,6 +89,7 @@ from webui.email_domain_store import (
     select_domain as _select_managed_email_domain,
 )
 from webui.security_utils import redact_log_line as redact_sensitive_log_line
+from webui import ip_ready_pool
 from browser_session import (
 
     browser,
@@ -246,6 +262,7 @@ DEFAULT_CONFIG = {
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
     "cloudmail_password": "",
+    "cloudmail_domains": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -272,6 +289,12 @@ DEFAULT_CONFIG = {
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后换 token，写入 CPA / Grok2API
     "cpa_auto_add": False,
+    # JWT bfs 风控 claim 检测（与 botFlagSource 独立；access_token/sso 含 bfs 键即标记）
+    "bfs_check": True,
+    # bfs 命中时跳过 CPA/Grok2API 写入（账号记入 sso_bfs_flagged.txt）
+    "bfs_skip_cpa": False,
+    # bfs 命中时写入 CPA 记录 disabled=true
+    "bfs_disable_cpa": False,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
     # CPA 本地 auth 目录（默认项目根目录下 cpa_auth/）
@@ -281,6 +304,12 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     # 最新 Go 版 Grok2API 的 grok_build JSON 导入目录（默认 grok2api_auth/）
     "grok2api_auth_dir": "grok2api_auth",
+    # grok2api 管理 API（文档 /api/admin/v1）：Web SSO 上传 / 转 Build / 转 Console
+    "grok2api_admin_url": "",
+    "grok2api_admin_user": "",
+    "grok2api_admin_password": "",
+    "grok2api_auto_upload": False,
+    "grok2api_instant_upload": False,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -290,6 +319,13 @@ DEFAULT_CONFIG = {
     "moemail_api_key": "",
     "moemail_domain": "",
     "moemail_expiry_ms": moemail_provider.DEFAULT_EXPIRY_MS,
+    "inbucket_api_base": "",
+    "inbucket_domain": "",
+    "inbucket_random_levels": "0",
+    # Outlook MSA refresh_token 库存（jsonl: email + refresh_token）
+    "outlook_rt_inventory": "",
+    "outlook_rt_used_path": "",
+    "outlook_rt_client_id": outlook_rt_provider.DEFAULT_CLIENT_ID,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
     # 每个真实出口最多完成的账号槽位；0=不限（只按连续失败换 IP）。
@@ -300,6 +336,12 @@ DEFAULT_CONFIG = {
     # 单 IP 累计使用次数上限（所有任务累计，见 log/ip_usage.json）；
     # 0=不限。超过后下一轮必须更换 IP。
     "ip_usage_limit": 0,
+    # 可用 IP 池（log/ip_ready_pool.json）：面板后台预探测 sticky 身份筛出
+    # 未超限出口，worker 换口时优先取用。以下为池的默认参数（面板线程读取）。
+    "ip_pool_target": 20,          # 池内希望保持的可用身份数（不足则补探测）
+    "ip_pool_refresh_interval": 120,  # 后台补池周期（秒）
+    "ip_pool_probe_concurrency": 12,  # 每轮并发探测数
+    "ip_pool_identity_ttl": 600,   # sticky 会话有效期（秒），过期身份作废
     # 注册提交后的 SSO 获取策略：快速轮询 + 有界的 grok.com 推进重试。
     "sso_wait_timeout": 50,
     "sso_poll_interval": 0.5,
@@ -418,11 +460,14 @@ def record_register_result(
     worker: str = "",
     bot_flag=None,
     risk=None,
+    bfs=None,
+    bfs_value=None,
     log_callback=None,
 ) -> dict:
     """记录单次注册结果 + 出口 IP（控制台一行 + jsonl）。
 
     status: ok / fail / risk / sso_timeout / browser / other
+    bfs: True/False/None — JWT claim 检测（与 botFlagSource 不同）
     """
     import json as _json
     from datetime import datetime, timezone
@@ -468,11 +513,18 @@ def record_register_result(
         "port": port,
         "bot_flag": bot_flag,
         "risk": risk,
+        "bfs": bfs,
+        "bfs_value": bfs_value,
     }
+    bfs_txt = "-"
+    if bfs is True:
+        bfs_txt = f"yes:{bfs_value}" if bfs_value is not None else "yes"
+    elif bfs is False:
+        bfs_txt = "clean"
     line = (
         f"[结果] status={status} ip={exit_ip or '?'} port={port or '?'} "
         f"email={mask_email(email) if email else '-'} kind={kind or '-'} bot={bot_flag if bot_flag is not None else '-'} "
-        f"risk={risk if risk is not None else '-'}"
+        f"risk={risk if risk is not None else '-'} bfs={bfs_txt}"
     )
     if log_callback:
         try:
@@ -520,7 +572,13 @@ def classify_failure(exc) -> str:
         or "最终注册页资料填写失败" in msg
     ):
         return FAIL_PROFILE
-    if "未收到验证码" in msg or "验证码阶段失败" in msg or ("验证码" in msg and "失败" in msg):
+    if (
+        "未收到验证码" in msg
+        or "验证码阶段失败" in msg
+        or "0 封信" in msg
+        or "收件箱为空" in msg
+        or ("验证码" in msg and "失败" in msg)
+    ):
         return FAIL_CODE
     if "Page.goto" in msg or (
         "打开注册页失败" in msg and ("timeout" in low or "超时" in msg)
@@ -561,6 +619,18 @@ def load_config():
         except Exception:
             config = DEFAULT_CONFIG.copy()
     return config
+
+
+def _sleep_cancelable(seconds, should_stop=None) -> None:
+    """Sleep in short slices so stop flags can interrupt account gaps."""
+    end = time.time() + max(0.0, float(seconds or 0))
+    while time.time() < end:
+        if callable(should_stop) and should_stop():
+            return
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.5, remaining))
 
 
 def parse_account_interval() -> float:
@@ -662,6 +732,25 @@ _proxy_pool: list = []
 _proxy_pool_lock = threading.Lock()
 _proxy_pool_source = "none"
 _proxy_worker_assignments: dict[int, str] = {}
+_proxy_leases: dict = {}
+_proxy_lease_lock = threading.Lock()
+_submit_slot_lock = threading.Lock()
+_next_submit_at = 0.0
+# 各窗口提交邮箱至少隔这么久，避免同时打 xAI 验证码
+SIGNUP_SUBMIT_GAP_SECONDS = max(
+    0.0, float(os.environ.get("SIGNUP_SUBMIT_GAP_SECONDS", "7") or 7)
+)
+
+
+def reserve_signup_submit_slot(gap: float | None = None) -> float:
+    """预约下一次提交邮箱的时间，返回需要先等待的秒数。"""
+    global _next_submit_at
+    wait_gap = SIGNUP_SUBMIT_GAP_SECONDS if gap is None else max(0.0, float(gap))
+    with _submit_slot_lock:
+        now = time.time()
+        slot = now if _next_submit_at <= now else _next_submit_at
+        _next_submit_at = slot + wait_gap
+        return max(0.0, slot - now)
 
 
 def load_proxy_pool(path: str = "") -> list:
@@ -715,9 +804,28 @@ def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
+def release_proxy_lease(worker_id: int | None = None) -> None:
+    """释放某个 worker 占用的出口；worker_id 为空则清空。"""
+    with _proxy_lease_lock:
+        if worker_id is None:
+            _proxy_leases.clear()
+            return
+        _proxy_leases.pop(int(worker_id), None)
+
+
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
-    """账号边界热加载，全池轮换；当前浏览器会话内不再换代理。"""
+    """账号边界选口：跳过别人占用的，优先 40 分钟内没出现过的出口 IP。
+
+    风控前置：当前口的 IP 若在窗口内用过，即使 rotate_idx=0 也换一条冷 IP。
+    """
     pool = load_proxy_pool()
+    details = []
+    try:
+        details = list(_managed_worker_proxy_details() or [])
+    except Exception:
+        details = []
+    if details:
+        pool = [str(row.get("url") or "") for row in details if row.get("url")]
     if not pool:
         if _proxy_pool_source == "managed-empty" and not config.get(
             "proxy_fallback_to_local", False
@@ -725,32 +833,68 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             raise RuntimeError("面板代理池没有健康且启用的代理，请先检测或等待冷却结束")
         # 回退本地网络：config.proxy 可用则走本地代理；留空则浏览器直连
         return str(config.get("proxy", "") or "").strip()
-    worker_id = max(0, int(worker_id))
-    rotate_idx = max(0, int(rotate_idx))
-    idx = (worker_id + rotate_idx) % len(pool)
-    with _proxy_pool_lock:
-        occupied = {
-            proxy
-            for owner, proxy in _proxy_worker_assignments.items()
-            if owner != worker_id
-        }
-        selected_raw = next(
-            (
-                pool[(idx + offset) % len(pool)]
-                for offset in range(len(pool))
-                if expand_proxy_template(
-                    pool[(idx + offset) % len(pool)], worker_id, rotate_idx
-                ) not in occupied
-            ),
-            pool[idx],
-        )
-        selected = expand_proxy_template(selected_raw, worker_id, rotate_idx)
-        _proxy_worker_assignments[worker_id] = selected
+    wid = max(0, int(worker_id))
+    rot = max(0, int(rotate_idx))
+    by_url = {str(row.get("url") or ""): row for row in details}
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    def _age(url: str) -> float:
+        row = by_url.get(url) or {}
+        ip = str(row.get("exit_ip") or "").strip()
+        if not ip:
+            return 10**9
+        raw = str(row.get("last_used_at") or "")
+        if not raw:
+            return 10**9
+        try:
+            used = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return max(0.0, (now - used).total_seconds())
+        except Exception:
+            return 10**9
+
+    fresh = max(60, int(_PROXY_IP_FRESH_SECONDS or 2400))
+    with _proxy_lease_lock:
+        current = _proxy_leases.get(wid)
+        others = {url for owner, url in _proxy_leases.items() if owner != wid}
+        avoid = set(others)
+        if current and (_age(current) < fresh or rot > 0):
+            avoid.add(current)
+        # 同 IP 也避开（两条口偶发同一 sticky）
+        hot_ips = set()
+        for url, row in by_url.items():
+            ip = str(row.get("exit_ip") or "").strip()
+            if ip and _age(url) < fresh:
+                hot_ips.add(ip)
+        ranked = []
+        for offset, cand in enumerate(pool):
+            if cand in avoid:
+                continue
+            ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
+            if ip and ip in hot_ips and cand != current:
+                continue
+            ranked.append((-_age(cand), offset, cand))
+        ranked.sort()
+        selected = ranked[0][2] if ranked else ""
+        if not selected:
+            leftovers = [
+                (-_age(cand), idx, cand)
+                for idx, cand in enumerate(pool)
+                if cand not in others
+            ]
+            leftovers.sort()
+            selected = leftovers[0][2] if leftovers else ""
+        if not selected:
+            selected = pool[(wid + rot) % len(pool)]
+        _proxy_leases[wid] = selected
     try:
-        _mark_managed_proxy_used(selected_raw)
+        _mark_managed_proxy_used(selected)
     except Exception:
         pass
-    return selected
+    # Resin {session}/{worker} 模板展开为本 worker 的粘性身份
+    try:
+        return expand_proxy_template(selected, wid, rot)
+    except Exception:
+        return selected
 
 
 def release_proxy_for_worker(worker_id: int) -> None:
@@ -881,6 +1025,15 @@ def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
     except Exception:
         pass
     try:
+        if is_soft_blacklisted(exit_ip):
+            until = soft_blacklist_until(exit_ip)
+            if until > 0:
+                remain = int(until - time.time())
+                return False, exit_ip, f"空页临时冷却中（剩余 {remain}s）"
+            return False, exit_ip, "软拉黑中（累计空页达标）"
+    except Exception:
+        pass
+    try:
         limit = get_ip_usage_limit(exit_ip)
         used = get_ip_usage(exit_ip)
         if limit > 0 and used >= limit:
@@ -930,7 +1083,55 @@ def rotate_browser_to_new_exit(
     """Rotate endpoints and refuse to start a new account on an unchanged exit.
 
     不再按 Sticky 时长等待：只在轮询周期内（90 秒上限）反复换口核验。
+    优先从可用 IP 池（ip_ready_pool）取预筛过的 sticky 身份，池空才退回
+    随机试错。
     """
+    # 池择优：已预探测确认"未超限 + 非黑名单"的身份，直接核验使用，
+    # 避免起浏览器随机试错（树脂偏向分配已超限的热门节点）。
+    tried_ips = {previous_ip} if previous_ip else set()
+    pool_tries = 0
+    while pool_tries < 3:
+        item = ip_ready_pool.pick_usable(
+            f"W{worker_id + 1}",
+            frozenset(tried_ips),
+        )
+        if not item:
+            break
+        pool_tries += 1
+        try:
+            stop_browser()
+        except Exception:
+            pass
+        proxy = str(item.get("expanded_url") or "")
+        set_thread_proxy(proxy)
+        log_callback(
+            f"[*] [IP策略] 可用池取出口 {item.get('exit_ip') or '?'} "
+            f"（身份 {redact_proxy(proxy)}）"
+        )
+        try:
+            start_browser(log_callback=log_callback)
+        except Exception as exc:
+            ip_ready_pool.remove_item(item.get("id") or "")
+            tried_ips.add(item.get("exit_ip") or "")
+            log_callback(
+                f"[!] [IP策略] 池身份启动失败: "
+                f"{redact_sensitive_log_line(str(exc))}，换下一个"
+            )
+            continue
+        current_ip = get_exit_ip() or ""
+        if current_ip and (not previous_ip or current_ip != previous_ip):
+            ip_ready_pool.remove_item(item.get("id") or "")
+            log_callback(
+                f"[+] [IP策略] 池身份核验通过: "
+                f"{previous_ip or '?'} → {current_ip}"
+            )
+            return rotate_idx, current_ip, time.monotonic()
+        ip_ready_pool.remove_item(item.get("id") or "")
+        tried_ips.add(current_ip or "")
+        log_callback(
+            f"[!] [IP策略] 池身份出口仍为 {current_ip or '?'}，弃用换下一个"
+        )
+
     checks_per_pass = min(proxy_count_for_worker(worker_id), 24)
     deadline = time.monotonic() + 90
     checked = 0
@@ -1014,10 +1215,19 @@ def record_proxy_boot_failure(proxy: str, exc) -> None:
         pass
 
 
-_MAIL_DIRECT_MARKERS = (
-    "mail-api.example.com",
-    "hermaly.com",
-    "example.com",
+def _record_proxy_precheck_failure(proxy: str, checks) -> bool:
+    for name, ok, detail in checks or []:
+        if name != _conn.XAI_SIGNUP_CHECK_NAME or ok:
+            continue
+        record_proxy_boot_failure(
+            proxy,
+            RuntimeError(f"xAI registration-page precheck failed: {detail}"),
+        )
+        return True
+    return False
+
+
+_MAIL_DIRECT_PATH_MARKERS = (
     "/admin/new_address",
     "/api/mails",
     "/api/mail/",
@@ -1027,7 +1237,18 @@ _MAIL_DIRECT_MARKERS = (
 
 def _url_needs_direct(url: str) -> bool:
     u = str(url or "").lower()
-    return any(m in u for m in _MAIL_DIRECT_MARKERS)
+    configured_bases = (
+        config.get("cloudflare_api_base"),
+        config.get("cloudmail_url"),
+        config.get("moemail_api_base"),
+        config.get("duckmail_api_base"),
+        config.get("inbucket_api_base"),
+    )
+    for value in configured_bases:
+        base = str(value or "").strip().lower().rstrip("/")
+        if base and (u == base or u.startswith(base + "/")):
+            return True
+    return any(marker in u for marker in _MAIL_DIRECT_PATH_MARKERS)
 
 
 def _apply_mail_direct(url, request_kwargs: dict) -> dict:
@@ -1105,6 +1326,18 @@ def _pick_list_payload(data):
     return _pick_list(data)
 
 
+def cloudflare_randomize_subdomain_enabled() -> bool:
+    """主域易被风控时挂随机子域（需 CF Email Routing 对 *.apex catch-all）。
+
+    配置 cloudflare_randomize_subdomain：true/false，默认 false（多数服务端
+    只接受已配置域名；本地 catch-all 免建号依赖固定域名匹配）。
+    """
+    raw = config.get("cloudflare_randomize_subdomain", False)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def cloudflare_create_temp_address(api_base, domain=""):
     selected_domain = str(domain or "").strip() or cloudflare_next_default_domain()
     return cloudflare_provider.create_temp_address(
@@ -1116,9 +1349,8 @@ def cloudflare_create_temp_address(api_base, domain=""):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
-        # 默认不随机子域（多数服务端只接受已配置域名）；需随机时在
-        # config 开启 cloudflare_randomize_subdomain
-        randomize_subdomain=bool(config.get("cloudflare_randomize_subdomain", False)),
+        # 有管理域名时也按配置决定是否随机子域（避免根域被批量风控）
+        randomize_subdomain=cloudflare_randomize_subdomain_enabled(),
     )
 
 
@@ -1272,6 +1504,35 @@ def _append_sso_risk_rejected(email: str, sso: str, details: str, log_callback=N
             log_callback(f"[CPA] 保存注册风控拒绝记录失败: {exc}")
 
 
+def _enqueue_instant_grok2api(email: str, sso: str, password: str, task_subdir=None, log_callback=None):
+    """注册成功即触发 grok2api 即时上传（一号一传，后台异步）。
+
+    入队毫秒级返回，任何异常静默——绝不阻塞注册流程。
+    """
+    try:
+        from webui.grok2api_instant import enqueue_instant_upload
+
+        if enqueue_instant_upload(email, sso, password, task_subdir=task_subdir):
+            if log_callback:
+                log_callback(f"[grok2api] 已入队即时上传: {email}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[grok2api] 即时上传入队失败（忽略）: {exc}")
+
+
+def _append_sso_bfs_flagged(email: str, sso: str, details: str, log_callback=None):
+    """保存 JWT bfs 标记账号（access_token/sso 含 bfs claim）。"""
+    try:
+        path = accounts_side_file("sso_bfs_flagged.txt")
+        safe_details = re.sub(r"[\r\n\t]+", " ", str(details or "")).strip()
+        append_private_text(path, f"{email}----{sso}----{safe_details}\n")
+        if log_callback:
+            log_callback(f"[CPA] 已保存 bfs 标记记录 → {path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[CPA] 保存 bfs 标记记录失败: {exc}")
+
+
 def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
     """检查新账号是否被注册风控拒绝；无法判定时继续原有 OAuth 路径。"""
     if not config.get("cpa_auto_add", False):
@@ -1416,11 +1677,69 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             _cpa_log("换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
-        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
+
+        # JWT bfs 检测（与 botFlagSource 独立；key 存在即标记）
+        bfs_check = config.get("bfs_check", True)
+        if isinstance(bfs_check, str):
+            bfs_check = bfs_check.strip().lower() not in ("0", "false", "no", "off")
+        bfs_info = {"ok": False, "has_bfs": False, "bfs": None, "source": ""}
+        if bfs_check:
+            bfs_info = _s2cpa.inspect_token_bundle_bfs(
+                access_token=str(token.get("access_token") or ""),
+                sso=sso,
+                id_token=str(token.get("id_token") or ""),
+                refresh_token=str(token.get("refresh_token") or ""),
+            )
+            skip_cpa = config.get("bfs_skip_cpa", False)
+            if isinstance(skip_cpa, str):
+                skip_cpa = skip_cpa.strip().lower() in ("1", "true", "yes", "on")
+            if not bfs_info.get("ok"):
+                _cpa_log("JWT bfs 检测: unknown（无法解码 token）")
+                if skip_cpa:
+                    _append_sso_pending(email, sso, log_callback=log_callback)
+                    _cpa_log("bfs_skip_cpa=true，未知状态不写入 CPA/Grok2API，已进入待重转队列")
+                    return False
+            elif bfs_info.get("has_bfs"):
+                detail = (
+                    f"bfs={bfs_info.get('bfs')!r} source={bfs_info.get('source') or '-'}"
+                )
+                _cpa_log(f"JWT bfs 标记: {detail}")
+                _append_sso_bfs_flagged(email, sso, detail, log_callback=log_callback)
+                if skip_cpa:
+                    _cpa_log("bfs_skip_cpa=true，跳过 CPA/Grok2API 写入")
+                    try:
+                        record_register_result(
+                            "ok",
+                            email or "",
+                            kind="bfs_flagged",
+                            detail=detail,
+                            bfs=True,
+                            bfs_value=bfs_info.get("bfs"),
+                            log_callback=log_callback,
+                        )
+                    except Exception:
+                        pass
+                    return False
+            else:
+                _cpa_log("JWT bfs 检测: clean")
+
+        record = _s2cpa.token_to_cpa_record(
+            token,
+            email=email,
+            sso=sso,
+            bfs_info=bfs_info if bfs_check else None,
+            check_bfs=bool(bfs_check),
+        )
         ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
         ref = ap.get("referrer")
         if ref:
             _cpa_log(f"access_token referrer={ref!r}")
+        disable_bfs = config.get("bfs_disable_cpa", False)
+        if isinstance(disable_bfs, str):
+            disable_bfs = disable_bfs.strip().lower() in ("1", "true", "yes", "on")
+        if disable_bfs and record.get("bfs") is True:
+            record["disabled"] = True
+            _cpa_log("bfs 账号已标记 disabled=true")
         wrote_ok = False
         if auth_dir:
             try:
@@ -1447,6 +1766,20 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             _cpa_log("token 已换出但 CPA/Grok2API 均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
+        # 成功写入后把 bfs 记入结果日志（ok 状态由上层注册成功路径再记一次时可能覆盖；此处补一条细节）
+        if bfs_check and bfs_info.get("has_bfs"):
+            try:
+                record_register_result(
+                    "ok",
+                    email or "",
+                    kind="bfs_flagged",
+                    detail=f"bfs={bfs_info.get('bfs')!r} source={bfs_info.get('source') or '-'}",
+                    bfs=True,
+                    bfs_value=bfs_info.get("bfs"),
+                    log_callback=log_callback,
+                )
+            except Exception:
+                pass
         return True
     except Exception as exc:
         _cpa_log(f"直出失败: {redact_sensitive_log_line(str(exc))}")
@@ -1783,7 +2116,10 @@ def cloudmail_get_email_and_token(domain=""):
     if selected_domain:
         domains = [selected_domain]
     else:
-        raw_domains = str(_profile_value("defaultDomains") or "")
+        # CloudMail 独立域名键优先；旧配置（与 CF 共用 defaultDomains）回退兼容
+        raw_domains = str(
+            _profile_value("cloudmail_domains") or _profile_value("defaultDomains") or ""
+        )
         domains = [
             item.strip()
             for item in re.split(r"[,，\s]+", raw_domains)
@@ -2052,9 +2388,15 @@ def get_email_and_token(api_key=None):
                         auth_mode=get_cloudflare_auth_mode(),
                         custom_auth=get_cloudflare_custom_auth(),
                         domain=managed_domain,
+                        randomize_subdomain=cloudflare_randomize_subdomain_enabled(),
                     )
-                except Exception:
-                    raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
+                except Exception as fallback_exc:
+                    primary_message = redact_sensitive_log_line(str(primary_exc))[:240]
+                    fallback_message = redact_sensitive_log_line(str(fallback_exc))[:240]
+                    raise Exception(
+                        "Cloudflare 创建邮箱失败: "
+                        f"{primary_message} | fallback: {fallback_message}"
+                    ) from primary_exc
 
         # catch-all 免建号优先：配置了 JWT_SECRET 时用随机地址 + 自签 JWT
         # 收信，跳过建号 API；任何异常回退 admin 建号
@@ -2070,6 +2412,10 @@ def get_email_and_token(api_key=None):
             result = _admin_create()
     elif provider == "mailnest":
         result = mailnest_buy_email(), "_"
+    elif provider == "inbucket":
+        result = inbucket_get_email_and_token(domain=managed_domain)
+    elif provider == "outlook_rt":
+        result = outlook_rt_take_mailbox()
     else:
         result = duckmail_provider.create_mailbox(
             http_get,
@@ -2087,6 +2433,120 @@ def get_email_and_token(api_key=None):
         except Exception:
             pass
     return result
+
+
+def get_inbucket_api_base():
+    raw = (
+        os.environ.get("INBUCKET_API_BASE")
+        or config.get("inbucket_api_base")
+        or ""
+    )
+    return inbucket_provider.normalize_base(str(raw))
+
+
+def get_inbucket_domain():
+    return str(config.get("inbucket_domain", "") or "").strip()
+
+
+def get_inbucket_random_levels():
+    return str(config.get("inbucket_random_levels", "0") or "0").strip()
+
+
+def inbucket_get_email_and_token(domain=""):
+    address, mailbox = inbucket_provider.create_address(
+        str(domain or "").strip() or get_inbucket_domain(),
+        random_levels=get_inbucket_random_levels(),
+    )
+    print(f"[*] 已生成 Inbucket 邮箱: {address}")
+    return address, mailbox
+
+
+def inbucket_get_oai_code(
+    mailbox,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del mailbox
+    return inbucket_provider.wait_for_code(
+        http_get,
+        get_inbucket_api_base(),
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        http_delete=http_delete,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
+
+
+def get_outlook_rt_inventory():
+    return str(config.get("outlook_rt_inventory", "") or "").strip()
+
+
+def get_outlook_rt_used_path():
+    return str(config.get("outlook_rt_used_path", "") or "").strip()
+
+
+def get_outlook_rt_client_id():
+    return (
+        str(config.get("outlook_rt_client_id", "") or "").strip()
+        or outlook_rt_provider.DEFAULT_CLIENT_ID
+    )
+
+
+def outlook_rt_take_mailbox():
+    inv = get_outlook_rt_inventory()
+    if not inv:
+        raise Exception(
+            "请在配置中填写 outlook_rt_inventory（jsonl/文本库存路径，"
+            "字段 email + refresh_token）"
+        )
+    # 取号后立刻 refresh + Inbox 预检：空箱/死 RT 秒退并 mark used
+    def _log(msg: str) -> None:
+        try:
+            cli_log(msg)
+        except Exception:
+            print(msg, flush=True)
+
+    return outlook_rt_provider.take_mailbox(
+        inv,
+        used_path=get_outlook_rt_used_path(),
+        default_client_id=get_outlook_rt_client_id(),
+        http_post=http_post,
+        http_get=http_get,
+        log_callback=_log,
+        max_attempts=20,
+        skip_empty_inbox=True,
+    )
+
+
+def outlook_rt_get_code(
+    token_key,
+    email,
+    timeout=180,
+    poll_interval=4,
+    log_callback=None,
+    cancel_callback=None,
+):
+    return outlook_rt_provider.wait_for_code(
+        http_get,
+        http_post,
+        token_key,
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
 
 
 def get_oai_code(
@@ -2146,6 +2606,25 @@ def get_oai_code(
             email,
             timeout=timeout,
             poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    if provider == "inbucket":
+        return inbucket_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "outlook_rt":
+        return outlook_rt_get_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=max(3, int(poll_interval or 4)),
             log_callback=log_callback,
             cancel_callback=cancel_callback,
         )
@@ -2214,6 +2693,15 @@ def cloudflare_get_oai_code(
         resend_callback=resend_callback,
         # 验证码提取成功后即删除该邮件（admin 凭证；失败仅记日志，不阻塞）
         on_code_mail=lambda mid: cloudflare_delete_mail(mid, log_callback=log_callback),
+        # 超时后清理该邮箱残留（解析失败的/迟到的）邮件，避免服务端存储持续膨胀
+        http_delete=http_delete,
+        purge_on_failure=True,
+        # catch-all 自签 JWT 在 Worker v1.10+/v1.12 的 /api/mails 会被拒
+        # （要求 address_id>0 且地址已注册）；admin 凭证可用时改走管理端轮询
+        poll_via_admin=(
+            get_cloudflare_auth_mode() == "x-admin-auth"
+            and bool(get_cloudflare_api_key())
+        ),
     )
 
 
@@ -2237,6 +2725,38 @@ def cloudflare_delete_mail(mail_id, *, log_callback=None):
         if log_callback:
             log_callback(f"[Debug] 删除验证码邮件失败 id={mail_id}: {exc}")
         return None
+
+
+def purge_cloudflare_mailbox_quiet(dev_token, email="", *, log_callback=None):
+    """清空该 Cloudflare 邮箱全部邮件（注册收尾调用）。
+
+    覆盖验证码提取后由 resend 迟到/解析失败残留的邮件，遏制服务端
+    邮件表（D1/SQLite）持续膨胀。非 cloudflare provider 或任何异常都静默跳过。
+    """
+    if not dev_token:
+        return 0
+    try:
+        if get_email_provider() != "cloudflare":
+            return 0
+        count = cloudflare_provider.purge_mailbox(
+            http_get,
+            http_delete,
+            get_cloudflare_api_base(),
+            dev_token,
+            messages_path=get_cloudflare_path("cloudflare_path_messages", "/messages"),
+            api_key=get_cloudflare_api_key(),
+            auth_mode=get_cloudflare_auth_mode(),
+            custom_auth=get_cloudflare_custom_auth(),
+            poll_via_admin=(
+                get_cloudflare_auth_mode() == "x-admin-auth"
+                and bool(get_cloudflare_api_key())
+            ),
+        )
+        if count and log_callback:
+            log_callback(f"[*] 已清理邮箱残留邮件 {count} 封")
+        return count
+    except Exception:
+        return 0
 
 
 def generate_random_birthdate():
@@ -2876,7 +3396,16 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail", "moemail"],
+            [
+                "duckmail",
+                "yyds",
+                "cloudflare",
+                "mailnest",
+                "cloudmail",
+                "moemail",
+                "outlook_rt",
+                "inbucket",
+            ],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
@@ -3051,7 +3580,8 @@ class GrokRegisterGUI:
         self.cloudmail_url_var = tk.StringVar(value=str(config.get("cloudmail_url", "")))
         self.cloudmail_admin_email_var = tk.StringVar(value=str(config.get("cloudmail_admin_email", "")))
         self.cloudmail_password_var = tk.StringVar(value=str(config.get("cloudmail_password", "")))
-        # CloudMail 也用 defaultDomains；与 CF 共用变量即可
+        # CloudMail 独立收信域名（旧版本与 CF 共用 defaultDomains，读取侧回退兼容）
+        self.cloudmail_domains_var = tk.StringVar(value=str(config.get("cloudmail_domains", "")))
         self._cloudmail_widgets = [
             p_label(0, 0, "站点 URL:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_url_var, width=52), 0, 1, columnspan=3),
@@ -3064,10 +3594,10 @@ class GrokRegisterGUI:
                 3,
             ),
             p_label(2, 0, "收信域名:"),
-            p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 2, 1),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_domains_var, width=34), 2, 1),
             p_label(2, 2, "说明:"),
             p_field(
-                tk_label(self.provider_frame, text="多个域名用逗号分隔", bg=UI_PANEL_BG),
+                tk_label(self.provider_frame, text="多个域名用逗号分隔（CloudMail 专用，不再与 Cloudflare 共用）", bg=UI_PANEL_BG),
                 2,
                 3,
                 sticky=tk.W,
@@ -3134,6 +3664,115 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # Outlook RT 库存（jsonl: email + refresh_token）
+        self.outlook_rt_inventory_var = tk.StringVar(
+            value=str(config.get("outlook_rt_inventory", "") or "")
+        )
+        self.outlook_rt_used_path_var = tk.StringVar(
+            value=str(config.get("outlook_rt_used_path", "") or "")
+        )
+        self.outlook_rt_client_id_var = tk.StringVar(
+            value=str(
+                config.get("outlook_rt_client_id", outlook_rt_provider.DEFAULT_CLIENT_ID)
+                or outlook_rt_provider.DEFAULT_CLIENT_ID
+            )
+        )
+        self._outlook_rt_widgets = [
+            p_label(0, 0, "库存文件:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_rt_inventory_var,
+                    width=52,
+                ),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "已用记录（可选）:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_rt_used_path_var,
+                    width=34,
+                ),
+                1,
+                1,
+            ),
+            p_label(1, 2, "Client ID:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_rt_client_id_var,
+                    width=34,
+                ),
+                1,
+                3,
+            ),
+            p_label(2, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="jsonl: email+refresh_token；取号非购买；Graph 收信",
+                    bg=UI_PANEL_BG,
+                ),
+                2,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
+        # Inbucket 自建临时邮箱（实例地址 + 收信根域名，可随机子域）
+        self.inbucket_api_base_var = tk.StringVar(
+            value=str(config.get("inbucket_api_base", "") or "")
+        )
+        self.inbucket_domain_var = tk.StringVar(
+            value=str(config.get("inbucket_domain", "") or "")
+        )
+        self.inbucket_random_levels_var = tk.StringVar(
+            value=str(config.get("inbucket_random_levels", "0") or "0")
+        )
+        self._inbucket_widgets = [
+            p_label(0, 0, "实例地址:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.inbucket_api_base_var, width=52),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "收信根域名:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.inbucket_domain_var, width=34),
+                1,
+                1,
+            ),
+            p_label(1, 2, "随机子域级数:"),
+            p_field(
+                tk_option_menu(
+                    self.provider_frame,
+                    self.inbucket_random_levels_var,
+                    ["0", "1", "2", "1-2", "1-3"],
+                    width=8,
+                ),
+                1,
+                3,
+                sticky=tk.W,
+            ),
+            p_label(2, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="多个根域名用逗号分隔；随机子域需泛解析",
+                    bg=UI_PANEL_BG,
+                ),
+                2,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
         self._provider_widget_groups = {
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
@@ -3141,6 +3780,8 @@ class GrokRegisterGUI:
             "mailnest": self._mailnest_widgets,
             "cloudmail": self._cloudmail_widgets,
             "moemail": self._moemail_widgets,
+            "outlook_rt": self._outlook_rt_widgets,
+            "inbucket": self._inbucket_widgets,
         }
 
         add_label(3, 0, "并发数（可选）:")
@@ -3245,6 +3886,15 @@ class GrokRegisterGUI:
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.grok2api_auth_dir_var = tk.StringVar(value=str(config.get("grok2api_auth_dir", "")))
+        self.grok2api_admin_url_var = tk.StringVar(value=str(config.get("grok2api_admin_url", "")))
+        self.grok2api_admin_user_var = tk.StringVar(value=str(config.get("grok2api_admin_user", "")))
+        self.grok2api_admin_password_var = tk.StringVar(value=str(config.get("grok2api_admin_password", "")))
+        self.grok2api_auto_upload_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_auto_upload", False))
+        )
+        self.grok2api_instant_upload_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_instant_upload", False))
+        )
         c_label(2, 0, "CPA auth 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 2, 1, columnspan=3)
         c_label(3, 0, "远程地址:")
@@ -3253,6 +3903,16 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 3, 3)
         c_label(4, 0, "Grok2API 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 4, 1, columnspan=3)
+        c_label(5, 0, "Grok2API 服务:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_url_var, width=34), 5, 1)
+        c_label(5, 2, "管理账号:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_user_var, width=26), 5, 3)
+        c_label(6, 0, "管理密码:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_password_var, width=52, show="*"), 6, 1, columnspan=3)
+        c_label(7, 0, "批次后自动上传:")
+        c_field(tk_checkbutton(self.cpa_frame, text="注册批次完成后自动上传到 grok2api", variable=self.grok2api_auto_upload_var), 7, 1, columnspan=3)
+        c_label(8, 0, "注册成功即上传:")
+        c_field(tk_checkbutton(self.cpa_frame, text="获取到 SSO 后立即上传 grok2api（一号一传，后台异步）", variable=self.grok2api_instant_upload_var), 8, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
@@ -3335,6 +3995,8 @@ class GrokRegisterGUI:
             "mailnest": "MailNest 配置",
             "cloudmail": "CloudMail 配置",
             "moemail": "MoeMail 配置",
+            "outlook_rt": "Outlook RT 库存配置",
+            "inbucket": "Inbucket 自建邮箱配置",
         }
         self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
         for widgets in self._provider_widget_groups.values():
@@ -3414,6 +4076,7 @@ class GrokRegisterGUI:
             config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
             config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
             config["defaultDomains"] = self.default_domains_var.get().strip()
+            config["cloudmail_domains"] = self.cloudmail_domains_var.get().strip()
             config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
             config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
             config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
@@ -3428,6 +4091,15 @@ class GrokRegisterGUI:
                 self.moemail_expiry_ms_var.get().strip()
                 or moemail_provider.DEFAULT_EXPIRY_MS
             )
+            config["outlook_rt_inventory"] = self.outlook_rt_inventory_var.get().strip()
+            config["outlook_rt_used_path"] = self.outlook_rt_used_path_var.get().strip()
+            config["outlook_rt_client_id"] = (
+                self.outlook_rt_client_id_var.get().strip()
+                or outlook_rt_provider.DEFAULT_CLIENT_ID
+            )
+            config["inbucket_api_base"] = self.inbucket_api_base_var.get().strip()
+            config["inbucket_domain"] = self.inbucket_domain_var.get().strip()
+            config["inbucket_random_levels"] = self.inbucket_random_levels_var.get().strip()
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
             if "协议" in _mode_text:
@@ -3442,6 +4114,11 @@ class GrokRegisterGUI:
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+            config["grok2api_admin_url"] = self.grok2api_admin_url_var.get().strip()
+            config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+            config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
+            config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+            config["grok2api_instant_upload"] = bool(self.grok2api_instant_upload_var.get())
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -3523,6 +4200,7 @@ class GrokRegisterGUI:
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
+        config["cloudmail_domains"] = self.cloudmail_domains_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
         config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
         config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
@@ -3544,6 +4222,15 @@ class GrokRegisterGUI:
             )
         except ValueError:
             config["moemail_expiry_ms"] = moemail_provider.DEFAULT_EXPIRY_MS
+        config["outlook_rt_inventory"] = self.outlook_rt_inventory_var.get().strip()
+        config["outlook_rt_used_path"] = self.outlook_rt_used_path_var.get().strip()
+        config["outlook_rt_client_id"] = (
+            self.outlook_rt_client_id_var.get().strip()
+            or outlook_rt_provider.DEFAULT_CLIENT_ID
+        )
+        config["inbucket_api_base"] = self.inbucket_api_base_var.get().strip()
+        config["inbucket_domain"] = self.inbucket_domain_var.get().strip()
+        config["inbucket_random_levels"] = self.inbucket_random_levels_var.get().strip()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()
         if "协议" in _mode_text:
@@ -3558,6 +4245,11 @@ class GrokRegisterGUI:
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
         config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+        config["grok2api_admin_url"] = self.grok2api_admin_url_var.get().strip()
+        config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get().strip()
+        config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+        config["grok2api_instant_upload"] = bool(self.grok2api_instant_upload_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -3579,6 +4271,25 @@ class GrokRegisterGUI:
         if config["email_provider"] == "mailnest" and not config["mailnest_api_key"]:
             self.log("[!] MailNest 模式需要先填写 MailNest API Key")
             return
+        if config["email_provider"] == "outlook_rt":
+            inv = get_outlook_rt_inventory()
+            if not inv:
+                self.log("[!] Outlook RT 模式需要填写库存文件路径（jsonl）")
+                return
+            from pathlib import Path as _Path
+
+            if not _Path(inv).expanduser().is_file():
+                self.log(f"[!] Outlook RT 库存文件不存在: {inv}")
+                return
+        if config["email_provider"] == "inbucket":
+            missing = []
+            if not get_inbucket_api_base():
+                missing.append("Inbucket 实例地址")
+            if not get_inbucket_domain():
+                missing.append("收信根域名")
+            if missing:
+                self.log(f"[!] Inbucket 模式缺少配置: {', '.join(missing)}")
+                return
         if config["email_provider"] == "moemail":
             missing = []
             if not get_moemail_api_base():
@@ -3596,8 +4307,8 @@ class GrokRegisterGUI:
                 missing.append("CloudMail 管理员邮箱")
             if not get_cloudmail_password():
                 missing.append("CloudMail 管理员密码")
-            if not config["defaultDomains"]:
-                missing.append("默认收信域名")
+            if not (config.get("cloudmail_domains") or config.get("defaultDomains")):
+                missing.append("CloudMail 收信域名")
             if missing:
                 self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
                 return
@@ -3758,7 +4469,7 @@ class GrokRegisterGUI:
             wlog("[*] 浏览器已启动")
             i = 0
             retry_count_for_slot = 0
-            max_slot_retry = 3
+            max_slot_retry = slot_retries()
             retry_same_slot = False
             while True:
                 if self.should_stop():
@@ -3828,6 +4539,8 @@ class GrokRegisterGUI:
                         log_callback=wlog,
                         cancel_callback=self.should_stop,
                         **get_sso_wait_policy(),
+                        email=email,
+                        password=profile.get("password", ""),
                     )
                     ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
                     if config.get("enable_nsfw", True):
@@ -3872,6 +4585,16 @@ class GrokRegisterGUI:
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
                     cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    _enqueue_instant_grok2api(
+                        email,
+                        sso,
+                        profile.get("password", ""),
+                        task_subdir=task_subdir,
+                        log_callback=wlog,
+                    )
+                    purge_cloudflare_mailbox_quiet(
+                        dev_token, email, log_callback=wlog
+                    )
                     self._record_success()
                     retry_count_for_slot = 0
                     if cpa_ok:
@@ -4037,9 +4760,16 @@ def run_registration_cli(count):
     fail_count = 0
     fail_stats = empty_fail_stats()
     retry_count_for_slot = 0
-    max_slot_retry = 3
+    max_slot_retry = slot_retries()
+    max_proxy_boot_rotations = proxy_boot_rotations()
     accounts_output_file = ""  # 已改为按邮箱单独保存，不再使用批量文件
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 24, int(count or 1)))
+    try:
+        home = _restore_home_proxies()
+        if int(home.get("restored") or 0) > 0:
+            cli_log(f"[*] 已恢复家宽出口 {home.get('restored')} 条（风控不冷却）")
+    except Exception:
+        pass
     pool = load_proxy_pool()
     cli_log(
         f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | "
@@ -4099,21 +4829,34 @@ def run_registration_cli(count):
                 f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
                 f"{redact_sensitive_log_line(detail)}"
             )
-        if _conn.has_blocking_xai_failure(startup_checks) and not config.get(
-            "proxy_fallback_to_local", False
-        ):
-            cli_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+        if _conn.has_blocking_xai_failure(startup_checks):
+            _record_proxy_precheck_failure(
+                str(startup_config.get("proxy") or ""),
+                startup_checks,
+            )
+            cli_log("[!] xAI 注册页预检失败，已停止当前批次；请检查或更换当前 proxy 后重试")
             set_current_task_subdir(None)
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
             except Exception:
                 pass
-            return
+            _conn.require_xai_signup(startup_checks)
+    except _conn.XaiSignupPrecheckFailed:
+        set_current_task_subdir(None)
+        raise
     except Exception as exc:
         cli_log(
-            f"[!] 启动连通性检查异常，继续注册: "
+            f"[!] 启动连通性检查异常，已停止当前批次: "
             f"{redact_sensitive_log_line(str(exc))}"
         )
+        set_current_task_subdir(None)
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        raise _conn.XaiSignupPrecheckFailed(
+            "xAI registration page precheck raised an exception"
+        ) from exc
 
     def _cli_record_failure(exc):
         nonlocal fail_count
@@ -4169,6 +4912,25 @@ def run_registration_cli(count):
                                 )
                             )
                             continue
+                        try:
+                            if is_soft_blacklisted(current_ip):
+                                cli_log(
+                                    f"[W{wid+1}] [*] [IP策略] 跳过出口 {current_ip}："
+                                    "空页软拉黑/冷却中"
+                                )
+                                current_rotate_idx, current_ip, current_started_at = (
+                                    rotate_browser_to_new_exit(
+                                        wid,
+                                        current_rotate_idx,
+                                        current_ip,
+                                        current_started_at,
+                                        log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                        cancel_callback=controller.should_stop,
+                                    )
+                                )
+                                continue
+                        except Exception:
+                            pass
                     claimed, used, reason = ip_quota.claim(wid, current_ip)
                     if claimed:
                         return (
@@ -4224,7 +4986,7 @@ def run_registration_cli(count):
                     # 黑名单/死代理/预检不通过：多换几条 sticky 再放弃
                     booted = False
                     last_boot = boot_exc
-                    for _try in range(1, 12):
+                    for _try in range(1, max_proxy_boot_rotations + 1):
                         msgb = str(last_boot)
                         if not (
                             "出口IP命中黑名单" in msgb
@@ -4293,6 +5055,18 @@ def run_registration_cli(count):
                         i = claimed
                     slot_start_i = i
                     try:
+                        # 先绑定槽位相关局部变量：fill_email_and_submit 在
+                        # 空页等场景会于赋值前抛异常，except 块引用 email 时
+                        # 若未初始化会 UnboundLocalError 直接杀死 worker 线程
+                        email = ""
+                        dev_token = ""
+                        code = ""
+                        delay = reserve_signup_submit_slot()
+                        if delay >= 0.5:
+                            cli_log(
+                                f"[W{wid+1}] [*] 错开提交 {delay:.0f}s，避免同时打验证码"
+                            )
+                            sleep_with_cancel(delay, controller.should_stop)
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
@@ -4315,6 +5089,8 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                             **get_sso_wait_policy(),
+                            email=email,
+                            password=profile.get("password", ""),
                         )
                         ensure_sso_oauth_eligible(
                             sso,
@@ -4348,7 +5124,20 @@ def run_registration_cli(count):
                         cpa_ok = add_sso_to_cpa(
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
+                        _enqueue_instant_grok2api(
+                            email,
+                            sso,
+                            profile.get("password", ""),
+                            task_subdir=task_subdir,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
+                        purge_cloudflare_mailbox_quiet(
+                            dev_token,
+                            email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         local_success += 1
+                        mark_successful_account()
                         i += 1
                         retry = 0
                         consecutive_failures = 0
@@ -4417,6 +5206,14 @@ def run_registration_cli(count):
                             or "出口IP命中黑名单" in msg
                             or "命中黑名单" in msg
                         )
+                        pipe_dead = (
+                            "epipe" in msg.lower()
+                            or "econnreset" in msg.lower()
+                            or "target closed" in msg.lower()
+                            or "targetclosed" in msg.lower()
+                            or "browser has been closed" in msg.lower()
+                            or "connection closed" in msg.lower()
+                        )
                         if proxy_dead:
                             record_proxy_boot_failure(
                                 get_bound_proxy() or get_thread_proxy(), exc
@@ -4430,12 +5227,52 @@ def run_registration_cli(count):
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
                         )
-                        if (blank_ui or proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
+                        throttled = "Email sign-up isn't available" in msg
+                        if throttled and retry < max_slot_retry:
+                            # xAI 邮箱注册限流（按时段/提交量节流，不是出口质量
+                            # 问题）：不记空页惩罚、不冷却/拉黑出口；退避后同
+                            # 槽位换口重试。
+                            retry += 1
+                            backoff = 90
+                            cli_log(
+                                f"[W{wid+1}] [!] 邮箱注册被限流"
+                                f"（Email sign-up isn't available），"
+                                f"退避 {backoff}s 后同槽位换口重试 "
+                                f"{retry}/{max_slot_retry}"
+                            )
+                            sleep_with_cancel(backoff, controller.should_stop)
+                            if accounts_per_ip > 0:
+                                rotate_idx += 1
+                            retry_same_slot = True
+                            continue
+                        if blank_ui:
+                            # 空页（reload 已尝试仍空白/无表单）：直接判定槽位
+                            # 失败，不再同槽位换口重试。首次空页只临时冷却该 IP
+                            # （30 分钟内预检/可用池跳过），累计空页 ≥2 次才
+                            # 永久软拉黑（counts 置 99999）——空页多为页面加载
+                            # 瞬时问题，避免单次抖动误杀长期正常 IP。
+                            try:
+                                permanent, blank_count = record_blank_page(active_ip)
+                            except Exception:
+                                permanent, blank_count = False, 0
+                            cli_log(
+                                f"[W{wid+1}] [!] 空页判定失败，出口 {active_ip or '?'} "
+                                + (
+                                    f"永久软拉黑（累计空页 {blank_count} 次）"
+                                    if permanent
+                                    else f"临时冷却 30 分钟（累计空页 {blank_count} 次）"
+                                )
+                            )
+                        elif (blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1
                             why = (
-                                "Turnstile卡住"
-                                if turnstile_stuck
-                                else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                "Playwright管道断开"
+                                if pipe_dead
+                                else (
+                                    "Turnstile卡住"
+                                    if turnstile_stuck
+                                    else ("资料页未就绪" if profile_soft else "空页/表单未就绪")
+                                )
                             )
                             cli_log(
                                 f"[W{wid+1}] [!] {why}，同槽位换口重试 {retry}/{max_slot_retry}: "
@@ -4487,9 +5324,11 @@ def run_registration_cli(count):
                             cli_log(f"[W{wid+1}] [*] [IP策略] 页面加载超时，切换 sticky #{rotate_idx}")
                         elif kind == FAIL_RISK and accounts_per_ip > 0:
                             rotate_idx += 1
-                            cli_log(f"[W{wid+1}] [*] 风控拒绝，切换 sticky #{rotate_idx}")
+                            cli_log(
+                                f"[W{wid+1}] [*] 风控拒绝，换 40 分钟内未出现的 IP #{rotate_idx}"
+                            )
                         elif accounts_per_ip > 0 and (
-                            blank_ui or proxy_dead or turnstile_stuck or profile_soft or kind in (
+                            blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft or kind in (
                             FAIL_TURNSTILE,
                             FAIL_PROFILE,
                             )
@@ -4623,7 +5462,7 @@ def run_registration_cli(count):
                                     )
                                     worker_stop = True
                                 else:
-                                    for _try in range(1, 10):
+                                    for _try in range(1, max_proxy_boot_rotations + 1):
                                         msgb = str(last_boot)
                                         if not (
                                             "出口IP命中黑名单" in msgb
@@ -4687,6 +5526,7 @@ def run_registration_cli(count):
             finally:
                 ip_quota.release(wid)
                 release_proxy_for_worker(wid)
+                release_proxy_lease(wid)
                 try:
                     maybe_stop_browser(
                         user_stopped=bool(controller.should_stop()),
@@ -4723,7 +5563,7 @@ def run_registration_cli(count):
     try:
         single_rotate_idx = 0
         last_boot = None
-        boot_attempts = max(1, min(12, len(pool) or 1))
+        boot_attempts = max(1, min(max_proxy_boot_rotations + 1, len(pool) or 1))
         for _boot_try in range(boot_attempts):
             px = ""
             try:
@@ -4815,6 +5655,8 @@ def run_registration_cli(count):
                     log_callback=cli_log,
                     cancel_callback=controller.should_stop,
                     **get_sso_wait_policy(),
+                    email=email,
+                    password=profile.get("password", ""),
                 )
                 ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
                 if config.get("enable_nsfw", True):
@@ -4839,7 +5681,16 @@ def run_registration_cli(count):
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                _enqueue_instant_grok2api(
+                    email,
+                    sso,
+                    profile.get("password", ""),
+                    task_subdir=task_subdir,
+                    log_callback=cli_log,
+                )
+                purge_cloudflare_mailbox_quiet(dev_token, email, log_callback=cli_log)
                 success_count += 1
+                mark_successful_account()
                 retry_count_for_slot = 0
                 i += 1
                 if cpa_ok:
@@ -4855,7 +5706,7 @@ def run_registration_cli(count):
                     bot_flag=0,
                     log_callback=cli_log,
                 )
-                if success_count % 2 == 0:
+                if success_count % 3 == 0:
                     single_rotate_idx += 1
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 record_ip_usage(get_exit_ip())
@@ -4927,6 +5778,17 @@ def run_registration_cli(count):
                         "命中黑名单",
                     )
                 )
+                pipe_dead = any(
+                    marker in message.lower()
+                    for marker in (
+                        "epipe",
+                        "econnreset",
+                        "target closed",
+                        "targetclosed",
+                        "browser has been closed",
+                        "connection closed",
+                    )
+                )
                 if proxy_dead:
                     record_proxy_boot_failure(
                         get_bound_proxy() or get_thread_proxy(), exc
@@ -4934,6 +5796,7 @@ def run_registration_cli(count):
                 if (
                     kind == FAIL_RISK
                     or proxy_dead
+                    or pipe_dead
                     or kind in (FAIL_TURNSTILE, FAIL_PROFILE, FAIL_PAGE_LOAD)
                 ):
                     single_rotate_idx += 1

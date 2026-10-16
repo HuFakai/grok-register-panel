@@ -134,7 +134,9 @@ def read_blacklist() -> dict:
         "isp_keywords": list(state["isp_keywords"]),
         "mtime": mtime,
         "mtime_human": (
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+            __import__("datetime").datetime.fromtimestamp(
+                mtime, __import__("zoneinfo").ZoneInfo("Asia/Shanghai")
+            ).strftime("%Y-%m-%d %H:%M:%S")
             if mtime
             else None
         ),

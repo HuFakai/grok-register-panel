@@ -15,21 +15,39 @@ tests=(
   tests/test_account_exports.py
   tests/test_sso_recovery.py
   tests/test_sso_wait.py
+  tests/test_bfs_detect.py
+  tests/test_bfs_ops.py
+  tests/test_bfs_worker_integration.py
+  tests/test_cloudflare_provider.py
+  tests/test_signup_throttle.py
+  tests/test_mail_cleanup.py
+  tests/test_retry_policy.py
+  tests/test_batch_traffic.py
+  tests/test_orchestrator_policy.py
+  tests/test_grok2api_api.py
+  tests/test_grok2api_upload.py
+  tests/test_grok2api_instant.py
+  tests/test_static_asset_cache.py
   tests/test_monitor_http.py
   tests/test_monitor_control.py
   tests/test_log_cleanup.py
   tests/test_proxy_store.py
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
+  tests/test_inbucket.py
+  tests/test_outlook_rt.py
   tests/test_email_profile_rotation.py
   tests/test_cloudflare_catchall.py
   tests/test_ip_rotation_policy.py
+  tests/test_ip_ready_pool.py
+  tests/test_windows_fingerprint.py
   tests/test_shared_slot_pool.py
   tests/test_ip_usage_store.py
   tests/test_results_store.py
   tests/test_config_backup.py
   tests/test_email_domain_store.py
   tests/test_email_domain_worker_integration.py
+  tests/test_sso_state.py
   tests/test_star_history.py
   tests/test_panel_structure.py
   tests/test_no_live_hardcode.py
@@ -53,7 +71,15 @@ done
   batch_supervisor.py \
   run_batch_headless.py \
   run_until_100.py \
-  sso_to_auth_json.py
+  sso_to_auth_json.py \
+  retry_policy.py \
+  batch_traffic.py \
+  static_asset_cache.py \
+  run_batch_headless_static_cache.py \
+  run_until_100_static_cache.py \
+  scripts/grok2api_upload.py \
+  scripts/check_sso_state.py \
+  webui/sso_state_ops.py
 
 bash -n scripts/*.sh
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

@@ -150,14 +150,64 @@ def test_probe_result_and_runtime_cooldown_control_worker_selection():
         state["items"][0]["cooldown_until"] = "2000-01-01T00:00:00Z"
         proxy_store.STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
         usable_after = proxy_store.list_worker_proxies()
-        assert usable_after == usable
+        assert usable_after == []
+        assert proxy_store.read_proxy_pool()["items"][0]["stored_status"] == "unknown"
 
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "203.0.113.10",
+                "asn": 64500,
+                "asn_org": "Example ISP",
+                "latency_ms": 222,
+                "checked_at": "2026-07-30T00:05:00Z",
+            },
+        )
+        usable = proxy_store.list_worker_proxies()
         assert proxy_store.record_proxy_result(usable[0], "risk", "policy deny")
         public = proxy_store.read_proxy_pool()
         item = public["items"][0]
         assert item["stored_status"] == "cooldown"
         assert item["cooldown_reason"] == "risk"
         assert item["risk_count"] == 1
+
+
+def test_xai_probe_uses_registration_page_result():
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = "<html>Sign up</html>"
+        headers = {}
+
+    def successful_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    detail = proxy_store.probe_xai_signup(
+        "http://proxy.example:8080",
+        timeout=5,
+        http_get=successful_get,
+    )
+    assert detail == "可达 HTTP 200"
+    assert calls[0][1]["proxies"]["https"] == "http://proxy.example:8080"
+
+    class ChallengeResponse:
+        status_code = 403
+        text = "Just a moment"
+        headers = {"server": "cloudflare"}
+
+    try:
+        proxy_store.probe_xai_signup(
+            "http://proxy.example:8080",
+            timeout=5,
+            http_get=lambda *_args, **_kwargs: ChallengeResponse(),
+        )
+    except RuntimeError as exc:
+        assert "xAI 注册页不可用" in str(exc)
+    else:
+        raise AssertionError("Cloudflare challenge must fail the proxy probe")
 
 
 def test_disable_delete_and_legacy_import():
@@ -266,12 +316,119 @@ def test_async_probe_job_persists_health():
             proxy_store.probe_proxy = previous_probe
 
 
+def test_worker_proxy_details_datacenter_filter():
+    """面板开关开启时跳过机房/云段出口；关闭或无 ASN 数据时不拦。"""
+    with IsolatedStore():
+        imported = proxy_store.import_proxies(
+            "dc.example:8080:user:pass\nhome.example:8080:user:pass\nunknown.example:8080:u:p"
+        )
+        ids = imported["imported_ids"]
+        proxy_store._apply_probe_result(
+            ids[0],
+            {"ok": True, "exit_ip": "64.176.21.9", "asn": 6185,
+             "asn_org": "Oracle Cloud, Inc", "latency_ms": 100,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+        proxy_store._apply_probe_result(
+            ids[1],
+            {"ok": True, "exit_ip": "2.27.109.9", "asn": 2856,
+             "asn_org": "British Telecommunications PLC", "latency_ms": 120,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+        proxy_store._apply_probe_result(
+            ids[2],
+            {"ok": True, "exit_ip": "203.0.113.77", "latency_ms": 130,
+             "checked_at": "2026-10-03T00:00:00Z"},
+        )
+
+        # 开关关闭：三家都在（含无 ASN 数据的条目）
+        previous = proxy_store.MONITOR_CONTROL_PATH
+        try:
+            proxy_store.MONITOR_CONTROL_PATH = (
+                proxy_store.STATE_PATH.parent / "monitor_control.json"
+            )
+            proxy_store.MONITOR_CONTROL_PATH.write_text("{}", encoding="utf-8")
+            rows = proxy_store.worker_proxy_details()
+            assert len(rows) == 3
+            assert all("asn_org" in row and "asn" in row for row in rows)
+
+            # 开关开启：机房段被跳过；无 ASN 数据的条目保留（宁可不拦）
+            proxy_store.MONITOR_CONTROL_PATH.write_text(
+                '{"ip_pool_filter_datacenter": true}', encoding="utf-8"
+            )
+            assert proxy_store.datacenter_filter_enabled() is True
+            rows = proxy_store.worker_proxy_details()
+            ips = {row["exit_ip"] for row in rows}
+            assert ips == {"2.27.109.9", "203.0.113.77"}
+        finally:
+            proxy_store.MONITOR_CONTROL_PATH = previous
+
+
+def test_home_proxy_risk_stays_usable_and_cannot_disable():
+    with IsolatedStore():
+        imported = proxy_store.import_proxies("http://127.0.0.1:8003")
+        proxy_id = imported["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "198.51.100.33",
+                "asn": 64500,
+                "asn_org": "Home",
+                "latency_ms": 100,
+                "checked_at": "2026-08-15T00:00:00Z",
+            },
+        )
+        url = proxy_store.list_worker_proxies()[0]
+        assert proxy_store.is_home_proxy(url)
+        assert proxy_store.record_proxy_result(url, "risk", "botFlagSource=1")
+        public = proxy_store.read_proxy_pool()["items"][0]
+        assert public["stored_status"] != "cooldown"
+        assert public["cooldown_reason"] == ""
+        assert public["risk_count"] == 1
+        assert url in proxy_store.list_worker_proxies()
+        try:
+            proxy_store.update_proxy(proxy_id, enabled=False)
+        except proxy_store.ProxyValidationError as exc:
+            assert "家宽" in str(exc)
+        else:
+            raise AssertionError("home proxies must stay enabled")
+        restored = proxy_store.restore_home_proxies()
+        assert restored["ok"] is True
+
+
+def test_1024_ports_never_enter_worker_pool():
+    with IsolatedStore():
+        imported = proxy_store.import_proxies(
+            "http://127.0.0.1:7902\nhttp://127.0.0.1:8003"
+        )
+        for item in imported["items"]:
+            proxy_store._apply_probe_result(
+                item["id"],
+                {
+                    "ok": True,
+                    "exit_ip": "198.51.100.20",
+                    "asn": 64500,
+                    "asn_org": "Test",
+                    "latency_ms": 50,
+                    "checked_at": "2026-08-16T00:00:00Z",
+                },
+            )
+        urls = proxy_store.list_worker_proxies()
+        assert any(u.endswith(":8003") for u in urls)
+        assert not any(":7902" in u for u in urls)
+
+
 if __name__ == "__main__":
+    test_worker_proxy_details_datacenter_filter()
     test_normalize_proxy_formats_and_rejects_paths()
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_resin_session_template_is_safe_and_runtime_results_map_to_source()
     test_probe_result_and_runtime_cooldown_control_worker_selection()
+    test_xai_probe_uses_registration_page_result()
     test_disable_delete_and_legacy_import()
     test_pagination_bulk_delete_and_large_test_batching()
     test_async_probe_job_persists_health()
+    test_home_proxy_risk_stays_usable_and_cannot_disable()
+    test_1024_ports_never_enter_worker_pool()
     print("OK proxy store")

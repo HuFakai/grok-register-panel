@@ -56,6 +56,16 @@ def is_admin_create_path(path: str) -> bool:
     return str(path or "").rstrip("/").lower() == "/admin/new_address"
 
 
+def _is_address_collision(status_code: int, body_text: str) -> bool:
+    if int(status_code or 0) not in {400, 409}:
+        return False
+    low = str(body_text or "").lower()
+    return any(
+        marker in low
+        for marker in ("already exists", "address exists", "duplicate address")
+    )
+
+
 def next_default_domain(domains: List[str], index: int) -> tuple[str, int]:
     cleaned = [x.strip() for x in domains if str(x).strip()]
     if not cleaned:
@@ -78,36 +88,69 @@ def create_temp_address(
 ) -> tuple[str, str]:
     path = accounts_path if accounts_path.startswith("/") else f"/{accounts_path}"
     url = f"{api_base.rstrip('/')}{path}"
+    selected_domain = str(domain or "").strip()
     # 根域批量易被标；默认挂随机子域（需 CF Email Routing 对 *.apex catch-all）
-    if domain and randomize_subdomain:
-        domain = random_subdomain_domain(domain)
-    if is_admin_create_path(path):
-        payload = {"name": name or generate_username(10), "enablePrefix": False}
-        if domain:
-            payload["domain"] = domain
-        headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
-    else:
-        payload = {}
-        if domain:
-            payload["domain"] = domain
-        headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
-    resp = http_post(url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        body = ""
+    if selected_domain and randomize_subdomain:
+        selected_domain = random_subdomain_domain(selected_domain)
+
+    last_err: Exception | None = None
+    # 并发 worker 容易撞同名 → 400 Address already exists；最多换名重试 4 次
+    for attempt in range(4):
+        local_name = str(name or "").strip()
+        if not local_name or attempt > 0:
+            # 追加短随机后缀，降低 james.smith 这类撞车
+            local_name = f"{generate_username(10)}{secrets.token_hex(2)}"
+        if is_admin_create_path(path):
+            payload = {"name": local_name, "enablePrefix": False}
+            if selected_domain:
+                payload["domain"] = selected_domain
+            headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
+        else:
+            payload = {}
+            if selected_domain:
+                payload["domain"] = selected_domain
+            headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
         try:
-            body = str(getattr(resp, "text", "") or "")[:300]
-        except Exception:
-            pass
-        raise Exception(f"Cloudflare {path} HTTP {resp.status_code}: {body}".strip())
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
-    return address, jwt
+            resp = http_post(url, json=payload, headers=headers)
+            body_text = ""
+            try:
+                body_text = (resp.text or "")[:240]
+            except Exception:
+                body_text = ""
+            if resp.status_code >= 400:
+                # 只有明确的地址冲突会因换名恢复；认证、域名和字段错误直接抛出。
+                retryable = _is_address_collision(resp.status_code, body_text)
+                if retryable and attempt < 3:
+                    last_err = Exception(
+                        f"Cloudflare {path} HTTP {resp.status_code}: 地址已存在"
+                    )
+                    name = ""  # 强制下一轮重新生成
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                raise Exception(
+                    f"Cloudflare {path} 返回非JSON (HTTP {resp.status_code})"
+                )
+            address = data.get("address")
+            jwt = data.get("jwt")
+            if not address or not jwt:
+                raise Exception(f"Cloudflare {path} 返回缺少 address/jwt 字段")
+            return address, jwt
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc).lower()
+            if attempt < 3 and any(
+                marker in msg
+                for marker in ("already exists", "address exists", "duplicate address")
+            ):
+                name = ""
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+    raise Exception("Cloudflare 创建邮箱失败（地址冲突重试耗尽）") from last_err
 
 
 def get_domains(
@@ -252,6 +295,53 @@ def get_message_detail(
     raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
 
 
+def admin_get_messages(
+    http_get: HttpGet,
+    api_base: str,
+    admin_pass: str,
+    address: str,
+    *,
+    custom_auth: str = "",
+    size: int = 20,
+) -> List[dict]:
+    """管理端按地址轮询邮件（GET /admin/mails?address=）。
+
+    v1.10+ 的 /api/mails 要求 address_id>0 且地址已注册，catch-all 自签
+    JWT 会被拒；管理端列表不受限，任何部署版本都可用。行结构归一化为
+    get_messages 兼容形状（id + raw，raw 为完整 RFC822 原文）。
+    """
+    if not admin_pass or not address:
+        raise Exception("CloudMail 管理端轮询需要 admin 凭据与收件地址")
+    headers = build_headers(admin_pass, "x-admin-auth", custom_auth)
+    resp = http_get(
+        f"{api_base.rstrip('/')}/admin/mails",
+        headers=headers,
+        params={"limit": size, "offset": 0, "address": address},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"Cloudflare admin mails 返回非JSON: {resp.text[:300]}")
+    rows = pick_list_payload(data)
+    normalized = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("id")
+        if mid is None:
+            continue
+        normalized.append(
+            {
+                "id": mid,
+                "raw": str(row.get("raw") or ""),
+                "created_at": str(row.get("created_at") or ""),
+            }
+        )
+    return normalized
+
+
 def create_mailbox_fallback(
     http_get: HttpGet,
     http_post: HttpPost,
@@ -264,6 +354,7 @@ def create_mailbox_fallback(
     auth_mode: str = "none",
     custom_auth: str = "",
     domain: str = "",
+    randomize_subdomain: bool = True,
 ) -> tuple[str, str]:
     selected_domain = str(domain or "").strip()
     if not selected_domain:
@@ -282,7 +373,21 @@ def create_mailbox_fallback(
         selected_domain = str(target.get("domain") or "").strip()
     if not selected_domain:
         raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-    username = generate_username(10)
+    # /admin/new_address 不能走 address/password 旧 payload（会 400 Required field）
+    # 统一复用 create_temp_address（含撞名重试）
+    if is_admin_create_path(accounts_path):
+        return create_temp_address(
+            http_post,
+            api_base,
+            accounts_path=accounts_path,
+            domain=selected_domain,
+            api_key=api_key,
+            auth_mode=auth_mode,
+            custom_auth=custom_auth,
+            randomize_subdomain=randomize_subdomain,
+        )
+
+    username = generate_username(10) + secrets.token_hex(2)
     address = f"{username}@{selected_domain}"
     password = secrets.token_urlsafe(12)
     create_account(
@@ -329,6 +434,9 @@ def wait_for_code(
     cancel_callback: Optional[Callable[[], bool]] = None,
     resend_callback: Optional[Callable[[], None]] = None,
     on_code_mail: Optional[Callable[[object], None]] = None,
+    http_delete: Optional[Callable[..., Any]] = None,
+    purge_on_failure: bool = False,
+    poll_via_admin: bool = False,
 ) -> str:
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
@@ -347,15 +455,24 @@ def wait_for_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 35
         try:
-            messages = get_messages(
-                http_get,
-                api_base,
-                dev_token,
-                messages_path=messages_path,
-                api_key=api_key,
-                auth_mode=auth_mode,
-                custom_auth=custom_auth,
-            )
+            if poll_via_admin:
+                messages = admin_get_messages(
+                    http_get,
+                    api_base,
+                    api_key,
+                    email,
+                    custom_auth=custom_auth,
+                )
+            else:
+                messages = get_messages(
+                    http_get,
+                    api_base,
+                    dev_token,
+                    messages_path=messages_path,
+                    api_key=api_key,
+                    auth_mode=auth_mode,
+                    custom_auth=custom_auth,
+                )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
@@ -395,31 +512,34 @@ def wait_for_code(
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
-            try:
-                detail = get_message_detail(
-                    http_get,
-                    api_base,
-                    dev_token,
-                    msg_id,
-                    messages_path=messages_path,
-                    api_key=api_key,
-                    auth_mode=auth_mode,
-                    custom_auth=custom_auth,
-                )
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
+            if not poll_via_admin:
+                # admin 轮询的 raw 已含完整原文；跳过单封详情，避免每次用
+                # 自签 JWT 打 /api/mail/{id}（v1.10+ 会 401）产生无谓请求
+                try:
+                    detail = get_message_detail(
+                        http_get,
+                        api_base,
+                        dev_token,
+                        msg_id,
+                        messages_path=messages_path,
+                        api_key=api_key,
+                        auth_mode=auth_mode,
+                        custom_auth=custom_auth,
+                    )
+                    for field in ("text", "raw", "content", "intro", "body", "snippet"):
+                        value = detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            combined += "\n" + value
+                    html_list2 = detail.get("html") or []
+                    if isinstance(html_list2, str):
+                        html_list2 = [html_list2]
+                    for h in html_list2:
+                        combined += "\n" + re.sub(r"<[^>]+>", " ", h)
+                    if not subject:
+                        subject = str(detail.get("subject", "") or "")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
@@ -439,7 +559,89 @@ def wait_for_code(
                     f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}"
                 )
         sleep_with_cancel(poll_interval, cancel_callback)
+    # 超时：清理该邮箱残留邮件（解析失败的、迟到的），避免服务端存储持续膨胀
+    if purge_on_failure and http_delete is not None:
+        purged = purge_mailbox(
+            http_get,
+            http_delete,
+            api_base,
+            dev_token,
+            messages_path=messages_path,
+            api_key=api_key,
+            auth_mode=auth_mode,
+            custom_auth=custom_auth,
+        )
+        if log_callback and purged:
+            log_callback(f"[*] 验证码超时，已清理邮箱残留邮件 {purged} 封")
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
+
+
+def purge_mailbox(
+    http_get: HttpGet,
+    http_delete: Callable[..., Any],
+    api_base: str,
+    dev_token: str,
+    *,
+    messages_path: str = "/messages",
+    api_key: str = "",
+    auth_mode: str = "none",
+    custom_auth: str = "",
+    max_rounds: int = 5,
+    poll_via_admin: bool = False,
+) -> int:
+    """清空该邮箱全部邮件（尽力而为，返回成功删除数量）。
+
+    用于验证码超时/失败后清理残留，避免服务端（D1/SQLite）邮件表持续膨胀。
+    删除走 admin 凭证（x-admin-auth）；单封失败不中断，列表拉取失败即停。
+    poll_via_admin 时列表改走管理端 /admin/mails?address=（catch-all 自签
+    JWT 在 v1.10+/v1.12 的 /api/mails 上会被拒）。
+    """
+    deleted = 0
+    for _ in range(max(1, int(max_rounds))):
+        try:
+            if poll_via_admin:
+                messages = admin_get_messages(
+                    http_get,
+                    api_base,
+                    api_key,
+                    email,
+                    custom_auth=custom_auth,
+                )
+            else:
+                messages = get_messages(
+                    http_get,
+                    api_base,
+                    dev_token,
+                    messages_path=messages_path,
+                    api_key=api_key,
+                    auth_mode=auth_mode,
+                    custom_auth=custom_auth,
+                )
+        except Exception:
+            break
+        if not messages:
+            break
+        removed_this_round = 0
+        for msg in messages:
+            msg_id = msg.get("id") or msg.get("msgid")
+            if not msg_id:
+                continue
+            try:
+                delete_mail(
+                    http_delete,
+                    api_base,
+                    msg_id,
+                    admin_auth=api_key,
+                    custom_auth=custom_auth,
+                )
+                deleted += 1
+                removed_this_round += 1
+            except Exception:
+                continue
+        # 一轮没能删掉任何邮件（例如服务端故障）就停，避免死循环
+        if removed_this_round == 0 or len(messages) < 20:
+            break
+    return deleted
 
 
 def delete_mail(

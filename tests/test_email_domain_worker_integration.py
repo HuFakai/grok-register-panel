@@ -197,7 +197,52 @@ def test_managed_domain_is_passed_to_provider_and_blocks_without_fallback():
             register.config.update(previous_config)
 
 
+def test_cloudflare_combined_error_is_redacted():
+    secret = "provider-secret-value-123456"
+    redacted = register.redact_sensitive_log_line(
+        f"token={secret} email=person@example.com"
+    )
+    assert secret not in redacted
+    assert "person@example.com" not in redacted
+
+
+def test_mail_direct_uses_configured_provider_bases():
+    keys = (
+        "cloudflare_api_base",
+        "cloudmail_url",
+        "moemail_api_base",
+        "duckmail_api_base",
+    )
+    previous = {key: register.config.get(key) for key in keys}
+    register.config.update(
+        {
+            "cloudflare_api_base": "https://cf-mail.example.test",
+            "cloudmail_url": "https://cloudmail.example.test",
+            "moemail_api_base": "",
+            "duckmail_api_base": "",
+        }
+    )
+    try:
+        assert register._url_needs_direct(
+            "https://cf-mail.example.test/api/new_address"
+        )
+        assert register._url_needs_direct(
+            "https://cloudmail.example.test/api/messages"
+        )
+        assert not register._url_needs_direct(
+            "https://unrelated.example.test/v1/status"
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                register.config.pop(key, None)
+            else:
+                register.config[key] = value
+
+
 if __name__ == "__main__":
     test_managed_domains_reach_all_supported_provider_adapters()
     test_managed_domain_is_passed_to_provider_and_blocks_without_fallback()
+    test_cloudflare_combined_error_is_redacted()
+    test_mail_direct_uses_configured_provider_bases()
     print("OK email domain worker integration")

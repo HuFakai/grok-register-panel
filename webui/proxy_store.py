@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import threading
@@ -56,6 +57,21 @@ NETWORK_COOLDOWN_SECONDS = max(
 RISK_COOLDOWN_SECONDS = max(
     60, int(os.environ.get("PROXY_RISK_COOLDOWN_SECONDS", "1800"))
 )
+# 家宽口：风控不冷却、不禁用；换口改走 40 分钟内没出现过的 IP
+HOME_PROXY_PORTS = set(
+    int(p)
+    for p in str(os.environ.get("PROXY_HOME_PORTS", "") or "").split(",")
+    if str(p).strip().isdigit()
+) or set(range(8001, 8012))
+IP_FRESH_SECONDS = max(
+    60, int(os.environ.get("PROXY_IP_FRESH_SECONDS", str(40 * 60)))
+)
+# 1024 家宽（mihomo 7901-7920）不参与注册选口，只用 Kookeey 8001-8011
+BLOCKED_WORKER_PORTS = set(
+    int(p)
+    for p in str(os.environ.get("PROXY_BLOCKED_PORTS", "") or "").split(",")
+    if str(p).strip().isdigit()
+) or set(range(7901, 7921))
 
 _TEST_LOCK = threading.RLock()
 _TEST_JOB = {
@@ -86,6 +102,195 @@ def _future_utc(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+
+def _url_port(url: object) -> int | None:
+    try:
+        return urlsplit(str(url or "")).port
+    except Exception:
+        return None
+
+
+def is_home_proxy(url: object) -> bool:
+    try:
+        parsed = urlsplit(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except Exception:
+        return False
+    if port not in HOME_PROXY_PORTS:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+# 数据中心/云厂商 ASN 组织名关键词（小写匹配 asn_org）；
+# xAI 封控收紧时空页多集中在机房段，住宅出口成功率更高。
+DATACENTER_ORG_KEYWORDS = (
+    "oracle",
+    "amazon",
+    "aws",
+    "google",
+    "microsoft",
+    "azure",
+    "hetzner",
+    "digitalocean",
+    "digital ocean",
+    "vultr",
+    "choopa",
+    "linode",
+    "akamai",
+    "ovh",
+    "contabo",
+    "alibaba",
+    "tencent",
+    "huawei",
+    "datacamp",
+    "hostinger",
+    "godaddy",
+    "hostwinds",
+    "kamatera",
+    "upcloud",
+    "leaseweb",
+    "ionos",
+    "scaleway",
+    "equinix",
+    "m247",
+    "psychz",
+    "colocation",
+    "data center",
+    "datacenter",
+    "hosting",
+)
+
+
+def is_datacenter_org(asn_org: object) -> bool:
+    """按出口 ASN 组织名判断是否机房/云段；组织名未知时返回 False（宁可不拦）。"""
+    text = str(asn_org or "").strip().lower()
+    if not text:
+        return False
+    return any(keyword in text for keyword in DATACENTER_ORG_KEYWORDS)
+
+
+MONITOR_CONTROL_PATH = ROOT / "log" / "monitor_control.json"
+
+
+def datacenter_filter_enabled() -> bool:
+    """读面板开关（monitor_control.json 的 ip_pool_filter_datacenter）。
+
+    独立小读取，避免 proxy_store ↔ monitor 循环导入；任何异常视为关闭。
+    """
+    try:
+        raw = json.loads(
+            MONITOR_CONTROL_PATH.read_text(encoding="utf-8") or "{}"
+        )
+        return bool(raw.get("ip_pool_filter_datacenter"))
+    except Exception:
+        return False
+
+
+def _item_usable_for_workers(item: dict) -> bool:
+    if not item.get("enabled"):
+        return False
+    port = _url_port(item.get("url"))
+    if port in BLOCKED_WORKER_PORTS:
+        return False
+    status = str(item.get("status") or "")
+    if is_home_proxy(item.get("url")):
+        # Kookeey 家宽不因风控冷却踢出；探测失败的 unhealthy 仍排除
+        return status in {"healthy", "unknown", "cooldown"}
+    return status == "healthy"
+
+
+def _ip_age_seconds(item: dict, now: datetime | None = None) -> float:
+    now = now or datetime.now(timezone.utc)
+    ip = str(item.get("exit_ip") or "").strip()
+    if not ip:
+        return 10**9
+    used = _parse_utc(item.get("last_used_at"))
+    if used is None:
+        return 10**9
+    return max(0.0, (now - used).total_seconds())
+
+
+def note_proxy_exit(url: object, exit_ip: object) -> bool:
+    """记下这次实际出口 IP，供 40 分钟去重。"""
+    try:
+        normalized = normalize_proxy(url)
+    except ProxyValidationError:
+        return False
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return False
+    changed = False
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        for item in state["items"]:
+            if item["url"] != normalized:
+                continue
+            item["exit_ip"] = _clean_text(ip, 64)
+            item["last_used_at"] = _utc_now()
+            changed = True
+            break
+        if changed:
+            _write_unlocked(state)
+    return changed
+
+
+def worker_proxy_details() -> list[dict]:
+    """Worker 可选出口：url + 最近出口 IP + 上次使用时间。
+
+    面板开启「数据中心出口过滤」时跳过机房/云段（asn_org 命中关键词）；
+    出口没有 ASN 数据时保留（宁可不拦不误杀）。
+    """
+    filter_dc = datacenter_filter_enabled()
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        changed = _release_expired_cooldowns(state)
+        rows = []
+        for item in state["items"]:
+            if not _item_usable_for_workers(item):
+                continue
+            asn_org = str(item.get("asn_org") or "")
+            if filter_dc and is_datacenter_org(asn_org):
+                continue
+            rows.append(
+                {
+                    "url": item["url"],
+                    "exit_ip": str(item.get("exit_ip") or ""),
+                    "last_used_at": str(item.get("last_used_at") or ""),
+                    "status": item.get("status") or "",
+                    "home": is_home_proxy(item["url"]),
+                    "asn": item.get("asn"),
+                    "asn_org": asn_org,
+                }
+            )
+        if changed:
+            _write_unlocked(state)
+    return rows
+
+
+def restore_home_proxies() -> dict:
+    """启用全部家宽口并清掉风控冷却。"""
+    restored = 0
+    with exclusive_file_lock(LOCK_PATH):
+        state, _ = _read_unlocked()
+        for item in state["items"]:
+            if not is_home_proxy(item.get("url")):
+                continue
+            changed_item = False
+            if item.get("enabled") is not True:
+                item["enabled"] = True
+                changed_item = True
+            if item.get("cooldown_reason") == "risk" or item.get("status") == "cooldown":
+                item["status"] = "healthy" if item.get("exit_ip") else "unknown"
+                item["cooldown_until"] = ""
+                item["cooldown_reason"] = ""
+                changed_item = True
+            if changed_item:
+                restored += 1
+        if restored:
+            _write_unlocked(state)
+    return {"ok": True, "restored": restored}
 
 
 def _parse_utc(value: object) -> datetime | None:
@@ -298,7 +503,14 @@ def _release_expired_cooldowns(state: dict) -> bool:
         until = _parse_utc(item.get("cooldown_until"))
         if until is not None and until > now:
             continue
-        item["status"] = "healthy" if item.get("exit_ip") else "unknown"
+        reason = str(item.get("cooldown_reason") or "").strip().lower()
+        # A previous exit IP does not prove that a proxy recovered from a
+        # network/TLS failure. Require an explicit probe before reusing it.
+        item["status"] = (
+            "unknown"
+            if reason == "network"
+            else ("healthy" if item.get("exit_ip") else "unknown")
+        )
         item["cooldown_until"] = ""
         item["cooldown_reason"] = ""
         changed = True
@@ -547,6 +759,8 @@ def update_proxy(proxy_id: str, *, enabled: object | None = None) -> dict:
             if enabled is not None:
                 if not isinstance(enabled, bool):
                     raise ProxyValidationError("enabled 必须是布尔值")
+                if enabled is False and is_home_proxy(item.get("url")):
+                    raise ProxyValidationError("家宽出口不能禁用")
                 item["enabled"] = enabled
             break
         if not found:
@@ -606,7 +820,7 @@ def worker_proxy_snapshot() -> dict:
         urls = [
             item["url"]
             for item in state["items"]
-            if item["enabled"] and item["status"] == "healthy"
+            if _item_usable_for_workers(item)
         ]
         if changed:
             _write_unlocked(state)
@@ -675,6 +889,15 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
                     item["risk_count"] += 1
                 item["cooldown_until"] = ""
                 item["cooldown_reason"] = ""
+            elif outcome == "risk" and is_home_proxy(normalized):
+                # 家宽风控：只记账，不冷却、不禁用；换口靠 40 分钟 IP 去重
+                item["risk_count"] += 1
+                item["failure_count"] += 1
+                item["last_error"] = _clean_text(error) or "运行时风控"
+                if item.get("status") == "cooldown":
+                    item["status"] = "healthy" if item.get("exit_ip") else "unknown"
+                item["cooldown_until"] = ""
+                item["cooldown_reason"] = ""
             else:
                 item["status"] = "cooldown"
                 item["failure_count"] += 1
@@ -723,6 +946,26 @@ def _parse_probe_payload(payload: object) -> tuple[str, int | None, str]:
     return ip, asn, _clean_text(org, 120)
 
 
+def probe_xai_signup(url: object, timeout: float = DEFAULT_TEST_TIMEOUT, *, http_get=None) -> str:
+    """Require the proxy to reach the actual registration page, not only an IP API."""
+    normalized = normalize_proxy(url)
+    timeout = max(2.0, min(float(timeout), 20.0))
+    from connectivity import check_xai_signup
+
+    if http_get is None:
+        from curl_cffi import requests as curl_requests
+
+        def http_get(target, **kwargs):
+            kwargs.pop("_allow_direct_fallback", None)
+            kwargs["timeout"] = min(float(kwargs.get("timeout", timeout)), timeout)
+            return curl_requests.get(target, **kwargs)
+
+    _name, ok, detail = check_xai_signup(normalized, http_get)
+    if not ok:
+        raise RuntimeError(f"xAI 注册页不可用: {detail}")
+    return detail
+
+
 def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     """Probe one proxy via public IP services and return non-secret metadata."""
     normalized = normalize_proxy(url)
@@ -742,6 +985,7 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
         "https://api.ipify.org?format=json",
     )
     last_error = None
+    result = None
     started = time.monotonic()
     for endpoint in endpoints:
         try:
@@ -756,7 +1000,7 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
             if endpoint.startswith("https://ipwho.is") and payload.get("success") is False:
                 raise RuntimeError("探测服务拒绝了请求")
             ip, asn, org = _parse_probe_payload(payload)
-            return {
+            result = {
                 "ok": True,
                 "exit_ip": ip,
                 "asn": asn,
@@ -764,9 +1008,13 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
                 "latency_ms": max(1, int((time.monotonic() - started) * 1000)),
                 "checked_at": _utc_now(),
             }
+            break
         except Exception as exc:
             last_error = exc
-    raise RuntimeError(_probe_error_message(last_error))
+    if result is None:
+        raise RuntimeError(_probe_error_message(last_error))
+    probe_xai_signup(normalized, timeout=timeout)
+    return result
 
 
 def _apply_probe_result(proxy_id: str, result: dict) -> None:

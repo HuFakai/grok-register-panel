@@ -45,6 +45,7 @@ from pathlib import Path
 
 from curl_cffi import requests
 from secure_files import (
+    append_private_text,
     atomic_write_json,
     atomic_write_text,
     ensure_private_dir,
@@ -195,11 +196,364 @@ def b64url_decode(seg: str) -> bytes:
     return base64.urlsafe_b64decode(seg)
 
 
-def decode_jwt_payload(token: str) -> dict:
+def _decode_jwt_payload_with_status(token: str) -> tuple[bool, dict]:
+    """Decode a JWT payload and distinguish valid empty claims from failure."""
     try:
-        return json.loads(b64url_decode(token.split(".")[1]))
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return False, {}
+        payload = json.loads(b64url_decode(parts[1]))
+        if not isinstance(payload, dict):
+            return False, {}
+        return True, payload
     except Exception:
-        return {}
+        return False, {}
+
+
+def decode_jwt_payload(token: str) -> dict:
+    """Return object claims, or an empty dict for malformed/non-object payloads."""
+    _ok, payload = _decode_jwt_payload_with_status(token)
+    return payload
+
+
+def inspect_jwt_bfs(token: str) -> dict:
+    """Detect xAI JWT risk claim ``bfs`` by key presence (not truthiness).
+
+    Clean tokens simply omit the claim. Flagged tokens typically carry
+    ``bfs: 2`` (value may vary; presence alone is the signal).
+    Distinct from grok.com ``botFlagSource`` / registration policy deny.
+    """
+    raw = str(token or "").strip()
+    if raw.startswith("sso="):
+        raw = raw[4:].strip()
+    # Nested JSON blob (encrypted_primary decode, or full OAuth response)
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            for key in ("access_token", "token", "sso", "id_token", "key"):
+                nested = str(obj.get(key) or "").strip()
+                if nested.count(".") >= 2:
+                    raw = nested
+                    break
+    ok, claims = _decode_jwt_payload_with_status(raw) if raw.count(".") >= 2 else (False, {})
+    has = ok and ("bfs" in claims)
+    return {
+        "ok": ok,
+        "has_bfs": has,
+        "bfs": claims.get("bfs") if has else None,
+        "tier": claims.get("tier"),
+        "sub": str(claims.get("sub") or claims.get("principal_id") or "")[:48],
+        "exp": claims.get("exp"),
+        "referrer": claims.get("referrer"),
+        "claim_keys": sorted(str(k) for k in claims.keys()) if claims else [],
+    }
+
+
+def inspect_token_bundle_bfs(
+    *,
+    access_token: str = "",
+    sso: str = "",
+    id_token: str = "",
+    refresh_token: str = "",
+) -> dict:
+    """Check OAuth / SSO bundle; prefer access_token, fall back to sso/id/refresh."""
+    sources: list[tuple[str, str]] = [
+        ("access_token", str(access_token or "").strip()),
+        ("sso", str(sso or "").strip()),
+        ("id_token", str(id_token or "").strip()),
+        ("refresh_token", str(refresh_token or "").strip()),
+    ]
+    result = {
+        "ok": False,
+        "has_bfs": False,
+        "bfs": None,
+        "source": "",
+        "tier": None,
+        "sub": "",
+        "exp": None,
+        "referrer": None,
+        "claim_keys": [],
+        "checked": [],
+    }
+    for name, value in sources:
+        if not value or value.count(".") < 2:
+            continue
+        info = inspect_jwt_bfs(value)
+        result["checked"].append(name)
+        if not info.get("ok"):
+            continue
+        if not result["ok"]:
+            result.update(
+                {
+                    "ok": True,
+                    "has_bfs": bool(info.get("has_bfs")),
+                    "bfs": info.get("bfs"),
+                    "source": name,
+                    "tier": info.get("tier"),
+                    "sub": info.get("sub") or "",
+                    "exp": info.get("exp"),
+                    "referrer": info.get("referrer"),
+                    "claim_keys": list(info.get("claim_keys") or []),
+                }
+            )
+        # Any source with bfs marks the bundle flagged (prefer reporting that source)
+        if info.get("has_bfs"):
+            result.update(
+                {
+                    "ok": True,
+                    "has_bfs": True,
+                    "bfs": info.get("bfs"),
+                    "source": name,
+                    "tier": info.get("tier"),
+                    "sub": info.get("sub") or result.get("sub") or "",
+                    "exp": info.get("exp") or result.get("exp"),
+                    "referrer": info.get("referrer") or result.get("referrer"),
+                    "claim_keys": list(info.get("claim_keys") or result.get("claim_keys") or []),
+                }
+            )
+            break
+    return result
+
+
+def inspect_cpa_record_bfs(record: dict | None) -> dict:
+    """Inspect a CPA xai-*.json (or similar) auth record for the bfs claim."""
+    if not isinstance(record, dict):
+        return {
+            "ok": False,
+            "has_bfs": False,
+            "bfs": None,
+            "source": "",
+            "email": "",
+            "error": "invalid record",
+        }
+    # Prefer the current token over cached metadata. CPA may refresh the token
+    # in place while leaving custom fields untouched.
+    has_token = any(
+        str(record.get(key) or "").strip()
+        for key in ("access_token", "key", "sso", "id_token", "refresh_token")
+    )
+    # A record without a token can still be classified from metadata written by
+    # the register flow.
+    if not has_token and "bfs" in record and record.get("bfs") is True:
+        return {
+            "ok": True,
+            "has_bfs": True,
+            "bfs": record.get("bfs_value", record.get("bfs")),
+            "source": "record.bfs",
+            "email": str(record.get("email") or "").strip(),
+            "tier": record.get("tier"),
+            "sub": str(record.get("sub") or "")[:48],
+            "exp": None,
+            "referrer": None,
+            "claim_keys": [],
+            "checked": ["record.bfs"],
+        }
+    if not has_token and record.get("bfs") is False and record.get("bfs_checked"):
+        return {
+            "ok": True,
+            "has_bfs": False,
+            "bfs": None,
+            "source": "record.bfs",
+            "email": str(record.get("email") or "").strip(),
+            "tier": record.get("tier"),
+            "sub": str(record.get("sub") or "")[:48],
+            "exp": None,
+            "referrer": None,
+            "claim_keys": [],
+            "checked": ["record.bfs"],
+        }
+    info = inspect_token_bundle_bfs(
+        access_token=str(record.get("access_token") or record.get("key") or ""),
+        sso=str(record.get("sso") or ""),
+        id_token=str(record.get("id_token") or ""),
+        refresh_token=str(record.get("refresh_token") or ""),
+    )
+    info["email"] = str(record.get("email") or "").strip()
+    return info
+
+
+def _flatten_nested_auth_entry(entry: dict) -> dict:
+    """Normalize one nested Grok2API auth entry for the common scanner."""
+    return {
+        "access_token": entry.get("access_token") or entry.get("key") or "",
+        "refresh_token": entry.get("refresh_token") or "",
+        "id_token": entry.get("id_token") or "",
+        "email": entry.get("email") or "",
+        "sub": entry.get("user_id") or entry.get("sub") or "",
+        "sso": entry.get("sso") or "",
+        "disabled": entry.get("disabled"),
+        "bfs": entry.get("bfs"),
+        "bfs_value": entry.get("bfs_value"),
+        "bfs_source": entry.get("bfs_source"),
+        "bfs_checked": entry.get("bfs_checked"),
+        "bfs_status": entry.get("bfs_status"),
+    }
+
+
+def _auth_record_candidates(data: object) -> list[tuple[str, dict]]:
+    """Return direct or nested auth records from one JSON file."""
+    if not isinstance(data, dict):
+        return []
+    auth_fields = {
+        "access_token",
+        "key",
+        "sso",
+        "id_token",
+        "refresh_token",
+        "bfs",
+        "bfs_checked",
+    }
+    if auth_fields.intersection(data):
+        return [("", data)]
+    candidates: list[tuple[str, dict]] = []
+    for key, entry in data.items():
+        if not isinstance(entry, dict) or not auth_fields.intersection(entry):
+            continue
+        candidates.append((str(key), _flatten_nested_auth_entry(entry)))
+    return candidates
+
+
+def scan_cpa_auth_dir_bfs(
+    auth_dir: str | Path,
+    *,
+    limit: int = 0,
+    include_clean: bool = True,
+) -> dict:
+    """Batch-scan CPA auth directory for JWT bfs flags. Pure local JWT decode."""
+    root = Path(auth_dir)
+    summary = {
+        "ok": True,
+        "auth_dir": str(root),
+        "total": 0,
+        "bfs_count": 0,
+        "clean_count": 0,
+        "error_count": 0,
+        "bfs_rate": 0.0,
+        "bfs_value_dist": {},
+        "items": [],
+        "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if not root.is_dir():
+        summary["ok"] = False
+        summary["error"] = f"auth_dir not found: {root}"
+        return summary
+
+    # Auth directories can contain generated xai-/g2a- files or a merged
+    # auth.json created by the CLI. Scan JSON files by content rather than
+    # relying on one filename convention.
+    paths = sorted(root.glob("*.json"))
+    # de-dup by path
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for path in paths:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    if limit and limit > 0:
+        ordered = ordered[: int(limit)]
+
+    value_dist: dict[str, int] = {}
+    for path in ordered:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            summary["total"] += 1
+            item = {
+                "file": path.name,
+                "email": "",
+                "has_bfs": False,
+                "bfs": None,
+                "source": "",
+                "disabled": None,
+                "error": str(exc)[:120],
+            }
+            summary["error_count"] += 1
+            summary["items"].append(item)
+            continue
+        candidates = _auth_record_candidates(data)
+        if not candidates:
+            summary["total"] += 1
+            summary["error_count"] += 1
+            summary["items"].append(
+                {
+                    "file": path.name,
+                    "email": "",
+                    "has_bfs": False,
+                    "bfs": None,
+                    "source": "",
+                    "disabled": None,
+                    "error": "no auth record found",
+                }
+            )
+            continue
+        for entry_key, data_record in candidates:
+            summary["total"] += 1
+            item = {
+                "file": f"{path.name}#{entry_key}" if entry_key else path.name,
+                "email": "",
+                "has_bfs": False,
+                "bfs": None,
+                "source": "",
+                "disabled": None,
+                "error": "",
+            }
+            info = inspect_cpa_record_bfs(data_record)
+            item["email"] = str(info.get("email") or data_record.get("email") or "")
+            item["has_bfs"] = bool(info.get("has_bfs"))
+            item["bfs"] = info.get("bfs")
+            item["source"] = str(info.get("source") or "")
+            item["sub"] = str(info.get("sub") or "")
+            item["tier"] = info.get("tier")
+            if "disabled" in data_record:
+                item["disabled"] = bool(data_record.get("disabled"))
+            if not info.get("ok") and not info.get("has_bfs"):
+                summary["error_count"] += 1
+                item["error"] = "jwt decode failed or empty token"
+                summary["items"].append(item)
+                continue
+            if item["has_bfs"]:
+                summary["bfs_count"] += 1
+                key = str(item["bfs"])
+                value_dist[key] = value_dist.get(key, 0) + 1
+                summary["items"].append(item)
+            else:
+                summary["clean_count"] += 1
+                if include_clean:
+                    summary["items"].append(item)
+    decoded = summary["bfs_count"] + summary["clean_count"]
+    summary["bfs_rate"] = round(100.0 * summary["bfs_count"] / decoded, 2) if decoded else 0.0
+    summary["bfs_value_dist"] = value_dist
+    return summary
+
+
+def apply_bfs_to_cpa_record(record: dict, bfs_info: dict | None = None) -> dict:
+    """Annotate CPA record with bfs metadata; optionally disable flagged accounts."""
+    if not isinstance(record, dict):
+        return record
+    info = bfs_info or inspect_cpa_record_bfs(record)
+    if info.get("ok") is not True:
+        record["bfs"] = None
+        record["bfs_checked"] = False
+        record["bfs_status"] = "unknown"
+        record.pop("bfs_value", None)
+        record.pop("bfs_source", None)
+        return record
+    has = bool(info.get("has_bfs"))
+    record["bfs"] = has
+    record["bfs_checked"] = True
+    record["bfs_status"] = "flagged" if has else "clean"
+    if has:
+        record["bfs_value"] = info.get("bfs")
+        record["bfs_source"] = str(info.get("source") or "")
+    else:
+        record.pop("bfs_value", None)
+        record.pop("bfs_source", None)
+    return record
 
 
 def rfc3339_ns(ts: float | None = None) -> str:
@@ -394,7 +748,7 @@ def _parse_grok_account_state(page_html: str) -> dict:
         risk = None
     policy = detail_fields.get("policy", "").lower()
     event = detail_fields.get("event", "")
-    denied = policy == "deny" and event == "$registration"
+    denied = policy == "deny"
 
     return {
         "found": bool(source_match or details_match),
@@ -455,6 +809,146 @@ def inspect_sso_account_state(
     except Exception as exc:
         result["error"] = str(exc)
         return result
+
+
+def classify_sso_account_state(state: dict) -> str:
+    """Map inspect_sso_account_state() into flagged / clean / error / unknown.
+
+    Aligns with the live risk gate:
+      - botFlagSource in (1, 2)
+      - policy=deny (any event, including $registration / $login)
+    """
+    if not isinstance(state, dict):
+        return "unknown"
+    bf = state.get("bot_flag_source")
+    policy = str(state.get("policy") or "").strip().lower()
+    if state.get("denied") or bf in (1, 2) or policy == "deny":
+        return "flagged"
+    if state.get("found"):
+        return "clean"
+    try:
+        status = int(state.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status != 200 or str(state.get("error") or "").strip():
+        return "error"
+    return "unknown"
+
+
+def run_check_sso_state(
+    records: list[SsoInput],
+    *,
+    proxy: str = "",
+    delay: float = 0,
+    export: str | Path | None = None,
+    clean_export: str | Path | None = None,
+    log=print,
+    on_item=None,
+    cancel_callback=None,
+) -> dict:
+    """批量读取 grok.com 账号风控状态，不换 token 不入库。
+
+    export / clean_export 边检查边逐行追加写（0600），中断不丢已检查结果；
+    clean_export 写出 verdict=clean 的原始行（raw_line，每行一条），仅用于本机后续 --sso 输入。
+    """
+    summary: dict = {
+        "ok": True,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total": 0,
+        "flagged_count": 0,
+        "clean_count": 0,
+        "unknown_count": 0,
+        "error_count": 0,
+        "denied_count": 0,
+        "bot_flag_dist": {},
+        "items": [],
+        "export_path": "",
+        "export_count": 0,
+        "clean_export_path": "",
+        "clean_export_count": 0,
+        "cancelled": False,
+    }
+    dist: dict[str, int] = {}
+    export_path = None
+    clean_path = None
+    if export:
+        export_path = Path(export)
+        export_path.unlink(missing_ok=True)
+    if clean_export:
+        clean_path = Path(clean_export)
+        clean_path.unlink(missing_ok=True)
+
+    total = len(records)
+    for i, record in enumerate(records, 1):
+        if cancel_callback and cancel_callback():
+            summary["cancelled"] = True
+            break
+        email = str(record.email or "").strip()
+
+        def _check_log(message, _i=i):
+            log(f"  [{_i}] {str(message).strip()}")
+
+        state = inspect_sso_account_state(record.sso, proxy=proxy, log=_check_log)
+        verdict = classify_sso_account_state(state)
+        bf = state.get("bot_flag_source")
+        summary["total"] += 1
+        dist_key = str(bf) if bf is not None else "none"
+        dist[dist_key] = dist.get(dist_key, 0) + 1
+        row = {
+            "index": i,
+            "email": email,
+            "bot_flag_source": bf,
+            "bot_flag_details": state.get("bot_flag_details") or "",
+            "risk": state.get("risk"),
+            "policy": state.get("policy") or "",
+            "event": state.get("event") or "",
+            "denied": bool(state.get("denied")),
+            "found": bool(state.get("found")),
+            "status_code": state.get("status_code"),
+            "verdict": verdict,
+            "error": state.get("error") or "",
+        }
+        summary["items"].append(row)
+        if verdict == "flagged":
+            summary["flagged_count"] += 1
+            if row["denied"]:
+                summary["denied_count"] += 1
+            if export_path:
+                append_private_text(export_path, json.dumps(row, ensure_ascii=False) + "\n")
+        elif verdict == "clean":
+            summary["clean_count"] += 1
+            if clean_path:
+                append_private_text(clean_path, record.raw_line + "\n")
+        elif verdict == "unknown":
+            summary["unknown_count"] += 1
+        else:
+            summary["error_count"] += 1
+
+        tag = "❌" if verdict == "flagged" else ("✅" if verdict == "clean" else "⚠️")
+        log(
+            f"{tag} [{i}/{total}] {email or '(no email)'} "
+            f"botFlagSource={bf} details={row['bot_flag_details'] or '-'} "
+            f"status={state.get('status_code')} -> {verdict}"
+        )
+        if on_item:
+            on_item(row, record, summary)
+        if delay and i < total:
+            if cancel_callback and cancel_callback():
+                summary["cancelled"] = True
+                break
+            time.sleep(float(delay))
+
+    summary["export_path"] = str(export_path) if export_path else ""
+    summary["export_count"] = summary["flagged_count"]
+    summary["clean_export_path"] = str(clean_path) if clean_path else ""
+    summary["clean_export_count"] = summary["clean_count"]
+    summary["bot_flag_dist"] = dist
+    if (
+        summary["total"]
+        and summary["flagged_count"] + summary["clean_count"] + summary["unknown_count"] == 0
+    ):
+        summary["ok"] = False
+    return summary
 
 
 def _normalize_token_payload(token: dict) -> dict | None:
@@ -1221,7 +1715,14 @@ def _safe_email_for_filename(email: str) -> str:
     return safe or "unknown"
 
 
-def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
+def token_to_cpa_record(
+    token: dict,
+    email: str = "",
+    sso: str = "",
+    *,
+    bfs_info: dict | None = None,
+    check_bfs: bool = True,
+) -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
     对齐 CPA internal/auth/xai/token.go 的 TokenStorage 字段，以及
@@ -1268,6 +1769,18 @@ def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
     sso_val = str(sso or "").strip()
     if sso_val:
         record["sso"] = sso_val
+    if check_bfs:
+        info = bfs_info or inspect_token_bundle_bfs(
+            access_token=access,
+            sso=sso_val,
+            id_token=id_token,
+            refresh_token=refresh,
+        )
+        apply_bfs_to_cpa_record(record, info)
+    else:
+        record["bfs"] = None
+        record["bfs_checked"] = False
+        record["bfs_status"] = "disabled"
     return record
 
 
@@ -1757,10 +2270,52 @@ def main() -> int:
     ap.add_argument("--proxy", default="", help="OAuth 请求走代理，如 http://127.0.0.1:7890")
     ap.add_argument("--consume-success", action="store_true", help="成功后从 SSO 队列文件原子移除对应记录（--sso 文件，或 --accounts-dir 扫描到的各任务 sso_pending.txt）")
     ap.add_argument("--pending-only", action="store_true", help="配合 --accounts-dir：只处理各任务目录的 sso_pending.txt")
+    ap.add_argument(
+        "--check-sso-state",
+        metavar="FILE",
+        default=None,
+        help="仅批量检查 sso 列表的 grok.com 账号风控状态（botFlagSource/risk/policy deny），不换 token 不入库",
+    )
+    ap.add_argument(
+        "--sso-state-export",
+        metavar="FILE",
+        default=None,
+        help="与 --check-sso-state 联用：导出被标记（botFlagSource=1/2 或 policy deny）名单 jsonl，不含 token",
+    )
+    ap.add_argument(
+        "--sso-state-clean-export",
+        metavar="FILE",
+        default=None,
+        help="与 --check-sso-state 联用：导出干净 sso 原始行 txt，每行一条，可直接复用为 --sso 输入",
+    )
     ap.add_argument("--report-json", default=None, help="写入不含 token 的运行摘要 JSON")
     args = ap.parse_args()
 
     apply_config_defaults(args)
+
+    # Standalone batch grok.com account-state check (no token conversion)
+    if args.check_sso_state:
+        records = load_sso_records(path=args.check_sso_state)
+        if not records:
+            ap.error(f"--check-sso-state: {args.check_sso_state} 中没有可用 sso")
+        summary = run_check_sso_state(
+            records,
+            proxy=args.proxy,
+            delay=args.delay,
+            export=args.sso_state_export,
+            clean_export=args.sso_state_clean_export,
+        )
+        if args.report_json:
+            atomic_write_json(args.report_json, summary)
+            print(f"报告 → {args.report_json}")
+        print(
+            f"sso 状态检查: total={summary['total']} "
+            f"flagged={summary['flagged_count']} clean={summary['clean_count']} "
+            f"unknown={summary['unknown_count']} err={summary['error_count']} "
+            f"botFlagDist={summary['bot_flag_dist']}"
+        )
+        return 0 if summary.get("ok") else 1
+
     records = load_sso_records(
         path=args.sso,
         single=args.sso_cookie,

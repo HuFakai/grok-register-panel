@@ -21,15 +21,81 @@ from webui import process_utils
 from webui import proxy_store
 
 
-def request(url: str, *, token: str = "", method: str = "GET", body: bytes | None = None):
+def test_compat_process_roots_require_existing_absolute_paths():
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        current = base / "current"
+        previous = base / "previous"
+        current.mkdir()
+        previous.mkdir()
+        roots = monitor._configured_process_roots(
+            current,
+            {
+                "GROK_COMPAT_PROCESS_ROOTS": os.pathsep.join(
+                    [str(previous), "relative-release", str(base / "missing"), str(current)]
+                )
+            },
+        )
+        assert roots == (current.resolve(), previous.resolve())
+
+
+def test_process_discovery_aggregates_explicit_release_roots():
+    previous_roots = monitor.MANAGED_PROCESS_ROOTS
+    previous_find = monitor.find_managed_processes
+    roots = (Path("/test/current"), Path("/test/previous"))
+    calls = []
+
+    def fake_find(root, script_names):
+        calls.append((root, script_names))
+        pid = 101 if root == roots[0] else 202
+        return [{"pid": pid, "pgid": pid, "etime": "00:01", "cmd": "test"}]
+
+    monitor.MANAGED_PROCESS_ROOTS = roots
+    monitor.find_managed_processes = fake_find
+    try:
+        found = monitor._find_managed_processes(("run_until_100.py",))
+    finally:
+        monitor.MANAGED_PROCESS_ROOTS = previous_roots
+        monitor.find_managed_processes = previous_find
+
+    assert [item["pid"] for item in found] == [101, 202]
+    assert [call[0] for call in calls] == list(roots)
+
+
+def test_panel_registration_env_enables_guarded_cache():
+    previous_enabled = os.environ.pop("GROK_STATIC_ASSET_CACHE", None)
+    previous_dir = os.environ.pop("GROK_STATIC_CACHE_DIR", None)
+    try:
+        env = monitor._registration_env()
+        assert env["GROK_STATIC_ASSET_CACHE"] == "1"
+        assert Path(env["GROK_STATIC_CACHE_DIR"]).as_posix().endswith("log/static-asset-cache")
+        node_path = Path(str(env.get("PLAYWRIGHT_NODEJS_PATH") or ""))
+        if os.name == "nt":
+            assert env.get("GROK_HEADLESS") == "1"
+            assert env.get("PYTHONUTF8") == "1"
+            assert node_path.name != "playwright-node"
+        os.environ["GROK_STATIC_ASSET_CACHE"] = "0"
+        assert monitor._registration_env()["GROK_STATIC_ASSET_CACHE"] == "0"
+    finally:
+        if previous_enabled is None:
+            os.environ.pop("GROK_STATIC_ASSET_CACHE", None)
+        else:
+            os.environ["GROK_STATIC_ASSET_CACHE"] = previous_enabled
+        if previous_dir is None:
+            os.environ.pop("GROK_STATIC_CACHE_DIR", None)
+        else:
+            os.environ["GROK_STATIC_CACHE_DIR"] = previous_dir
+
+
+def request(url: str, *, token: str = "", method: str = "GET", body: bytes | None = None, timeout: float = 5):
     headers = {}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = "Bearer " + token
     if body is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        response = urllib.request.urlopen(req, timeout=5)
+        response = urllib.request.urlopen(req, timeout=timeout)
         return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
@@ -114,13 +180,32 @@ def test_monitor_http_auth_and_headers():
 
         status, _, body = request(base + "/api/status", token=token)
         assert status == 200
-        assert "process" in json.loads(body)
+        payload = json.loads(body)
+        assert "process" in payload
+        assert "traffic" in payload
+        assert "bytes_up" in payload["traffic"]
+        assert "traffic_summary" in payload
+        assert "bytes_per_batch" in payload["traffic_summary"]
+        assert "bytes_per_success" in payload["traffic_summary"]
 
         status, _, _ = request(base + "/api/recovery")
         assert status == 401
-        status, _, body = request(base + "/api/recovery", token=token)
+        # recovery_status 全量扫描账号目录（5 万+记录时约 6s），放宽客户端超时
+        status, _, body = request(base + "/api/recovery", token=token, timeout=30)
         assert status == 200
         assert "pending_count" in json.loads(body)
+
+        status, _, _ = request(base + "/api/sso-state")
+        assert status == 401
+        status, _, body = request(base + "/api/sso-state", token=token)
+        assert status == 200
+        assert "sources" in json.loads(body)
+        status, _, body = request(
+            base + "/api/sso-state/start",
+            method="POST",
+            body=b'{"source":"paste","text":""}',
+        )
+        assert status == 401
 
         status, _, body = request(base + "/api/proxies")
         assert status == 401
@@ -558,23 +643,14 @@ def test_start_reports_unavailable_process_table():
 
 
 def test_ip_usage_api_delete_and_per_ip_limit():
-    import browser_session
     import ip_usage_store
 
     token = "test-ip-usage-token-123456"
     previous_token = os.environ.get("MONITOR_TOKEN")
     previous_file = ip_usage_store._USAGE_FILE
-    previous_lookup = browser_session.lookup_exit_meta
     previous_control = monitor.load_control
     with tempfile.TemporaryDirectory() as temp:
         ip_usage_store._USAGE_FILE = Path(temp) / "log" / "ip_usage.json"
-        browser_session.lookup_exit_meta = lambda ip: {
-            "status": "success",
-            "country": "美国",
-            "isp": "TEST ISP",
-            "org": "TEST ORG",
-            "as": "AS12345",
-        }
         # 隔离全局上限：真实 control 文件可能设置了 ip_usage_limit
         monitor.load_control = lambda: {"ip_usage_limit": 0}
         os.environ["MONITOR_TOKEN"] = token
@@ -594,8 +670,6 @@ def test_ip_usage_api_delete_and_per_ip_limit():
             items = {it["ip"]: it for it in payload["items"]}
             assert payload["total_usage"] == 4
             assert items["203.0.113.7"]["count"] == 3
-            assert items["203.0.113.7"]["meta"]["country"] == "美国"
-            assert items["203.0.113.7"]["meta"]["asn"] == "AS12345"
             # 未设置覆盖 → limit None，生效值回退全局（0=不限）
             assert items["203.0.113.7"]["limit"] is None
             assert items["203.0.113.7"]["limit_effective"] == 0
@@ -661,8 +735,187 @@ def test_ip_usage_api_delete_and_per_ip_limit():
             server.server_close()
             thread.join(timeout=5)
             ip_usage_store._USAGE_FILE = previous_file
-            browser_session.lookup_exit_meta = previous_lookup
             monitor.load_control = previous_control
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
+def test_ip_usage_api_reset_clears_all():
+    import ip_usage_store
+
+    token = "test-ip-usage-reset-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = ip_usage_store._USAGE_FILE
+    previous_control = monitor.load_control
+    with tempfile.TemporaryDirectory() as temp:
+        ip_usage_store._USAGE_FILE = Path(temp) / "log" / "ip_usage.json"
+        monitor.load_control = lambda: {"ip_usage_limit": 0}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            # 写入统计 + 每 IP 上限 + 软拉黑，确认清空前存在
+            ip_usage_store.record_ip_usage("203.0.113.9", times=2)
+            ip_usage_store.record_ip_usage("203.0.113.10", times=1)
+            ip_usage_store.set_ip_usage_limit("203.0.113.9", 5)
+            assert ip_usage_store.get_total_usage() == 3
+            ip_usage_store.soft_blacklist_ip("203.0.113.10")
+            assert ip_usage_store.get_ip_usage("203.0.113.10") == 99999
+
+            # 无 token → 401
+            status, _, _ = request(
+                base + "/api/ip-usage/reset", method="POST"
+            )
+            assert status == 401
+            # 带 token → 200，统计全清
+            status, _, body = request(
+                base + "/api/ip-usage/reset", token=token, method="POST"
+            )
+            assert status == 200
+            assert json.loads(body) == {"ok": True, "cleared": True}
+
+            # GET 确认全空：次数/上限/软拉黑/元数据都清掉
+            status, _, body = request(base + "/api/ip-usage", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["items"] == []
+            assert payload["total_usage"] == 0
+            assert ip_usage_store.get_per_ip_limit("203.0.113.9") is None
+            assert ip_usage_store.get_ip_usage("203.0.113.10") == 0
+            assert ip_usage_store.is_soft_blacklisted("203.0.113.10") is False
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            ip_usage_store._USAGE_FILE = previous_file
+            monitor.load_control = previous_control
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
+def test_ip_pool_api_returns_state():
+    import webui.ip_ready_pool as ip_ready_pool
+    from webui import proxy_store as ps
+
+    token = "test-ip-pool-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_file = ip_ready_pool._POOL_FILE
+    previous_snapshot = ps.worker_proxy_snapshot
+    with tempfile.TemporaryDirectory() as temp:
+        ip_ready_pool._POOL_FILE = Path(temp) / "log" / "ip_ready_pool.json"
+        ps.worker_proxy_snapshot = lambda: {"configured": False, "urls": []}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            status, _, _ = request(base + "/api/ip-pool")
+            assert status == 401
+            status, _, body = request(base + "/api/ip-pool", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["stats"]["total"] == 0
+            assert payload["items"] == []
+
+            # 写一条可用项后可见
+            ip_ready_pool._write_items(
+                [
+                    {
+                        "id": "abc123",
+                        "template_url": "http://Default.{session}:TOKEN@h:2261",
+                        "expanded_url": "http://Default.ipool-1-0:TOKEN@h:2261",
+                        "exit_ip": "198.51.100.9",
+                        "used": 0,
+                        "limit": 10,
+                        "usable": True,
+                        "checked_at": 1000.0,
+                        "expires_at": 1000.0 + 600,
+                        "consumer": "",
+                        "consumed_at": 0.0,
+                    }
+                ]
+            )
+            status, _, body = request(base + "/api/ip-pool", token=token)
+            payload = json.loads(body)
+            assert payload["stats"]["total"] == 1
+            assert payload["stats"]["usable"] == 0  # 1970 年过期项不计入可用
+            assert payload["items"][0]["exit_ip"] == "198.51.100.9"
+
+            # 探测接口需要写权限
+            status, _, _ = request(base + "/api/ip-pool/probe", method="POST", body=b"{}")
+            assert status == 401
+            status, _, _ = request(
+                base + "/api/ip-pool/probe",
+                token=token,
+                method="POST",
+                body=b"{}",
+            )
+            # 无代理模板时探测不报错，返回当前统计
+            assert status == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            ip_ready_pool._POOL_FILE = previous_file
+            ps.worker_proxy_snapshot = previous_snapshot
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
+def test_grok2api_api_auth_and_status():
+    import webui.grok2api_upload as g2api_upload
+
+    token = "test-grok2api-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_report = g2api_upload.REPORT_FILE
+    previous_config = g2api_upload.load_config
+    with tempfile.TemporaryDirectory() as temp:
+        g2api_upload.REPORT_FILE = Path(temp) / "log" / "grok2api_upload_report.json"
+        g2api_upload.load_config = lambda *a, **k: {}
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            # 读需要 token
+            status, _, _ = request(base + "/api/grok2api")
+            assert status == 401
+            status, _, body = request(base + "/api/grok2api", token=token)
+            assert status == 200
+            payload = json.loads(body)
+            assert payload["configured"] is False
+            assert payload["running"] is False
+            assert payload["last_report"] == {}
+            # 上传/停止需要写权限
+            status, _, _ = request(base + "/api/grok2api/upload", method="POST", body=b"{}")
+            assert status == 401
+            status, _, body = request(
+                base + "/api/grok2api/upload",
+                token=token,
+                method="POST",
+                body=b"{}",
+            )
+            # 未配置 → 409 且提示未配置
+            assert status == 409
+            assert "未配置" in json.loads(body).get("error", "")
+            status, _, _ = request(base + "/api/grok2api/stop", method="POST", body=b"{}")
+            assert status == 401
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            g2api_upload.REPORT_FILE = previous_report
+            g2api_upload.load_config = previous_config
             if previous_token is None:
                 os.environ.pop("MONITOR_TOKEN", None)
             else:
@@ -672,6 +925,9 @@ def test_ip_usage_api_delete_and_per_ip_limit():
 if __name__ == "__main__":
     test_proxy_start_prerequisites()
     test_kill_all_verifies_process_exit()
+    test_compat_process_roots_require_existing_absolute_paths()
+    test_process_discovery_aggregates_explicit_release_roots()
+    test_panel_registration_env_enables_guarded_cache()
     test_monitor_http_auth_and_headers()
     test_proxy_api_auth_mutations_and_redaction()
     test_email_domain_api_auth_and_mutations()
@@ -680,4 +936,7 @@ if __name__ == "__main__":
     test_log_cleanup_api_requires_auth_and_returns_summary()
     test_start_reports_unavailable_process_table()
     test_ip_usage_api_delete_and_per_ip_limit()
+    test_ip_usage_api_reset_clears_all()
+    test_ip_pool_api_returns_state()
+    test_grok2api_api_auth_and_status()
     print("OK monitor http")

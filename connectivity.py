@@ -15,6 +15,10 @@ XAI_SIGNUP_CHECK_NAME = "xAI注册页"
 XAI_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 
+class XaiSignupPrecheckFailed(RuntimeError):
+    """The registration page was not reachable through the selected proxy."""
+
+
 def _tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
     s = socket.socket()
     s.settimeout(timeout)
@@ -111,6 +115,11 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
     return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
+
+
+def require_xai_signup(results: List[CheckResult]) -> None:
+    if has_blocking_xai_failure(results):
+        raise XaiSignupPrecheckFailed("xAI registration page precheck failed")
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:
@@ -261,6 +270,53 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             if domains:
                 detail += f"；域名 {domains[:80]}"
             return "邮箱API", True, detail
+
+        if provider == "inbucket":
+            from email_providers import inbucket as inbucket_provider
+
+            base = inbucket_provider.normalize_base(
+                str(config.get("inbucket_api_base") or "")
+            )
+            domains = inbucket_provider.parse_domains(config.get("inbucket_domain"))
+            if not base:
+                return "邮箱API", False, "未配置 inbucket_api_base"
+            if not domains:
+                return "邮箱API", False, "未配置 inbucket_domain"
+            # GET 邮箱列表无副作用：不存在即返回空数组
+            resp = http_get(
+                f"{base}/api/v1/mailbox/probe",
+                headers={"Accept": "application/json"},
+                timeout=12,
+                proxies={},
+            )
+            if resp.status_code in (401, 403):
+                return "邮箱API", False, f"Inbucket 拒绝访问 HTTP {resp.status_code}"
+            if resp.status_code == 404:
+                return "邮箱API", False, "Inbucket API 404：请检查实例地址与 base path"
+            if resp.status_code >= 400:
+                return "邮箱API", False, f"Inbucket HTTP {resp.status_code}"
+            return "邮箱API", True, f"Inbucket 可达 HTTP {resp.status_code}（域名 {','.join(domains)[:80]}）"
+
+        if provider == "outlook_rt":
+            from email_providers import outlook_rt as outlook_rt_provider
+
+            inv = str(config.get("outlook_rt_inventory") or "").strip()
+            if not inv:
+                return "邮箱API", False, "未配置 outlook_rt_inventory"
+            used = str(config.get("outlook_rt_used_path") or "").strip()
+            client_id = str(config.get("outlook_rt_client_id") or "").strip()
+            detail = outlook_rt_provider.probe_inventory(
+                http_post,
+                inv,
+                used_path=used,
+                default_client_id=client_id,
+            )
+            ok = "refresh OK" in detail or "available=" in detail
+            if "available=0" in detail and "refresh OK" not in detail:
+                ok = False
+            if "refresh 失败" in detail:
+                ok = False
+            return "邮箱API", ok, detail[:300]
 
         return "邮箱API", True, f"提供商 {provider} 跳过深度探测"
     except Exception as exc:

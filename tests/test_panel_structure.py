@@ -61,7 +61,7 @@ def test_reference_motion_and_reduced_motion():
     assert 'background-size: 40px 40px;' in mon
     assert '@keyframes panel-enter' in mon
     assert 'main > :not(.help-view)' in mon
-    assert 'animation: panel-enter 520ms' in mon
+    assert 'animation: panel-enter 400ms' in mon
     assert '@media (prefers-reduced-motion: reduce)' in mon
     assert 'animation-iteration-count: 1 !important;' in mon
 
@@ -71,8 +71,8 @@ def test_compact_overview_density():
     assert '.control-panel { padding: 12px 16px; }' in mon
     assert '.control-panel .msg:empty { display: none; }' in mon
     assert '#kpis { margin-top: 10px; }' in mon
-    assert '.rate-panel { margin-top: 10px; padding: 12px 16px 14px; }' in mon
-    assert '<section class="card panel rate-panel">' in mon
+    assert '.rate-panel { padding: 12px 14px 14px; }' in mon
+    assert '<section class="card rate-panel">' in mon
     assert '@media (min-width: 1121px)' in mon
     assert '.control-panel .control-actions button {' in mon
 
@@ -94,10 +94,11 @@ def test_help_and_faq_module():
     assert 'body.help-view-open #dashboard-view > :not(#help-view) { display: none; }' in html
     assert 'role="tablist"' in html
     assert 'id="faq-search"' in html
-    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 13
+    assert len(re.findall(r'<details class="faq-item" data-faq-item', html)) == 16
     assert 'policy=deny' in html
     assert '账号补录' in html
     assert '成功项会从待补录队列移除' in html
+    assert 'bfs' in html.lower()
     assert 'permission-denied' in html
     assert 'function setAppView(view, options = {})' in mon
     assert 'function toggleAppView()' in mon
@@ -138,12 +139,17 @@ def test_proxy_pool_panel_structure():
     assert '/api/proxies/import' in mon
     assert '/api/proxies/test' in mon
     assert '/api/proxies/delete' in mon
+    assert 'id="ip-pool-body"' in html
+    assert 'function refreshIpPool(' in mon
+    assert 'function probeIpPool(' in mon
+    assert '/api/ip-pool' in mon
     assert 'def do_PATCH(self):' in mon
     assert 'def do_DELETE(self):' in mon
     assert 'worker_proxy_snapshot as _managed_worker_proxy_snapshot' in worker
     assert 'pool = load_proxy_pool()' in worker
     assert '面板代理池没有健康且启用的代理' in worker
     assert 'redact_proxy(px)' in worker
+    assert 'ip_ready_pool' in worker
 
 def test_email_service_and_domain_rotation_panel_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
@@ -190,17 +196,72 @@ def test_email_service_and_domain_rotation_panel_structure():
     assert 'on_email_domain_rejected' in flow
     assert 'on_email_accepted' in flow
 
+def test_ip_pool_datacenter_filter_toggle():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="ip-pool-filter-dc"' in html
+    assert '只用住宅出口' in html
+    assert 'function saveIpPoolDatacenterFilter(' in mon
+    assert 'ip_pool_filter_datacenter' in mon
+    # 注册限流失败分类
+    assert '注册限流' in mon
+
+
+def test_mail_cleanup_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="mail-cleanup-label"' in html
+    assert 'id="mail-cleanup-count"' in html
+    assert 'id="mail-cleanup-keep-hours"' in html
+    assert 'id="mail-cleanup-interval"' in html
+    assert 'id="mail-cleanup-enabled"' in html
+    assert 'id="mail-cleanup-clean-unknow"' in html
+    assert 'id="mail-cleanup-save-btn"' in html
+    assert 'id="mail-cleanup-run-btn"' in html
+    assert 'id="mail-cleanup-last"' in html
+    assert 'function refreshMailCleanup(' in mon
+    assert 'function renderMailCleanup(data, applySettings)' in mon
+    assert 'function mailCleanupProgressText(' in mon
+    assert 'function saveMailCleanupSettings(' in mon
+    assert 'function runMailCleanup(' in mon
+    # 运行中显示实时进度（scan/delete/batch 阶段），清理可能持续数分钟
+    assert 'p.phase === "scan"' in mon
+    assert 'p.phase === "delete"' in mon
+    assert 'p.phase === "batch"' in mon
+    assert '"progress": state.get("progress")' in mon
+    # 设置只在打开页面/保存成功后回填，后台轮询绝不覆盖编辑中的输入框
+    assert 'if (applySettings) mailCleanupSettingsToInputs(data.settings);' in mon
+    assert 'refreshMailCleanup(false, true)' in mon
+    # 计数不做任何周期轮询（含 60s）：只在清理执行（定时/手动）后随结果更新
+    assert '}, 60000);' not in mon
+    assert '待清理后更新' in mon
+    assert 'last_known_count' in mon
+    interval_3s = re.search(r'setInterval\(\(\) => \{.*?\}, 3000\);', mon, re.S)
+    assert interval_3s and 'MailCleanup' not in interval_3s.group(0)
+    assert '/api/mail-cleanup' in mon
+    assert '/api/mail-cleanup/run' in mon
+    assert '/api/mail-cleanup/settings' in mon
+    assert 'mail_cleanup_keep_hours' in mon
+    assert 'mail_cleanup_interval_hours' in mon
+    # 定时线程随 monitor 启动
+    assert 'def _mail_cleanup_loop(' in mon
+    assert 'name="mail-cleanup"' in mon
+
 def test_panel_security_and_recovery_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
     assert 'def _require_read(self)' in mon
     assert 'frame-ancestors \'none\'' in mon
     assert 'X-Frame-Options' in mon
-    assert 'MAX_REQUEST_BODY = 64 * 1024' in mon
+    assert 'MAX_REQUEST_BODY = 1024 * 1024' in mon
     assert mon.index('if not self._require_write():') < mon.index('body = self._read_body()')
     assert '/api/recovery/start' in mon
     assert '/api/recovery/stop' in mon
     assert 'id="recovery-pending"' in html
+    # IP 使用统计一键清空：后端端点 + 面板按钮 + JS
+    assert '/api/ip-usage/reset' in mon
+    assert 'id="ip-usage-reset-btn"' in html
+    assert 'function resetIpUsage' in mon
     assert 'id="recovery-accounts"' in html
     assert 'id="recovery-stop"' in html
     assert 'id="run-status" aria-label="任务状态：加载中"' in html
@@ -208,6 +269,76 @@ def test_panel_security_and_recovery_structure():
     assert 'id="kpis" aria-label="核心指标" aria-live=' not in html
     assert 'if u.path == "/favicon.ico":' in mon
     assert 'def version_string(self):' in mon
+
+
+def test_batch_traffic_metric_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    runner = (ROOT / 'run_batch_headless.py').read_text(encoding='utf-8')
+    assert '"traffic": traffic' in mon
+    assert '"traffic_summary": traffic_summary' in mon
+    assert 'if int(traffic.get("version") or 0) < 2:' in mon
+    assert 'function formatBytes(value)' in mon
+    assert '["本批代理流量"' in mon
+    assert '["每批平均流量"' in mon
+    assert '["每个成功号平均流量"' in mon
+    assert 'trafficSummary.bytes_per_batch' in mon
+    assert 'trafficSummary.bytes_per_success' in mon
+    assert '" / 上行 " + formatBytes(traffic.bytes_up)' in mon
+    assert '" / 下行 " + formatBytes(traffic.bytes_down)' in mon
+    assert 'archive_batch(history_file, finalized)' in runner
+    assert 'GROK_STATIC_ASSET_CACHE' in mon
+    assert 'static-asset-cache' in mon
+    assert 'setInterval(() => refreshStats(false), 30000);' in mon
+
+def test_grok2api_upload_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="grok2api-upload"' in html
+    assert 'id="grok2api-stop"' in html
+    assert 'id="grok2api-status"' in html
+    assert 'function renderGrok2api(' in mon
+    assert 'function startGrok2apiUpload(' in mon
+    assert 'function stopGrok2apiUpload(' in mon
+    assert '/api/grok2api' in mon
+    assert 'grok2api_admin_url' in mon
+    # 后台脚本存在
+    script = (ROOT / 'scripts/grok2api_upload.py').read_text(encoding='utf-8')
+    assert '--from-config' in script
+
+
+def test_embedded_scripts_parse():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    scripts = re.findall(r'<script>(.*?)</script>', html, re.S)
+    assert len(scripts) == 2
+    for script in scripts:
+        balance = 0
+        for ch in script:
+            if ch == '{':
+                balance += 1
+            elif ch == '}':
+                balance -= 1
+                assert balance >= 0
+        assert balance == 0
+
+
+def test_sso_state_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="sso-view-toggle"' in html
+    assert 'id="sso-view"' in html
+    assert 'id="sso-input"' in html
+    assert 'id="sso-body"' in html
+    assert 'id="sso-dash-title"' in html
+    assert 'function toggleSsoView()' in mon
+    assert 'function startSsoScan()' in mon
+    assert 'function refreshSsoState(' in mon
+    assert '/api/sso-state/start' in mon
+    assert 'view !== "sso"' in mon
+    assert 'from webui.sso_state_ops import' in mon
+    assert (ROOT / 'webui/sso_state_ops.py').is_file()
+    assert (ROOT / 'scripts/check_sso_state.py').is_file()
+
 
 if __name__ == '__main__':
     test_workers_dom_ids_unique()
@@ -223,4 +354,8 @@ if __name__ == '__main__':
     test_proxy_pool_panel_structure()
     test_email_service_and_domain_rotation_panel_structure()
     test_panel_security_and_recovery_structure()
+    test_embedded_scripts_parse()
+    test_sso_state_panel_structure()
+    test_ip_pool_datacenter_filter_toggle()
+    test_mail_cleanup_panel_structure()
     print('OK structure')

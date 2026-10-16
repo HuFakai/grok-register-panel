@@ -31,6 +31,7 @@ _USAGE_LOCK = threading.Lock()
 _KEY_COUNTS = "counts"
 _KEY_LIMITS = "limits"
 _KEY_META = "meta"
+_KEY_SOFT = "soft_blacklist"
 _KEY_UPDATED = "updated_at"
 
 
@@ -103,14 +104,33 @@ def _load_all() -> dict:
                 cleaned = _clean_meta(value)
                 if cleaned:
                     meta[str(ip).strip()] = cleaned
-    return {_KEY_COUNTS: counts, _KEY_LIMITS: limits, _KEY_META: meta}
+
+    soft: dict[str, dict] = {}
+    raw_soft = data.get(_KEY_SOFT) or {}
+    if isinstance(raw_soft, dict):
+        for ip, value in raw_soft.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                count = max(0, int(value.get("count") or 0))
+                until = float(value.get("until") or 0)
+            except (TypeError, ValueError):
+                continue
+            if count > 0 or until > 0:
+                soft[str(ip).strip()] = {"count": count, "until": until}
+    return {_KEY_COUNTS: counts, _KEY_LIMITS: limits, _KEY_META: meta, _KEY_SOFT: soft}
 
 
 def _load_counts() -> dict[str, int]:
     return _load_all().get(_KEY_COUNTS, {})
 
 
-def _write_all(counts: dict, limits: dict, meta: dict) -> None:
+def _write_all(
+    counts: dict,
+    limits: dict,
+    meta: dict,
+    soft: dict | None = None,
+) -> None:
     _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(
         _USAGE_FILE,
@@ -118,6 +138,7 @@ def _write_all(counts: dict, limits: dict, meta: dict) -> None:
             _KEY_COUNTS: counts,
             _KEY_LIMITS: limits,
             _KEY_META: meta,
+            _KEY_SOFT: soft if soft is not None else _load_all().get(_KEY_SOFT, {}),
             _KEY_UPDATED: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     )
@@ -140,6 +161,105 @@ def record_ip_usage(exit_ip: str, times: int = 1) -> int:
             counts[ip] = counts.get(ip, 0) + increment
             _write_all(counts, data[_KEY_LIMITS], data[_KEY_META])
             return counts[ip]
+
+
+SOFT_BLACKLIST_COUNT = 99999
+SOFT_COOLDOWN_SECONDS = 30 * 60  # 首次空页临时冷却时长
+SOFT_PERMANENT_THRESHOLD = 2  # 同一 IP 累计空页达到该次数 → 永久软拉黑
+
+
+def record_blank_page(
+    exit_ip: str,
+    cooldown_seconds: int = SOFT_COOLDOWN_SECONDS,
+    permanent_threshold: int = SOFT_PERMANENT_THRESHOLD,
+) -> tuple[bool, int]:
+    """记录一次空页：首次临时冷却，累计达阈值则永久软拉黑。
+
+    返回 (permanent, cumulative_count)：permanent=True 表示已把 counts 置
+    99999 永久拉黑；False 表示仅进入临时冷却（期间预检/可用池跳过）。
+    """
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return False, 0
+    with _USAGE_LOCK:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_USAGE_FILE.with_suffix(".lock")):
+            data = _load_all()
+            soft = dict(data.get(_KEY_SOFT) or {})
+            entry = dict(soft.get(ip) or {})
+            count = max(0, int(entry.get("count") or 0)) + 1
+            if count >= max(1, int(permanent_threshold)):
+                counts = data[_KEY_COUNTS]
+                counts[ip] = SOFT_BLACKLIST_COUNT
+                soft.pop(ip, None)
+                _write_all(counts, data[_KEY_LIMITS], data[_KEY_META], soft)
+                return True, count
+            entry["count"] = count
+            entry["until"] = time.time() + max(60.0, float(cooldown_seconds))
+            soft[ip] = entry
+            _write_all(data[_KEY_COUNTS], data[_KEY_LIMITS], data[_KEY_META], soft)
+            return False, count
+
+
+def is_soft_blacklisted(exit_ip: str, now: float | None = None) -> bool:
+    """该出口是否被软拉黑：永久（counts>=99999）或临时冷却期内。"""
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return False
+    now = time.time() if now is None else now
+    if get_ip_usage(ip) >= SOFT_BLACKLIST_COUNT:
+        return True
+    with _USAGE_LOCK:
+        data = _load_all()
+        entry = (data.get(_KEY_SOFT) or {}).get(ip) or {}
+        until = float(entry.get("until") or 0)
+        return until > now
+
+
+def soft_blacklist_until(exit_ip: str) -> float:
+    """临时冷却到期时间（epoch）；未冷却返回 0。"""
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return 0.0
+    with _USAGE_LOCK:
+        entry = (_load_all().get(_KEY_SOFT) or {}).get(ip) or {}
+        return float(entry.get("until") or 0)
+
+
+def clear_soft_blacklist(exit_ip: str) -> bool:
+    """清除该 IP 的空页累计与冷却记录（恢复脚本用），返回是否有清除。"""
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return False
+    with _USAGE_LOCK:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_USAGE_FILE.with_suffix(".lock")):
+            data = _load_all()
+            soft = dict(data.get(_KEY_SOFT) or {})
+            if ip not in soft:
+                return False
+            soft.pop(ip, None)
+            _write_all(data[_KEY_COUNTS], data[_KEY_LIMITS], data[_KEY_META], soft)
+            return True
+
+
+def soft_blacklist_ip(exit_ip: str) -> int:
+    """把某出口 IP 累计使用次数直接置 99999（软拉黑）。
+
+    超过所有上限后，注册侧预检、可用 IP 池、配额核验都会跳过该出口，
+    等效拉黑但保留记录，可手动删除恢复（与硬黑名单 ASN/ISP 不同）。
+    """
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return 0
+    with _USAGE_LOCK:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_USAGE_FILE.with_suffix(".lock")):
+            data = _load_all()
+            counts = data[_KEY_COUNTS]
+            counts[ip] = SOFT_BLACKLIST_COUNT
+            _write_all(counts, data[_KEY_LIMITS], data[_KEY_META])
+            return SOFT_BLACKLIST_COUNT
 
 
 def get_ip_usage(exit_ip: str) -> int:

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Playwright node wrapper: prefer system Node 18/20/22 + EPIPE guard.
+# Playwright 1.60's bundled node is v24.15 and fatal-exits on write EPIPE.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+GUARD="$HERE/playwright-epipe-guard.js"
+NODE="${GROK_PLAYWRIGHT_NODE:-}"
+if [[ -z "${NODE}" || ! -x "${NODE}" ]]; then
+  if [[ -x /usr/bin/node ]]; then
+    NODE=/usr/bin/node
+  else
+    NODE="$(command -v node || true)"
+  fi
+fi
+if [[ -z "${NODE}" || ! -x "${NODE}" ]]; then
+  echo "playwright-node: no system node found" >&2
+  exit 127
+fi
+if [[ -f "${GUARD}" ]]; then
+  exec "${NODE}" --require "${GUARD}" "$@"
+fi
+exec "${NODE}" "$@"

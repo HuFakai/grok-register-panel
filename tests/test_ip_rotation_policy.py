@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -149,7 +150,9 @@ def test_verified_rotation_retries_until_ip_changes():
     }
     seen = iter(["1.1.1.1", "2.2.2.2"])
     logs = []
+    previous_pick = app.ip_ready_pool.pick_usable
     try:
+        app.ip_ready_pool.pick_usable = lambda *a, **k: None  # 池空，走回退试错
         app.proxy_count_for_worker = lambda worker_id: 3
         app.pick_proxy_for_worker = (
             lambda worker_id, rotate_idx: f"http://user:pass@proxy:{10000 + rotate_idx}"
@@ -171,6 +174,7 @@ def test_verified_rotation_retries_until_ip_changes():
         assert ip == "2.2.2.2"
         assert all("pass" not in line for line in logs)
     finally:
+        app.ip_ready_pool.pick_usable = previous_pick
         for name, value in originals.items():
             setattr(app, name, value)
 
@@ -178,19 +182,24 @@ def test_verified_rotation_retries_until_ip_changes():
 def test_worker_proxy_assignments_do_not_collide_during_rotation():
     original_load = app.load_proxy_pool
     original_mark = app._mark_managed_proxy_used
+    original_details = app._managed_worker_proxy_details
     try:
         app.load_proxy_pool = lambda: ["proxy-a", "proxy-b", "proxy-c"]
         app._mark_managed_proxy_used = lambda _proxy: None
-        with app._proxy_pool_lock:
-            app._proxy_worker_assignments.clear()
+        # 隔离真实面板代理池：测试用固定列表走 leases 轮换
+        app._managed_worker_proxy_details = lambda: []
+        with app._proxy_lease_lock:
+            app._proxy_leases.clear()
         assert app.pick_proxy_for_worker(0, 0) == "proxy-a"
         assert app.pick_proxy_for_worker(1, 0) == "proxy-b"
         assert app.pick_proxy_for_worker(0, 1) == "proxy-c"
     finally:
         app.release_proxy_for_worker(0)
         app.release_proxy_for_worker(1)
+        app.release_proxy_lease()
         app.load_proxy_pool = original_load
         app._mark_managed_proxy_used = original_mark
+        app._managed_worker_proxy_details = original_details
 
 
 def test_ip_quota_is_shared_and_exclusive_across_workers():
@@ -305,7 +314,9 @@ def test_rotate_skips_precheck_failed_exit_without_starting_browser():
         )
     }
     started = []
+    previous_pick = app.ip_ready_pool.pick_usable
     try:
+        app.ip_ready_pool.pick_usable = lambda *a, **k: None  # 池空，走回退试错
         app.proxy_count_for_worker = lambda worker_id: 3
         app.pick_proxy_for_worker = (
             lambda worker_id, rotate_idx: f"http://proxy:{10000 + rotate_idx}"
@@ -338,8 +349,64 @@ def test_rotate_skips_precheck_failed_exit_without_starting_browser():
         assert ip == "9.9.9.3"
         assert started == [True], "应只对通过的出口启动一次浏览器"
     finally:
+        app.ip_ready_pool.pick_usable = previous_pick
         for name, value in originals.items():
             setattr(app, name, value)
+
+
+def test_blank_page_fails_and_soft_blacklists_without_same_slot_retry():
+    """空页（页面空白/无表单）直接失败，首次临时冷却、累计≥2次永久拉黑。"""
+    src = (ROOT / "grok_register_ttk.py").read_text(encoding="utf-8")
+    # 空页单独分支先于重试判定：直接判失败并冷却，不换口重试
+    assert "if blank_ui:" in src
+    assert "record_blank_page(active_ip)" in src
+    assert "空页判定失败" in src
+    # 空页分支内不含 retry_same_slot（空页不换口重试）；重试分支含 pipe_dead
+    blank_branch = src.split("if blank_ui:", 1)[1].split("elif (blank_ui", 1)[0]
+    assert "retry_same_slot = True" not in blank_branch
+    assert "pipe_dead" in src
+    assert "Playwright管道断开" in src
+    # 预检与 claim 路径都检查软拉黑冷却
+    assert "is_soft_blacklisted" in src
+
+
+def test_soft_blacklisted_ip_fails_precheck():
+    """软拉黑后的出口在预检中被跳过（累计使用 99999 或冷却中）。"""
+    import ip_usage_store
+
+    old = dict(app.config)
+    originals = {
+        "resolve": app._bs._resolve_proxy_exit_ip,
+        "blocked": app._bs.is_blocked_exit_ip,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = ip_usage_store._USAGE_FILE
+        ip_usage_store._USAGE_FILE = Path(tmp) / "ip_usage.json"
+        try:
+            app.config["ip_usage_limit"] = "30"
+            app._bs._resolve_proxy_exit_ip = lambda proxy: "203.0.113.99"
+            app._bs.is_blocked_exit_ip = lambda ip: (False, "")
+            ip_usage_store.soft_blacklist_ip("203.0.113.99")
+            usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+            assert usable is False
+            assert ip == "203.0.113.99"
+            assert "软拉黑" in reason or "已到上限" in reason
+            # 临时冷却同样被预检跳过
+            app._bs._resolve_proxy_exit_ip = lambda proxy: "203.0.113.100"
+            ip_usage_store.record_blank_page("203.0.113.100")
+            usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+            assert usable is False
+            assert "冷却" in reason
+            # 冷却到期后恢复可用
+            ip_usage_store.clear_soft_blacklist("203.0.113.100")
+            usable, ip, reason = app.precheck_proxy_exit("http://proxy:8080")
+            assert usable is True
+        finally:
+            ip_usage_store._USAGE_FILE = previous
+        app.config.clear()
+        app.config.update(old)
+        app._bs._resolve_proxy_exit_ip = originals["resolve"]
+        app._bs.is_blocked_exit_ip = originals["blocked"]
 
 
 if __name__ == "__main__":
@@ -355,4 +422,6 @@ if __name__ == "__main__":
     test_ip_quota_limit_zero_means_unlimited()
     test_precheck_proxy_exit_blacklist_and_limit()
     test_rotate_skips_precheck_failed_exit_without_starting_browser()
+    test_blank_page_fails_and_soft_blacklists_without_same_slot_retry()
+    test_soft_blacklisted_ip_fails_precheck()
     print("OK ip_rotation_policy")

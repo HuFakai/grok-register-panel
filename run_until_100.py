@@ -13,8 +13,14 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from runtime_platform import batch_launch_command, popen_group_kwargs, runtime_python
-from secure_files import append_private_text, ensure_private_dir
+from runtime_platform import (
+    apply_playwright_node_env,
+    batch_launch_command,
+    popen_group_kwargs,
+    runtime_python,
+)
+from retry_policy import PRECHECK_EXIT_CODE, orchestrator_failure_limit
+from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from notify_push import notify_task_done
 from results_store import ok_count
 from webui.blacklist_store import add_asn as add_blacklist_asn
@@ -112,10 +118,17 @@ def start_batch(count: int):
     logname = LOG_DIR / f"batch-orch-{time.strftime('%Y%m%d-%H%M%S')}-n{count}.log"
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["GROK_NOTIFY_SUPPRESS"] = "1"
+    if os.name == "nt":
+        env.setdefault("GROK_HEADLESS", "1")
+        env.setdefault("PYTHONUTF8", "1")
+    apply_playwright_node_env(env)
     try:
         proc = subprocess.Popen(
             batch_launch_command(
@@ -127,14 +140,14 @@ def start_batch(count: int):
             cwd=str(ROOT),
             stdout=fout,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "GROK_NOTIFY_SUPPRESS": "1"},
+            env=env,
             **popen_group_kwargs(),
         )
     finally:
         fout.close()
     write_pid_file(LOG_DIR / "batch100.pid", proc.pid)
     log(f"started pid={proc.pid} count={count} workers={WORKERS} log={logname.name}")
-    return proc.pid, logname
+    return proc, logname
 
 
 def read_blocklist_asns() -> set:
@@ -261,6 +274,8 @@ def analyze_risks_and_expand(logpath: Path) -> list:
         ok_as[a] += 1
 
     log(f"analyze risk_ips={risk_ips} risk_as={dict(risk_as)} ok_as={dict(ok_as)}")
+    log("analyze skip ASN ban (rotate IP every 3 successes instead)")
+    return []
     for asn, nbad in risk_as.most_common():
         if asn in blocked:
             continue
@@ -308,22 +323,31 @@ def main():
     log(f"rules: workers={WORKERS} pause_on_risk_only={RISK_PAUSE} SSO ignored block={sorted(read_blocklist_asns())}")
     
     round_i = 0
+    consecutive_batch_failures = 0
+    failure_limit = orchestrator_failure_limit()
     while ok_count() < TARGET_CPA and round_i < MAX_ROUNDS:
         round_i += 1
         need = TARGET_CPA - ok_count()
         batch_n = min(max(need + 8, 15), 40)
         log(f"=== ROUND {round_i} need={need} batch_n={batch_n} ok={ok_count()} block={sorted(read_blocklist_asns())} ===")
         try:
-            pid, logpath = start_batch(batch_n)
+            proc, logpath = start_batch(batch_n)
         except Exception as e:
             log(f"start_batch failed: {e}")
+            consecutive_batch_failures += 1
+            if consecutive_batch_failures >= failure_limit:
+                log(
+                    f"ORCH STOP consecutive batch start failures="
+                    f"{consecutive_batch_failures}/{failure_limit}"
+                )
+                return
             time.sleep(5)
             continue
         t0 = time.time()
         while True:
             time.sleep(15)
             try:
-                alive = batch_alive(pid)
+                alive = proc.poll() is None and batch_alive(proc.pid)
             except Exception:
                 alive = False
             risks = count_risk(logpath)
@@ -344,7 +368,21 @@ def main():
                     log(f"  analyze error (continue anyway): {e}")
                 break
             if not alive:
-                log("  batch exited")
+                return_code = proc.poll()
+                log(f"  batch exited rc={return_code}")
+                if return_code == PRECHECK_EXIT_CODE:
+                    log("ORCH STOP xAI registration page precheck failed")
+                    return
+                if return_code not in (0, None):
+                    consecutive_batch_failures += 1
+                    if consecutive_batch_failures >= failure_limit:
+                        log(
+                            f"ORCH STOP consecutive batch failures="
+                            f"{consecutive_batch_failures}/{failure_limit}"
+                        )
+                        return
+                else:
+                    consecutive_batch_failures = 0
                 try:
                     analyze_risks_and_expand(logpath)
                 except Exception as e:

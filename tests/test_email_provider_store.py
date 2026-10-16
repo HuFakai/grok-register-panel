@@ -54,12 +54,24 @@ def test_provider_schema_and_defaults():
             "mailnest",
             "cloudmail",
             "moemail",
+            "outlook_rt",
+            "inbucket",
         }
         assert providers["duckmail"]["configured"] is True
         assert providers["cloudmail"]["configured"] is False
+        assert providers["outlook_rt"]["configured"] is False
+        assert providers["inbucket"]["configured"] is False
         assert any(
             field["name"] == "cloudmail_password" and field["secret"] is True
             for field in providers["cloudmail"]["fields"]
+        )
+        assert any(
+            field["name"] == "outlook_rt_inventory"
+            for field in providers["outlook_rt"]["fields"]
+        )
+        assert any(
+            field["name"] == "inbucket_api_base"
+            for field in providers["inbucket"]["fields"]
         )
 
 
@@ -377,6 +389,43 @@ def test_profiles_do_not_touch_legacy_config():
             assert email_provider_store.list_email_profiles()["has_legacy_config"] is True
 
 
+def test_inbucket_requires_base_and_domain():
+    with IsolatedConfig() as config_path:
+        saved = email_provider_store.save_email_provider_config(
+            "inbucket",
+            {
+                "inbucket_api_base": "http://127.0.0.1:9000/",
+                "inbucket_domain": "Mail.Example.com, box.example.net，mail.example.com",
+                "inbucket_random_levels": "1-3",
+            },
+        )
+        assert saved["provider"] == "inbucket"
+        assert saved["configured"] is True
+        assert saved["values"]["inbucket_api_base"] == "http://127.0.0.1:9000"
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        # 多根域名：去重、小写、逗号分隔
+        assert raw["inbucket_domain"] == "mail.example.com,box.example.net"
+        assert raw["inbucket_random_levels"] == "1-3"
+
+        partial = email_provider_store.save_email_provider_config(
+            "inbucket",
+            {"inbucket_api_base": "http://127.0.0.1:9000", "inbucket_domain": ""},
+        )
+        assert partial["configured"] is False
+
+        assert_config_error(
+            lambda: email_provider_store.save_email_provider_config(
+                "inbucket",
+                {"inbucket_api_base": "https://user:pass@inbucket.example.com"},
+            )
+        )
+        assert_config_error(
+            lambda: email_provider_store.save_email_provider_config(
+                "inbucket", {"inbucket_random_levels": "9"}
+            )
+        )
+
+
 if __name__ == "__main__":
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
@@ -386,4 +435,5 @@ if __name__ == "__main__":
     test_profiles_crud_enable_and_secret_preservation()
     test_profiles_validation_and_errors()
     test_profiles_do_not_touch_legacy_config()
+    test_inbucket_requires_base_and_domain()
     print("OK email provider store")

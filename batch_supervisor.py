@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
-import selectors
+import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+import psutil
+
 from runtime_platform import popen_group_kwargs
+from retry_policy import BATCH_MAX_RESTARTS_DEFAULT, PRECHECK_EXIT_CODE
 from secure_files import atomic_write_json, exclusive_file_lock
 
 
 PROGRESS_ENV = "GROK_BATCH_PROGRESS_FILE"
 DEFAULT_IDLE_TIMEOUT = 360
-DEFAULT_MAX_RESTARTS = 8
+DEFAULT_MAX_RESTARTS = BATCH_MAX_RESTARTS_DEFAULT
+NON_RETRYABLE_EXIT_CODES = frozenset({PRECHECK_EXIT_CODE})
 
 _PROGRESS_LOCK = threading.Lock()
 _DRIVER_CRASH_MARKERS = (
@@ -27,6 +33,41 @@ _DRIVER_CRASH_MARKERS = (
     "Connection closed while reading from the driver",
     "Playwright driver unexpectedly exited",
 )
+
+
+def _configure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
+def _write_output(text: str) -> None:
+    try:
+        print(text, end="", flush=True)
+    except UnicodeEncodeError:  # pragma: no cover - legacy Windows consoles
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(text.encode("utf-8", errors="replace"))
+            buffer.flush()
+
+
+def _read_pipe(pipe, output: queue.Queue) -> None:
+    try:
+        while True:
+            try:
+                chunk = os.read(pipe.fileno(), 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.put(chunk)
+    finally:
+        output.put(None)
+
+
+_configure_utf8_stdio()
 
 
 def is_driver_crash_line(line: str) -> bool:
@@ -86,14 +127,67 @@ def mark_slot_completed(slots: int = 1) -> None:
             )
 
 
+def _terminate_windows_process_tree(
+    process: subprocess.Popen,
+    grace_seconds: float = 5.0,
+    *,
+    psutil_module=psutil,
+) -> None:
+    tracked = []
+    try:
+        root = psutil_module.Process(process.pid)
+        tracked = root.children(recursive=True) + [root]
+    except (psutil_module.Error, OSError):
+        tracked = []
+
+    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if ctrl_break is not None:
+        try:
+            process.send_signal(ctrl_break)
+        except (OSError, ValueError):
+            pass
+    if tracked:
+        _gone, alive = psutil_module.wait_procs(
+            tracked,
+            timeout=min(max(0.1, grace_seconds), 2.0),
+        )
+        for item in alive:
+            try:
+                item.terminate()
+            except (psutil_module.Error, OSError):
+                pass
+        _gone, alive = psutil_module.wait_procs(
+            alive,
+            timeout=max(0.1, grace_seconds - 2.0),
+        )
+        for item in alive:
+            try:
+                item.kill()
+            except (psutil_module.Error, OSError):
+                pass
+    else:
+        try:
+            process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=max(0.1, grace_seconds))
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+
 def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5.0) -> None:
     if process.poll() is not None:
         return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
-        else:  # pragma: no cover - Windows fallback
-            process.terminate()
+        else:  # pragma: no cover - exercised through the injected unit test
+            _terminate_windows_process_tree(process, grace_seconds)
+            return
     except ProcessLookupError:
         return
     try:
@@ -104,8 +198,8 @@ def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
-        else:  # pragma: no cover - Windows fallback
-            process.kill()
+        else:  # pragma: no cover - handled above
+            _terminate_windows_process_tree(process, 0.5)
     except ProcessLookupError:
         pass
     try:
@@ -123,6 +217,7 @@ def run_supervisor(
     idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     max_restarts: int = DEFAULT_MAX_RESTARTS,
     child_env: Mapping[str, str] | None = None,
+    non_retryable_exit_codes: Sequence[int] = tuple(NON_RETRYABLE_EXIT_CODES),
 ) -> int:
     """Run a batch child and restart the remaining work after a driver crash."""
     target = max(1, int(count))
@@ -171,50 +266,86 @@ def run_supervisor(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
                 env=env,
                 **popen_group_kwargs(),
             )
             assert active_process.stdout is not None
-            selector = selectors.DefaultSelector()
-            selector.register(active_process.stdout, selectors.EVENT_READ)
+            output_queue: queue.Queue[bytes | None] = queue.Queue()
+            reader = threading.Thread(
+                target=_read_pipe,
+                args=(active_process.stdout, output_queue),
+                daemon=True,
+            )
+            reader.start()
             last_output = time.monotonic()
             restart_reason = ""
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending_output = ""
+            pipe_closed = False
+            exit_seen_at = None
 
-            try:
-                while not stop_requested:
-                    events = selector.select(timeout=1.0)
-                    for key, _mask in events:
-                        line = key.fileobj.readline()
-                        if not line:
-                            continue
-                        last_output = time.monotonic()
-                        print(line, end="", flush=True)
+            while not stop_requested:
+                try:
+                    chunk = output_queue.get(timeout=1.0)
+                except queue.Empty:
+                    chunk = b""
+                if chunk is None:
+                    pipe_closed = True
+                elif chunk:
+                    last_output = time.monotonic()
+                    pending_output += decoder.decode(chunk)
+                    lines = pending_output.splitlines(keepends=True)
+                    pending_output = ""
+                    if lines and not lines[-1].endswith(("\n", "\r")):
+                        pending_output = lines.pop()
+                    for line in lines:
+                        _write_output(line)
                         if is_driver_crash_line(line):
                             restart_reason = "playwright driver crashed"
                             break
-                    if restart_reason:
+                if restart_reason:
+                    break
+                return_code = active_process.poll()
+                if return_code is not None and pipe_closed:
+                    pending_output += decoder.decode(b"", final=True)
+                    if pending_output:
+                        _write_output(pending_output)
+                        if is_driver_crash_line(pending_output):
+                            restart_reason = "playwright driver crashed"
+                    break
+                if return_code is not None:
+                    # The reader may still be draining bytes written immediately
+                    # before process exit. EOF wins over idle detection.
+                    exit_seen_at = exit_seen_at or time.monotonic()
+                    if time.monotonic() - exit_seen_at > 2.0:
+                        pending_output += decoder.decode(b"", final=True)
+                        if pending_output:
+                            _write_output(pending_output)
                         break
-                    return_code = active_process.poll()
-                    if return_code is not None:
-                        tail = active_process.stdout.read()
-                        if tail:
-                            print(tail, end="", flush=True)
-                        break
-                    if time.monotonic() - last_output > max(1.0, float(idle_timeout)):
-                        restart_reason = f"no child output for {int(idle_timeout)}s"
-                        break
-            finally:
-                selector.close()
+                    continue
+                if time.monotonic() - last_output > max(1.0, float(idle_timeout)):
+                    restart_reason = f"no child output for {int(idle_timeout)}s"
+                    break
 
             if stop_requested:
                 _terminate_process_group(active_process)
+                try:
+                    active_process.stdout.close()
+                except OSError:
+                    pass
+                reader.join(timeout=2)
                 return 130
 
             return_code = active_process.poll()
             if restart_reason:
                 _terminate_process_group(active_process)
+                try:
+                    active_process.stdout.close()
+                except OSError:
+                    pass
+                reader.join(timeout=2)
                 restarts += 1
                 remaining = max(0, target - read_completed(progress_path))
                 print(
@@ -224,7 +355,20 @@ def run_supervisor(
                 time.sleep(min(1.0 * restarts, 5.0))
                 continue
 
+            try:
+                active_process.stdout.close()
+            except OSError:
+                pass
+            reader.join(timeout=2)
+
             completed = read_completed(progress_path)
+            if return_code in {int(code) for code in non_retryable_exit_codes}:
+                print(
+                    f"[supervisor] child exited with non-retryable rc={return_code} "
+                    f"completed={completed}/{target}",
+                    flush=True,
+                )
+                return int(return_code)
             if return_code == 0 and completed >= target:
                 print(
                     f"[supervisor] child exited cleanly completed={completed}/{target}",

@@ -171,6 +171,86 @@ def save_account_record(
         return _write_exports(root, records)
 
 
+def delete_account_records(
+    accounts_dir: str | os.PathLike[str],
+    emails: list[str],
+) -> dict:
+    """Delete given accounts (per-account txt) and rebuild affected aggregates.
+
+    同一邮箱可能同时存在于根目录（遗留）与多个任务目录；这里把所有匹配的
+    <email>.txt 一并删除，再对每个受影响目录刷新聚合导出（accounts_all.txt /
+    grok2api 导入文件）。返回删除明细供面板展示。
+    """
+    base = ensure_private_dir(accounts_dir)
+    wanted: set[str] = set()
+    for item in emails or []:
+        try:
+            wanted.add(_clean_field(item, "邮箱").lower())
+        except ValueError:
+            continue
+    if not wanted:
+        return {"ok": False, "error": "没有可删除的邮箱", "deleted": [], "tasks": []}
+
+    affected_roots: dict[Path, list[str]] = {}
+    deleted: list[dict] = []
+    scanned = 0
+    for root in (base, *sorted(p for p in (base / TASKS_SUBDIR).glob("*") if p.is_dir())):
+        for path in root.glob("*.txt"):
+            if path.name in IGNORED_ACCOUNT_FILENAMES:
+                continue
+            scanned += 1
+            email_key = path.stem.lower()
+            if email_key not in wanted:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            affected_roots.setdefault(root, []).append(email_key)
+            deleted.append({"email": email_key, "task": _task_label(base, root)})
+
+    rebuilt = []
+    for root, removed in affected_roots.items():
+        lock_path = root / ".account_exports.lock"
+        with exclusive_file_lock(lock_path):
+            # 只以逐账号 txt 为源重建；不能走 _load_records（它会把删除前
+            # 的旧聚合 accounts_all.txt 当数据源读回，导致已删账号复活）。
+            records: dict[str, AccountCredential] = {}
+            for path in _source_files(root):
+                try:
+                    lines = path.read_text(encoding="utf-8-sig").splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    record = parse_account_line(line)
+                    if record is not None:
+                        records[record.email] = record
+            _write_exports(root, records)
+        rebuilt.append(
+            {
+                "task": _task_label(base, root),
+                "removed": len(removed),
+                "remaining": len(records),
+            }
+        )
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "deleted_count": len(deleted),
+        "tasks": rebuilt,
+        "scanned_files": scanned,
+    }
+
+
+def _task_label(base: Path, root: Path) -> str:
+    """任务目录名（accounts/tasks/<id>）；根目录返回空串表示遗留账号。"""
+    try:
+        rel = root.relative_to(base)
+    except ValueError:
+        return ""
+    return "" if rel == Path(".") else rel.parts[-1]
+
+
 def consolidate_account_exports(accounts_dir: str | os.PathLike[str]) -> dict:
     """Rebuild per-task aggregate files after a GUI/CLI registration round.
 

@@ -28,6 +28,8 @@ PROVIDER_LABELS = {
     "mailnest": "MailNest",
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
+    "outlook_rt": "Outlook RT 库存",
+    "inbucket": "Inbucket",
 }
 SUPPORTED_PROVIDERS = tuple(PROVIDER_LABELS)
 
@@ -65,8 +67,22 @@ FIELD_DEFINITIONS = {
         "type": "password",
         "secret": True,
     },
+    "cloudflare_randomize_subdomain": {
+        "label": "随机子域",
+        "type": "select",
+        "default": "false",
+        "options": [
+            {"value": "true", "label": "启用（需泛域收信）"},
+            {"value": "false", "label": "关闭（固定域名）"},
+        ],
+    },
     "defaultDomains": {
         "label": "收信域名",
+        "type": "text",
+        "placeholder": "mail.example.com, inbox.example.net",
+    },
+    "cloudmail_domains": {
+        "label": "收信域名（CloudMail）",
         "type": "text",
         "placeholder": "mail.example.com, inbox.example.net",
     },
@@ -157,7 +173,49 @@ FIELD_DEFINITIONS = {
             {"value": 0, "label": "永久"},
         ],
     },
+    "outlook_rt_inventory": {
+        "label": "库存文件路径",
+        "type": "text",
+        "placeholder": "/path/to/outlook_latest_50_with_rt.jsonl",
+    },
+    "outlook_rt_used_path": {
+        "label": "已用记录路径（可选）",
+        "type": "text",
+        "placeholder": "默认 inventory.used",
+    },
+    "outlook_rt_client_id": {
+        "label": "Client ID（可选）",
+        "type": "text",
+        "default": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+        "placeholder": "默认 Microsoft Authentication Broker",
+    },
+    "inbucket_api_base": {
+        "label": "实例地址",
+        "type": "url",
+        "placeholder": "http://127.0.0.1:9000",
+    },
+    "inbucket_domain": {
+        "label": "收信根域名（可多个）",
+        "type": "text",
+        "placeholder": "mail.example.com, box.example.net",
+    },
+    "inbucket_random_levels": {
+        "label": "随机子域级数",
+        "type": "select",
+        "default": "0",
+        "options": [
+            {"value": "0", "label": "关闭（使用根域名）"},
+            {"value": "1", "label": "随机 1 级子域"},
+            {"value": "2", "label": "随机 2 级子域"},
+            {"value": "1-2", "label": "随机 1-2 级子域"},
+            {"value": "1-3", "label": "随机 1-3 级子域"},
+        ],
+    },
 }
+
+# 历史遗留键：旧版本 cloudmail 与 cloudflare 共用 defaultDomains，
+# 保存旧数据时仍放行（读取侧已改为优先 cloudmail_domains）。
+LEGACY_PROVIDER_FIELDS = {"cloudmail": ("defaultDomains",)}
 
 PROVIDER_FIELDS = {
     "cloudflare": (
@@ -165,6 +223,7 @@ PROVIDER_FIELDS = {
         "cloudflare_auth_mode",
         "cloudflare_api_key",
         "cloudflare_custom_auth",
+        "cloudflare_randomize_subdomain",
         "defaultDomains",
         "cloudflare_path_domains",
         "cloudflare_path_accounts",
@@ -178,13 +237,23 @@ PROVIDER_FIELDS = {
         "cloudmail_url",
         "cloudmail_admin_email",
         "cloudmail_password",
-        "defaultDomains",
+        "cloudmail_domains",
     ),
     "moemail": (
         "moemail_api_base",
         "moemail_api_key",
         "moemail_domain",
         "moemail_expiry_ms",
+    ),
+    "outlook_rt": (
+        "outlook_rt_inventory",
+        "outlook_rt_used_path",
+        "outlook_rt_client_id",
+    ),
+    "inbucket": (
+        "inbucket_api_base",
+        "inbucket_domain",
+        "inbucket_random_levels",
     ),
 }
 
@@ -281,7 +350,7 @@ def _normalize_value(name: str, value: object):
             return normalize_domain(text)
         except EmailDomainValidationError as exc:
             raise EmailProviderConfigError(str(exc)) from exc
-    if name == "defaultDomains":
+    if name in {"defaultDomains", "cloudmail_domains", "inbucket_domain"}:
         return _normalize_domains(value)
     if field_type == "email":
         text = _string(value)
@@ -314,6 +383,16 @@ def _normalize_value(name: str, value: object):
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", text):
             raise EmailProviderConfigError("项目代码格式无效")
         return text
+    if name == "outlook_rt_client_id":
+        text = _string(value) or str(definition.get("default") or "")
+        if text and not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", text):
+            raise EmailProviderConfigError("Outlook Client ID 格式无效")
+        return text
+    if name in {"outlook_rt_inventory", "outlook_rt_used_path"}:
+        text = _string(value)
+        if text and any(ch in text for ch in "\n\r\0"):
+            raise EmailProviderConfigError("库存路径无效")
+        return text
     return _string(value, strip=name != "cloudmail_password")
 
 
@@ -342,11 +421,19 @@ def _is_configured(provider: str, values: dict) -> bool:
                 "cloudmail_url",
                 "cloudmail_admin_email",
                 "cloudmail_password",
-                "defaultDomains",
+                "cloudmail_domains" if values.get("cloudmail_domains") else "defaultDomains",
             )
         )
     if provider == "moemail":
         return bool(values.get("moemail_api_base") and values.get("moemail_api_key"))
+    if provider == "outlook_rt":
+        # 库存文件必须真实存在（否则取号必然失败，直接判定未配置）
+        inventory = str(values.get("outlook_rt_inventory") or "").strip()
+        return bool(inventory and Path(inventory).expanduser().is_file())
+    if provider == "inbucket":
+        return bool(
+            values.get("inbucket_api_base") and values.get("inbucket_domain")
+        )
     return False
 
 
@@ -404,6 +491,7 @@ def _candidate_config(
     if not isinstance(settings, dict):
         raise EmailProviderConfigError("settings 必须是 JSON 对象")
     allowed = set(PROVIDER_FIELDS[normalized_provider])
+    allowed.update(LEGACY_PROVIDER_FIELDS.get(normalized_provider, ()))
     unknown = sorted(set(settings) - allowed)
     if unknown:
         raise EmailProviderConfigError(f"包含不支持的配置字段: {unknown[0]}")
@@ -639,6 +727,7 @@ def save_email_profile(
     if not isinstance(fields, dict):
         raise EmailProviderConfigError("fields 必须是 JSON 对象")
     allowed = set(PROVIDER_FIELDS[normalized_provider])
+    allowed.update(LEGACY_PROVIDER_FIELDS.get(normalized_provider, ()))
     unknown = sorted(set(fields) - allowed)
     if unknown:
         raise EmailProviderConfigError(f"包含不支持的配置字段: {unknown[0]}")

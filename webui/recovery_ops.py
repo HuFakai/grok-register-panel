@@ -17,14 +17,14 @@ from runtime_platform import popen_group_kwargs, runtime_python
 from account_exports import GENERATED_EXPORT_FILENAMES
 
 try:
-    from secure_files import ensure_private_dir, exclusive_file_lock
+    from secure_files import best_effort_fchmod, ensure_private_dir, exclusive_file_lock
     from webui.process_utils import (
         find_managed_processes,
         terminate_managed_processes,
         write_pid_file,
     )
 except ImportError:  # running from webui/
-    from secure_files import ensure_private_dir, exclusive_file_lock
+    from secure_files import best_effort_fchmod, ensure_private_dir, exclusive_file_lock
     from process_utils import (  # type: ignore
         find_managed_processes,
         terminate_managed_processes,
@@ -126,7 +126,7 @@ def _account_records() -> dict[str, str]:
     # 递归扫描：根目录历史账号 + tasks/<任务>/ 下各任务账号
     for path in sorted(ACCOUNTS_DIR.rglob("*.txt")):
         if path.name in (
-            {"mail_credentials.txt", "sso_risk_rejected.txt"}
+            {"mail_credentials.txt", "sso_risk_rejected.txt", "sso_bfs_flagged.txt"}
             | GENERATED_EXPORT_FILENAMES
         ):
             continue
@@ -228,7 +228,7 @@ def start_recovery(scope: str = "pending") -> dict:
     log_path = LOG_DIR / f"recovery-{timestamp}-{normalized_scope}.log"
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     output = os.fdopen(fd, "w", encoding="utf-8")

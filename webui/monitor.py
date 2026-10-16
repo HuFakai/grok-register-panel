@@ -19,10 +19,17 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from secure_files import atomic_write_json, ensure_private_dir
+from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir
+from batch_traffic import (
+    read_metrics as read_batch_traffic,
+    read_summary as read_batch_traffic_summary,
+)
 from runtime_platform import (
+    apply_playwright_node_env,
     batch_launch_command,
     batch_runtime_error,
+    beijing_strftime,
+    now_beijing,
     popen_group_kwargs,
     runtime_python,
 )
@@ -59,6 +66,20 @@ try:
     )
     from webui.log_cleanup import cleanup_expired_logs
     from webui.recovery_ops import recovery_status, start_recovery, stop_recovery
+    from webui.bfs_ops import bfs_status, check_token_text, run_bfs_scan
+    from webui.sso_state_ops import (
+        read_sso_state_export,
+        sso_state_status,
+        start_sso_state_scan,
+        stop_sso_state_scan,
+    )
+    from webui.account_manager_ops import (
+        build_payload as accounts_build_payload,
+        delete_accounts as accounts_delete,
+        list_accounts as accounts_list,
+        resolve_filtered_emails as accounts_resolve_filtered,
+        set_account_status as accounts_set_status,
+    )
     from webui.security_utils import (
         check_token_optional_read,
         expected_token,
@@ -97,6 +118,19 @@ except ImportError:  # running as script from webui/
     )
     from log_cleanup import cleanup_expired_logs  # type: ignore
     from recovery_ops import recovery_status, start_recovery, stop_recovery  # type: ignore
+    from sso_state_ops import (  # type: ignore
+        read_sso_state_export,
+        sso_state_status,
+        start_sso_state_scan,
+        stop_sso_state_scan,
+    )
+    from account_manager_ops import (  # type: ignore
+        build_payload as accounts_build_payload,
+        delete_accounts as accounts_delete,
+        list_accounts as accounts_list,
+        resolve_filtered_emails as accounts_resolve_filtered,
+        set_account_status as accounts_set_status,
+    )
     from security_utils import (  # type: ignore
         check_token_optional_read,
         expected_token,
@@ -105,6 +139,8 @@ except ImportError:  # running as script from webui/
         redact_proxy,
     )
 LOG_DIR = ROOT / "log"
+BATCH_TRAFFIC = LOG_DIR / "batch_traffic.json"
+BATCH_TRAFFIC_HISTORY = LOG_DIR / "batch_traffic_history.json"
 CPA_DIR = Path(os.environ.get("CPA_AUTH_DIR", str(ROOT / "cpa_auth")))
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
 FONT_ASSETS = {
@@ -122,6 +158,54 @@ if _panel_tail_setting is None:
 else:
     PANEL_INCLUDE_TAIL = _panel_tail_setting.strip().lower() in ("1", "true", "yes")
 
+
+def _configured_process_roots(
+    current_root: Path = ROOT,
+    environ=None,
+) -> tuple[Path, ...]:
+    """Return exact project roots allowed for cross-release process discovery."""
+    env = os.environ if environ is None else environ
+    roots = [Path(current_root).resolve()]
+    raw = str(env.get("GROK_COMPAT_PROCESS_ROOTS", "") or "").strip()
+    for item in raw.split(os.pathsep):
+        value = item.strip()
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() and resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+MANAGED_PROCESS_ROOTS = _configured_process_roots()
+
+
+def _find_managed_processes(script_names) -> list[dict]:
+    found = {}
+    for root in MANAGED_PROCESS_ROOTS:
+        for item in find_managed_processes(root, script_names):
+            found[int(item["pid"])] = item
+    return sorted(found.values(), key=lambda item: int(item["pid"]))
+
+
+def _terminate_managed_processes(
+    script_names,
+    *,
+    grace_seconds: float = 2.0,
+) -> list[int]:
+    killed = set()
+    for root in MANAGED_PROCESS_ROOTS:
+        killed.update(
+            terminate_managed_processes(root, script_names, grace_seconds=grace_seconds)
+        )
+    return sorted(killed)
+
 BASE_FILE = LOG_DIR / "batch1000.base"
 ORCH_PID = LOG_DIR / "orch100.pid"
 BATCH_PID = LOG_DIR / "batch100.pid"
@@ -133,10 +217,7 @@ VENV_PY = runtime_python(ROOT)
 ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
-MAX_REQUEST_BODY = 64 * 1024
-# IP 元数据懒查询失败冷却：{ip: monotonic 截止时间}，地理 API 不可达时
-# 避免每轮轮询都重试同一批 IP 拖慢 /api/ip-usage
-_ip_usage_meta_fail_until: dict[str, float] = {}
+MAX_REQUEST_BODY = 1024 * 1024
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -154,6 +235,7 @@ RE_END = re.compile(r"任务结束。成功\s*(\d+)\s*\|\s*失败\s*(\d+)")
 RE_ADDED_BL = re.compile(r"ADDED blacklist AS(\d+)")
 RE_LOOKUP_FAIL = re.compile(r"lookup fail", re.I)
 RE_ANALYZE_ERR = re.compile(r"analyze error", re.I)
+RE_BFS = re.compile(r"JWT bfs 标记|bfs=yes|kind=bfs_flagged|has_bfs")
 
 
 def _read_json(path: Path, default=None):
@@ -180,6 +262,23 @@ def load_control() -> dict:
         c.setdefault("ip_failure_rotate_threshold", 3)
         c.setdefault("ip_usage_limit", 0)  # 0=不限单 IP 累计使用次数
         c.setdefault("mode", "orch")  # orch | batch
+        # 服务端邮件自动清理（webui/mail_cleanup_ops.py）
+        # 迁移：旧单位 keep_days（天）→ keep_hours（小时）；旧默认（1天+24h间隔）
+        # 直接切到新默认（1h+1h），非默认值按 1 天=24 小时换算。
+        legacy_days = c.pop("mail_cleanup_keep_days", None)
+        if legacy_days is not None:
+            c.pop("mail_cleanup_interval_hours", None)
+            try:
+                legacy = int(legacy_days)
+            except (TypeError, ValueError):
+                legacy = 1
+            if legacy != 1:
+                c["mail_cleanup_keep_hours"] = max(1, legacy * 24)
+        c.setdefault("mail_cleanup_keep_hours", 1)
+        c.setdefault("mail_cleanup_interval_hours", 1)
+        c.setdefault("mail_cleanup_enabled", True)
+        c.setdefault("ip_pool_filter_datacenter", False)
+        c.setdefault("mail_cleanup_clean_unknow", True)
         return c
 
 
@@ -197,6 +296,13 @@ def save_control(updates: dict) -> dict:
         "target_cpa",
         # 任务启动时的累计成功数基线（本次任务增量 = ok_count - base_ok）
         "base_ok",
+        # 服务端邮件自动清理
+        "mail_cleanup_enabled",
+        "mail_cleanup_keep_hours",
+        "mail_cleanup_interval_hours",
+        "mail_cleanup_clean_unknow",
+        # 数据中心出口过滤开关（IP 使用页手动切换）
+        "ip_pool_filter_datacenter",
     }
     with CONTROL_LOCK:
         c = load_control()
@@ -214,7 +320,7 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["batch_count"] = 40
         try:
-            c["add_count"] = max(1, int(c.get("add_count", 40)))
+            c["add_count"] = max(1, min(2000, int(c.get("add_count", 40))))
         except Exception:
             c["add_count"] = 40
         try:
@@ -236,6 +342,21 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["ip_usage_limit"] = 0
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
+        # 清理设置走 mail_cleanup_ops.normalize_settings 的范围（1-720 小时 / 1-168 小时）
+        for key, default, low, high in (
+            ("mail_cleanup_keep_hours", 1, 1, 720),
+            ("mail_cleanup_interval_hours", 1, 1, 168),
+        ):
+            try:
+                c[key] = max(low, min(high, int(c.get(key, default))))
+            except Exception:
+                c[key] = default
+        for key, default in (
+            ("mail_cleanup_enabled", True),
+            ("mail_cleanup_clean_unknow", True),
+            ("ip_pool_filter_datacenter", False),
+        ):
+            c[key] = bool(c.get(key, default))
         for key in ("base_cpa", "target_cpa"):
             if c.get(key) is None or str(c.get(key)).strip() == "":
                 c.pop(key, None)
@@ -307,8 +428,8 @@ def process_running():
         "batch_pid": None,
         "batch_etime": None,
     }
-    orch = find_managed_processes(ROOT, ("run_until_100.py",))
-    batch = find_managed_processes(ROOT, ("run_batch_headless.py",))
+    orch = _find_managed_processes(("run_until_100.py",))
+    batch = _find_managed_processes(("run_batch_headless.py",))
 
     def primary(items):
         if not items:
@@ -391,6 +512,8 @@ def parse_log(path, max_tail=400_000):
             fm = RE_FAIL_KIND.search(line)
             kind = fm.group(1) if fm else "其它"
             msg = fm.group(2) if fm else line[-120:]
+            if "Email sign-up isn't available" in msg or "邮箱注册被限流" in msg:
+                kind = "注册限流"
             if "inputs=none" in msg:
                 kind = "空页UI"
             if "Turnstile" in msg or "Turnstile" in kind:
@@ -523,6 +646,7 @@ def success_stats():
     jsonl_ok = 0
     jsonl_risk = 0
     jsonl_fail = 0
+    bfs_hits = 0
     by_day = {}
     results = LOG_DIR / "register_results.jsonl"
 
@@ -562,6 +686,8 @@ def success_stats():
                     except Exception:
                         continue
                     st = o.get("status")
+                    if o.get("bfs") is True:
+                        bfs_hits += 1
                     day = (o.get("ts") or "")[:10]
                     if day:
                         by_day.setdefault(day, {"ok": 0, "risk": 0, "fail": 0})
@@ -635,12 +761,13 @@ def success_stats():
         "jsonl_ok": jsonl_ok,
         "jsonl_risk": jsonl_risk,
         "jsonl_fail": jsonl_fail,
+        "bfs": bfs_hits,
         "batch_ok": batch_ok,
         "batch_fail": batch_fail,
         "batch_log": parsed.get("log_name"),
         "by_day": by_day,
         "rates": rates,
-        "refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "refreshed_at": beijing_strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:
         _write_json(STATS_CACHE, data)
@@ -675,8 +802,7 @@ def _parse_etime(s):
 
 def kill_all():
     """Stop orchestrator and batch process groups under this project root."""
-    killed = terminate_managed_processes(
-        ROOT,
+    killed = _terminate_managed_processes(
         ("run_until_100.py", "run_batch_headless.py"),
         grace_seconds=8.0,
     )
@@ -747,11 +873,26 @@ def _email_domain_pool_view(result: dict | None = None) -> dict:
     return data
 
 
+def _registration_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("GROK_STATIC_ASSET_CACHE", "1")
+    env.setdefault(
+        "GROK_STATIC_CACHE_DIR",
+        str(LOG_DIR / "static-asset-cache"),
+    )
+    if os.name == "nt":
+        env.setdefault("GROK_HEADLESS", "1")
+        env.setdefault("PYTHONUTF8", "1")
+    apply_playwright_node_env(env)
+    return env
+
+
 def _start_orch_unlocked():
     proc = process_running()
     if proc.get("orch_running") or proc.get("batch_running"):
         return {"ok": False, "error": "already running", "process": proc}
-    if find_managed_processes(ROOT, ("sso_to_auth_json.py",)):
+    if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
@@ -788,7 +929,7 @@ def _start_orch_unlocked():
     stdout_path = LOG_DIR / "orch100-stdout.log"
     fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     stdout = os.fdopen(fd, "a", encoding="utf-8")
@@ -803,7 +944,7 @@ def _start_orch_unlocked():
             cwd=str(ROOT),
             stdout=stdout,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=_registration_env(),
             **popen_group_kwargs(),
         )
     finally:
@@ -832,7 +973,7 @@ def _start_batch_only_unlocked():
     proc = process_running()
     if proc.get("batch_running") or proc.get("orch_running"):
         return {"ok": False, "error": "already running", "process": proc}
-    if find_managed_processes(ROOT, ("sso_to_auth_json.py",)):
+    if _find_managed_processes(("sso_to_auth_json.py",)):
         return {"ok": False, "error": "account recovery is running"}
     prerequisite_error = _runtime_prerequisite_error()
     if prerequisite_error:
@@ -852,7 +993,7 @@ def _start_batch_only_unlocked():
     ensure_private_dir(LOG_DIR)
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        best_effort_fchmod(fd, 0o600)
     except OSError:
         pass
     fout = os.fdopen(fd, "w", encoding="utf-8")
@@ -867,6 +1008,7 @@ def _start_batch_only_unlocked():
             cwd=str(ROOT),
             stdout=fout,
             stderr=subprocess.STDOUT,
+            env=_registration_env(),
             **popen_group_kwargs(),
         )
     finally:
@@ -936,9 +1078,18 @@ def snapshot():
             eta_min = remain / rate_per_min
             eta = f"{int(eta_min)}m" if eta_min < 120 else f"{eta_min/60:.1f}h"
     workers_show = parsed.get("workers") or control.get("workers")
+    traffic = read_batch_traffic(BATCH_TRAFFIC)
+    if traffic.get("running") and not proc.get("running"):
+        traffic["running"] = False
+    if int(traffic.get("version") or 0) < 2:
+        traffic["successful_accounts"] = max(
+            int(traffic.get("successful_accounts") or 0),
+            int(parsed.get("ok") or 0),
+        )
+    traffic_summary = read_batch_traffic_summary(BATCH_TRAFFIC_HISTORY, traffic)
     return {
         "ts": time.time(),
-        "ts_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_human": beijing_strftime("%Y-%m-%d %H:%M:%S"),
         "base_cpa": base,
         "base_cpa_stale": base_stale,
         "cpa": cpa,
@@ -953,6 +1104,8 @@ def snapshot():
         "success_rate": round(100.0 * ok / done, 1) if done else None,
         "rate_per_min": rate_per_min,
         "eta": eta,
+        "traffic": traffic,
+        "traffic_summary": traffic_summary,
         "blacklist": {
             "count": bl.get("count"),
             "asns": bl.get("asns"),
@@ -1117,7 +1270,7 @@ HTML = r"""<!DOCTYPE html>
     align-items: flex-end;
     justify-content: space-between;
     gap: 20px;
-    margin: 2px 0 20px;
+    margin: 2px 0 14px;
   }
   .page-heading > div { min-width: 0; }
   .page-title { margin: 0; color: var(--text); font-size: 28px; line-height: 1.18; font-weight: 680; }
@@ -1154,18 +1307,37 @@ HTML = r"""<!DOCTYPE html>
   .dot.on { background: var(--ok); }
   .dot.done { background: var(--ok); }
   .dot.off { background: var(--muted); }
-  main { width: min(calc(100% - 64px), 1480px); margin: 0 auto; padding: 28px 0 48px; }
+  main { width: min(calc(100% - 64px), 1280px); margin: 0 auto; padding: 28px 0 48px; }
   .panel-gap { margin-top: 14px; }
   .card {
     min-width: 0;
     background: var(--surface-raised);
     border: 1px solid var(--border);
     border-radius: 0;
-    padding: 16px;
+    padding: 14px;
     transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms cubic-bezier(.16, 1, .3, 1);
   }
   @media (hover: hover) {
     .card:hover { border-color: var(--border-strong); transform: translateY(-2px); }
+    .chip:hover { border-color: var(--border-strong); background: var(--surface-raised); }
+    .rate-item:hover,
+    .proxy-summary-item:hover,
+    .domain-summary-item:hover { background: var(--surface-raised); }
+    .proxy-state:hover,
+    .domain-state:hover { background: var(--surface-soft); }
+    .domain-advanced > summary:hover .domain-advanced-title,
+    .faq-item summary:hover { color: var(--text-secondary); }
+    .card > summary.panel-summary:hover { background: var(--surface-soft); }
+    .faq-item[open] summary:hover { color: var(--accent); }
+  }
+  .proxy-select:focus-visible,
+  .proxy-toggle:focus-visible,
+  .domain-toggle:focus-visible,
+  .domain-advanced > summary:focus-visible,
+  .card > summary.panel-summary:focus-visible,
+  .faq-item summary:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
   }
   .panel { margin-top: 14px; }
   .panel.no-margin { margin-top: 0; }
@@ -1185,6 +1357,26 @@ HTML = r"""<!DOCTYPE html>
     margin-bottom: 14px;
   }
   .section-meta { color: var(--muted); font-size: 12px; text-align: right; }
+  .card > summary.panel-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 24px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .card > summary.panel-summary::-webkit-details-marker { display: none; }
+  .card > summary.panel-summary::after {
+    content: "+";
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-family: "Geist Mono", monospace;
+    font-size: 18px;
+    line-height: 1;
+  }
+  .card[open] > summary.panel-summary::after { content: "-"; }
+  .card[open] > summary.panel-summary { margin-bottom: 12px; }
   .control-grid {
     display: grid;
     grid-template-columns: minmax(220px, 1.6fr) minmax(150px, .9fr) repeat(4, minmax(100px, .55fr)) minmax(258px, auto);
@@ -1202,7 +1394,7 @@ HTML = r"""<!DOCTYPE html>
   .ip-policy {
     grid-column: 1 / -1;
     display: grid;
-    grid-template-columns: minmax(260px, 1.4fr) repeat(3, minmax(140px, .6fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
     align-items: end;
     padding: 12px;
@@ -1222,7 +1414,7 @@ HTML = r"""<!DOCTYPE html>
     height: 20px;
     flex: 0 0 auto;
     border: 1px solid var(--border-strong);
-    background: var(--surface-strong);
+    background: var(--surface-deep);
     position: relative;
     transition: background .16s ease, border-color .16s ease;
   }
@@ -1301,6 +1493,30 @@ HTML = r"""<!DOCTYPE html>
     background: var(--accent);
     color: var(--accent-ink);
   }
+  .header-btn {
+    min-width: 0;
+    min-height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    background: var(--surface-soft);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 620;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, transform 180ms cubic-bezier(.16, 1, .3, 1);
+  }
+  .header-btn:hover { border-color: var(--hover-border); color: var(--text); }
+  .header-btn:active { transform: translateY(1px); }
+  .header-btn.primary { background: var(--primary-bg); border-color: var(--primary-bg); color: var(--primary-text); }
+  .header-btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+  .status-cluster .msg { margin: 0; min-height: 0; font-size: 11px; white-space: nowrap; }
   .theme-switch {
     flex: 0 0 auto;
     display: inline-flex;
@@ -1326,7 +1542,7 @@ HTML = r"""<!DOCTYPE html>
   button.theme-option[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
   .metric-grid {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 1px;
     overflow: hidden;
     border: 1px solid var(--border);
@@ -1351,7 +1567,7 @@ HTML = r"""<!DOCTYPE html>
     overflow-wrap: anywhere;
   }
   .metric .sub { min-height: 16px; margin-top: 4px; color: var(--muted); font-size: 11px; }
-  .rate-panel { margin-top: 10px; padding: 12px 16px 14px; }
+  .rate-panel { padding: 12px 14px 14px; }
   .rate-panel .section-head { min-height: 24px; margin-bottom: 8px; }
   .rate-panel .section-meta { font-size: 11px; }
   .rate-grid {
@@ -1385,6 +1601,7 @@ HTML = r"""<!DOCTYPE html>
   .tail {
     max-height: 360px;
     overflow: auto;
+    overscroll-behavior: contain;
     border: 1px solid var(--border);
     border-radius: 2px;
     background: var(--tail-bg);
@@ -1395,24 +1612,19 @@ HTML = r"""<!DOCTYPE html>
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .log-summary {
-    cursor: pointer;
-    font-weight: 700;
-    margin-bottom: 12px;
-  }
-  details:not([open]) > .log-summary { margin-bottom: 0; }
   .log-tools {
     display: flex;
-    align-items: end;
+    align-items: center;
     justify-content: flex-end;
     gap: 8px;
-    margin: -2px 0 10px;
+    margin: 0 0 10px;
     padding-bottom: 10px;
     border-bottom: 1px solid var(--border);
   }
   .log-retention { width: 132px; }
   .log-retention input { min-height: 32px; }
   .log-tools button { min-height: 32px; padding: 5px 10px; }
+  .log-tools button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
   .log-cleanup-msg { min-width: 180px; color: var(--muted); font-size: 11px; text-align: right; }
   .chips { display: flex; flex-wrap: wrap; gap: 7px; }
   .card > h2 + .chips { margin-top: 14px; }
@@ -1519,14 +1731,22 @@ HTML = r"""<!DOCTYPE html>
   .proxy-table th:nth-child(8) { width: 160px; }
   /* IP 使用统计表：7 列独立列宽（复用 proxy-table 的 fixed 布局，
      但代理池的 nth-child 宽度不适用，需单独定义避免 IP/国家列重叠） */
-  .ip-usage-table { min-width: 920px; }
+  .ip-usage-table { min-width: 720px; }
   .ip-usage-table th:nth-child(1) { width: 220px; text-align: left; }
-  .ip-usage-table th:nth-child(2) { width: 110px; }
-  .ip-usage-table th:nth-child(3) { width: 76px; }
-  .ip-usage-table th:nth-child(4) { width: 86px; }
-  .ip-usage-table th:nth-child(5) { width: 170px; }
-  .ip-usage-table th:nth-child(6) { width: 150px; }
-  .ip-usage-table th:nth-child(7) { width: 76px; }
+  .ip-usage-table th:nth-child(2) { width: 86px; }
+  .ip-usage-table th:nth-child(3) { width: 170px; }
+  .ip-usage-table th:nth-child(4) { width: 150px; }
+  .ip-usage-table th:nth-child(5) { width: 76px; }
+  .ip-pool-table { min-width: 700px; }
+  .ip-pool-table th:nth-child(1) { width: 220px; text-align: left; }
+  .ip-pool-table th:nth-child(2) { width: 86px; }
+  .ip-pool-table th:nth-child(3) { width: 76px; }
+  .ip-pool-table th:nth-child(4) { width: 110px; }
+  .ip-pool-table th:nth-child(5) { width: 110px; }
+  .ip-pool-table th:nth-child(6) { width: 90px; }
+  /* BFS 检测表：4 列自适应（proxy-table 的 min-width:1040px 会撑出横向滚动，这里不适用） */
+  .bfs-table { min-width: 0; }
+  .bfs-table td { overflow-wrap: anywhere; }
   .proxy-select { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-endpoint { overflow-wrap: anywhere; }
   .proxy-meta { margin-top: 3px; color: var(--muted); font-size: 10px; }
@@ -1550,6 +1770,210 @@ HTML = r"""<!DOCTYPE html>
   .proxy-toggle { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
   .proxy-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
   .proxy-job { color: var(--muted); font-size: 11px; }
+  body.sso-view-open { overflow: hidden; }
+  body.sso-view-open #dashboard-view > :not(#sso-view) { display: none; }
+  .sso-view {
+    position: fixed;
+    inset: 68px 0 0;
+    z-index: 8;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .sso-view[hidden] { display: none; }
+  .sso-view-inner {
+    width: min(calc(100% - 64px), 1280px);
+    margin: 0 auto;
+    padding: 28px 0 48px;
+  }
+  .sso-view-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sso-view-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+  .sso-summary {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--border);
+    gap: 1px;
+  }
+  .sso-summary-item { min-width: 0; padding: 12px 14px; background: var(--surface); }
+  .sso-summary-label { color: var(--muted); font-size: 11px; }
+  .sso-summary-value { margin-top: 4px; font-family: "Geist Mono", monospace; font-size: 22px; line-height: 1; font-weight: 720; }
+  .sso-summary-value.warn { color: var(--warn); }
+  .sso-summary-value.ok { color: var(--ok); }
+  .sso-summary-value.fail { color: var(--fail); }
+  .sso-import {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(280px, .55fr);
+    gap: 16px;
+    align-items: stretch;
+    margin-top: 14px;
+    padding: 16px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  #sso-input {
+    min-height: 148px;
+    font-family: "Geist Mono", monospace;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .sso-import-actions { display: flex; flex-direction: column; justify-content: space-between; gap: 12px; }
+  .sso-source-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .sso-source-row button[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .sso-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .sso-format { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+  .sso-list-section { margin-top: 18px; }
+  .sso-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+  .sso-list-head h2 { margin: 0; font-size: 13px; }
+  .sso-filter { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sso-filter button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .sso-table-wrap { overflow: auto; border: 1px solid var(--border); background: var(--surface-raised); max-height: 460px; }
+  .sso-table { min-width: 920px; table-layout: fixed; }
+  .sso-table th:nth-child(1) { width: 180px; }
+  .sso-table th:nth-child(2) { width: 72px; }
+  .sso-table th:nth-child(3) { width: 88px; }
+  .sso-table th:nth-child(4) { width: 72px; }
+  .sso-table th:nth-child(5) { width: 110px; }
+  .sso-table th:nth-child(6) { width: 90px; }
+  .sso-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
+  .sso-job { color: var(--muted); font-size: 11px; }
+  .sso-verdict {
+    min-height: 24px;
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .sso-verdict.clean { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); color: var(--ok); }
+  .sso-verdict.flagged { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); color: var(--fail); }
+  .sso-verdict.error, .sso-verdict.unknown { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); color: var(--warn); }
+  body.accounts-view-open { overflow: hidden; }
+  body.accounts-view-open #dashboard-view > :not(#accounts-view) { display: none; }
+  .accounts-view {
+    position: fixed;
+    inset: 68px 0 0;
+    z-index: 8;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .accounts-view[hidden] { display: none; }
+  .accounts-view-inner {
+    width: min(calc(100% - 64px), 1280px);
+    margin: 0 auto;
+    padding: 28px 0 48px;
+  }
+  .accounts-view-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .accounts-view-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+  .accounts-summary {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--border);
+    gap: 1px;
+  }
+  .accounts-summary-item { min-width: 0; padding: 12px 14px; background: var(--surface); }
+  .accounts-summary-label { color: var(--muted); font-size: 11px; }
+  .accounts-summary-value { margin-top: 4px; font-family: "Geist Mono", monospace; font-size: 22px; line-height: 1; font-weight: 720; }
+  .accounts-summary-value.ok { color: var(--ok); }
+  .accounts-summary-value.fail { color: var(--fail); }
+  .accounts-toolbar {
+    display: grid;
+    grid-template-columns: minmax(180px, 1.4fr) minmax(150px, 1fr) minmax(120px, .8fr) minmax(120px, .8fr) auto;
+    gap: 10px;
+    align-items: end;
+    margin-top: 14px;
+    padding: 14px 0;
+    border-top: 1px solid var(--border);
+  }
+  .accounts-toolbar .field { min-width: 0; }
+  .accounts-toolbar-actions { display: flex; gap: 6px; align-items: center; }
+  .accounts-bulk {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .accounts-bulk[hidden] { display: none; }
+  .accounts-bulk-count { margin-right: 4px; color: var(--text); font-size: 12px; font-weight: 600; }
+  .accounts-bulk .select-all-filtered { border-color: var(--accent); color: var(--accent); }
+  .accounts-list-section { margin-top: 16px; }
+  .accounts-list-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+  .accounts-list-head h2 { margin: 0; font-size: 13px; }
+  .accounts-job { color: var(--muted); font-size: 11px; }
+  .accounts-table-wrap { overflow: auto; border: 1px solid var(--border); background: var(--surface-raised); max-height: 520px; }
+  .accounts-table { min-width: 980px; table-layout: fixed; }
+  .accounts-table th:nth-child(1) { width: 40px; }
+  .accounts-table th:nth-child(2) { width: 240px; }
+  .accounts-table th:nth-child(3) { width: 130px; }
+  .accounts-table th:nth-child(4) { width: 170px; }
+  .accounts-table th:nth-child(5) { width: 110px; }
+  .accounts-table th:nth-child(6) { width: 185px; }
+  .accounts-table th:nth-child(7) { width: 130px; }
+  .accounts-table td, .accounts-table th { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .accounts-table input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+  .accounts-secret { font-family: "Geist Mono", monospace; font-size: 11px; color: var(--muted); }
+  .accounts-secret.reveal { color: var(--text); }
+  .accounts-empty { padding: 38px 18px !important; color: var(--muted); text-align: center; }
+  .acc-status {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 2px 7px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+    background: transparent;
+    color: var(--text);
+  }
+  .acc-status.used { border-color: color-mix(in srgb, var(--ok) 55%, var(--border)); color: var(--ok); }
+  .acc-status.disabled { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); color: var(--fail); }
+  .acc-status.unused { color: var(--muted); }
+  .row-actions { display: flex; gap: 5px; }
+  .row-actions button { min-height: 24px; padding: 2px 8px; font-size: 11px; }
+  .accounts-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0 0; flex-wrap: wrap; }
+  .accounts-page-controls { display: flex; align-items: center; gap: 7px; }
+  .accounts-page-controls select { min-height: 32px; width: auto; padding: 5px 28px 5px 9px; }
+  .accounts-page-controls button { min-height: 32px; padding: 5px 10px; }
+  .accounts-page-info { color: var(--muted); font-size: 11px; }
   .proxy-pagination {
     display: flex;
     align-items: center;
@@ -1611,6 +2035,7 @@ HTML = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--border);
   }
   .mail-provider-toolbar .field { max-width: 520px; }
+  .mail-provider-toolbar h2 { margin: 0; color: var(--text); font-size: 15px; font-weight: 620; }
   .mail-provider-status { display: flex; align-items: center; gap: 8px; min-height: 38px; }
   .mail-provider-status-label { color: var(--muted); font-size: 11px; }
   .mail-provider-fields {
@@ -1829,17 +2254,14 @@ HTML = r"""<!DOCTYPE html>
   .faq-empty { margin: 16px 0 2px; color: var(--muted); font-size: 12px; }
   footer { margin-top: 16px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
   main > :not(.help-view) {
-    animation: panel-enter 520ms cubic-bezier(.16, 1, .3, 1) both;
+    animation: panel-enter 400ms cubic-bezier(.16, 1, .3, 1) both;
   }
-  main > :nth-child(2) { animation-delay: 45ms; }
-  main > :nth-child(3) { animation-delay: 90ms; }
-  main > :nth-child(4) { animation-delay: 135ms; }
-  main > :nth-child(5) { animation-delay: 180ms; }
-  main > :nth-child(6) { animation-delay: 225ms; }
-  main > :nth-child(7) { animation-delay: 270ms; }
-  main > :nth-child(8) { animation-delay: 315ms; }
-  main > :nth-child(9) { animation-delay: 360ms; }
-  main > :nth-child(n + 10) { animation-delay: 405ms; }
+  main > :nth-child(2) { animation-delay: 15ms; }
+  main > :nth-child(3) { animation-delay: 30ms; }
+  main > :nth-child(4) { animation-delay: 45ms; }
+  main > :nth-child(5) { animation-delay: 60ms; }
+  main > :nth-child(6) { animation-delay: 75ms; }
+  main > :nth-child(n + 7) { animation-delay: 90ms; }
   @keyframes panel-enter {
     from { opacity: 0; transform: translateY(12px); }
     to { opacity: 1; transform: translateY(0); }
@@ -1872,6 +2294,8 @@ HTML = r"""<!DOCTYPE html>
     .brand { width: auto; }
     .status-cluster { width: auto; justify-content: flex-end; margin-left: auto; }
     #clock, #sync-label { display: none; }
+    .header-btn { min-height: 28px; padding: 0 8px; font-size: 10px; }
+    #config-backup-msg { display: none; }
     main { width: calc(100% - 24px); padding: 20px 0 34px; }
     .page-heading { margin-bottom: 16px; }
     .page-title { font-size: 22px; }
@@ -1906,6 +2330,18 @@ HTML = r"""<!DOCTYPE html>
     .proxy-view { inset-block-start: 60px; }
     .proxy-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
     .proxy-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
+    .sso-view { inset-block-start: 60px; }
+    .sso-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
+    .sso-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
+    .sso-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .sso-import { grid-template-columns: minmax(0, 1fr); }
+    .accounts-view { inset-block-start: 60px; }
+    .accounts-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
+    .accounts-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
+    .accounts-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .accounts-toolbar { grid-template-columns: minmax(0, 1fr); }
+    .accounts-toolbar-actions button { flex: 1 1 auto; }
+    .accounts-list-head { align-items: flex-start; flex-direction: column; }
     .proxy-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .proxy-summary-item:last-child { grid-column: 1 / -1; }
     .proxy-import { grid-template-columns: minmax(0, 1fr); }
@@ -1948,12 +2384,15 @@ HTML = r"""<!DOCTYPE html>
     .button-group { justify-content: flex-start; }
     #run-status { display: none; }
     button.view-switch { min-width: 0; padding-inline: 6px; }
-    #domain-view-label, #proxy-view-label, #help-view-label { font-size: 0; }
+    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label, #accounts-view-label { font-size: 0; }
     #domain-view-label::after { content: "邮箱"; font-size: 11px; }
     #proxy-view-label::after { content: "代理"; font-size: 11px; }
+    #sso-view-label::after { content: "风控"; font-size: 11px; }
+    #accounts-view-label::after { content: "账号"; font-size: 11px; }
     #help-view-label::after { content: "问题"; font-size: 11px; }
     #domain-view-toggle[data-active="true"] #domain-view-label::after,
     #proxy-view-toggle[data-active="true"] #proxy-view-label::after,
+    #sso-view-toggle[data-active="true"] #sso-view-label::after,
     #help-view-toggle[data-active="true"] #help-view-label::after { content: "返回"; }
     button.theme-option { padding-inline: 6px; }
     .domain-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2023,12 +2462,27 @@ HTML = r"""<!DOCTYPE html>
       <button type="button" class="view-switch" id="proxy-view-toggle" aria-label="打开代理池" title="代理池" aria-controls="proxy-view" aria-expanded="false" data-active="false" onclick="toggleProxyView()">
         <span id="proxy-view-label" aria-hidden="true">代理池</span>
       </button>
+      <button type="button" class="view-switch" id="sso-view-toggle" aria-label="打开 SSO 风控" title="SSO 风控" aria-controls="sso-view" aria-expanded="false" data-active="false" onclick="toggleSsoView()">
+        <span id="sso-view-label" aria-hidden="true">SSO 风控</span>
+      </button>
+      <button type="button" class="view-switch" id="accounts-view-toggle" aria-label="打开账号管理" title="账号管理" aria-controls="accounts-view" aria-expanded="false" data-active="false" onclick="toggleAccountsView()">
+        <span id="accounts-view-label" aria-hidden="true">账号管理</span>
+      </button>
       <button type="button" class="view-switch" id="ip-usage-view-toggle" aria-label="打开IP使用统计" title="IP使用统计" aria-controls="ip-usage-view" aria-expanded="false" data-active="false" onclick="toggleIpUsageView()">
         <span id="ip-usage-view-label" aria-hidden="true">IP使用</span>
       </button>
       <button type="button" class="view-switch" id="help-view-toggle" aria-label="打开问题和使用" title="问题和使用" aria-controls="help-view" aria-expanded="false" data-active="false" onclick="toggleAppView()">
         <span id="help-view-label" aria-hidden="true">问题和使用</span>
       </button>
+      <button type="button" class="header-btn primary" id="topbar-export" onclick="exportConfig()"
+              title="导出全部配置（config / 代理池 / 邮箱域名 / 多配置档 / IP 限制，含敏感凭据，请妥善保管）">导出配置</button>
+      <label class="header-btn" id="topbar-import"
+             title="导入配置文件恢复环境（将覆盖上述配置，导入后需重启面板生效）">
+        <span>导入</span>
+        <input type="file" id="config-import-file" accept=".json,application/json" class="sr-only"
+               onchange="importConfigFile(this.files[0])"/>
+      </label>
+      <span class="badge" id="config-backup-msg" role="status" aria-live="polite" hidden></span>
       <div class="theme-switch" role="group" aria-label="界面主题">
         <button type="button" class="theme-option" data-theme-choice="light" aria-pressed="false" onclick="setTheme('light')">浅色</button>
         <button type="button" class="theme-option" data-theme-choice="dark" aria-pressed="false" onclick="setTheme('dark')">深色</button>
@@ -2054,7 +2508,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshAccounts(); refreshBfs()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
@@ -2070,7 +2524,7 @@ HTML = r"""<!DOCTYPE html>
         <input type="number" id="batch_count" min="1" value="40"/>
       </div>
       <div class="field"><label for="add_count">追加目标</label>
-        <input type="number" id="add_count" min="1" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
+        <input type="number" id="add_count" min="1" max="2000" value="40" title="每次启动从当前 CPA 再注册 N 个"/>
       </div>
       <div class="field"><label for="risk_pause">风控阈值</label>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>
@@ -2093,29 +2547,6 @@ HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="msg" id="ctrl-msg" role="status" aria-live="polite"></div>
-  </section>
-
-  <section class="mail-provider-panel" aria-labelledby="config-backup-label" style="margin:12px 0 0">
-    <div class="mail-provider-toolbar">
-      <div>
-        <div class="mail-source-kicker">Config backup</div>
-        <h2 style="margin:0;font-size:15px" id="config-backup-label">配置备份（一键导出/导入）</h2>
-        <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
-          导出全部配置（config.json / 代理池 / 邮箱域名池 / 邮箱多配置档 / 控制参数 / IP 使用限制），
-          换环境（如重新 clone 仓库）后导入即可直接启动。
-          <span style="color:var(--fail, #e5484d)">导出文件含代理密码与邮箱密钥等敏感凭据，请妥善保管。</span>
-        </p>
-      </div>
-      <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
-        <button class="primary" onclick="exportConfig()">导出配置</button>
-        <label class="proxy-job" style="display:inline-flex;align-items:center;gap:6px">
-          导入
-          <input type="file" id="config-import-file" accept=".json,application/json" style="max-width:220px"
-                 onchange="importConfigFile(this.files[0])"/>
-        </label>
-      </div>
-    </div>
-    <div class="msg" id="config-backup-msg" role="status" aria-live="polite"></div>
   </section>
 
   <section class="help-view" id="help-view" aria-labelledby="help-view-title" hidden>
@@ -2193,9 +2624,17 @@ HTML = r"""<!DOCTYPE html>
             <summary>邮箱 API 返回 401 或请求超时</summary>
             <div class="faq-answer">401 先检查对应邮箱服务的 key 和 <code>auth_mode</code>。访问 workers.dev 超时时，在配置中显式填写代理，不要只依赖桌面进程可能无法继承的 HTTP_PROXY 环境变量。</div>
           </details>
-          <details class="faq-item" data-faq-item data-search="邮箱服务 provider cloudflare duckmail yyds mailnest cloudmail moemail api 测试 域名轮换">
+          <details class="faq-item" data-faq-item data-search="邮箱服务 provider cloudflare duckmail yyds mailnest cloudmail moemail outlook_rt inbucket 自建 jsonl refresh_token api 测试 域名轮换">
             <summary>如何配置邮箱服务</summary>
-            <div class="faq-answer">打开顶部“邮箱服务”，选择当前使用的服务商后填写对应 API 配置，保存并测试连通性。自有域名轮换位于同页高级设置；只有 xAI 明确拒绝域名才累计，邮箱 API 和验证码异常不会处罚域名。</div>
+            <div class="faq-answer">打开顶部“邮箱服务”，选择当前使用的服务商后填写对应 API 配置，保存并测试连通性。Outlook RT 库存模式填写 jsonl（email + refresh_token）路径即可，无需 client_id。Inbucket 自建模式填写实例地址和收信根域名（可逗号分隔多个轮换，MX 需指向实例），随机子域级数可选（需泛解析收信）。自有域名轮换位于同页高级设置；只有 xAI 明确拒绝域名才累计，邮箱 API 和验证码异常不会处罚域名。</div>
+          </details>
+          <details class="faq-item" data-faq-item data-search="bfs jwt claim access_token 标记 flagged 风控 检测 scan">
+            <summary>什么是 bfs，和 botFlagSource 有何不同</summary>
+            <div class="faq-answer"><code>bfs</code> 是 xAI access_token / SSO JWT 里的风险 claim：payload 里<strong>出现该字段</strong>即视为标记（常见值 2）。它与 grok.com 页面的 <code>botFlagSource</code> / <code>policy=deny</code> 独立。注册换 token 后会自动检测；也可在控制台“BFS 检测”扫描 CPA 目录，导出 <code>log/bfs_flagged.jsonl</code>。配置 <code>bfs_skip_cpa</code> 可跳过入库，<code>bfs_disable_cpa</code> 可写 disabled。</div>
+          </details>
+          <details class="faq-item" data-faq-item data-search="sso 风控 botFlagSource policy deny check-sso-state 检测 面板 粘贴">
+            <summary>如何用 SSO 批量检测账号是否被风控</summary>
+            <div class="faq-answer">打开顶部“SSO 风控”，粘贴 <code>email----sso</code> 或纯 cookie，也可扫描待处理 / 全部账号 / 已隔离名单。面板用 SSO 访问 grok.com 读取 <code>botFlagSource</code> 和 <code>policy=deny</code>，不换 token、不入库。标记规则与注册门禁一致：<code>botFlagSource</code> 为 1/2，或任意 <code>policy=deny</code>。干净名单写到 <code>log/sso_clean.txt</code>，标记名单写到 <code>log/sso_flagged.jsonl</code>（不含 token）。命令行：<code>python scripts/check_sso_state.py --sso list.txt --from-config config.json</code>。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="黑名单 asn 清除 重置 baseline 风控 出口">
             <summary>黑名单有什么作用，可以清除吗</summary>
@@ -2212,6 +2651,10 @@ HTML = r"""<!DOCTYPE html>
           <details class="faq-item" data-faq-item data-search="体验额度 429 quota rate limit 免费 余额">
             <summary>体验额度有多少，出现 429 怎么办</summary>
             <div class="faq-answer">体验额度由上游按账号分配，面板无法推算准确余额。429 通常表示额度耗尽或触发速率限制，需要等待恢复或更换仍有可用额度的 auth。</div>
+          </details>
+          <details class="faq-item" data-faq-item data-search="邮件清理 清理 邮箱 涨满 d1 500mb raw_mails 磁盘 数据库 mail cleanup 保留天数">
+            <summary>服务端邮件越积越多 / D1 数据库涨满怎么办</summary>
+            <div class="faq-answer">面板「邮箱服务」页有「服务端邮件自动清理」：按保留时长删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 涨满、并压低每日行读取配额消耗。默认保留 1 小时、每小时自动清理一次，也可点「立即清理」手动触发。清理是组合策略：先调 Worker 批量接口删整数天前的大头（保留不足 24 小时也先删 1 天前的），再分页逐封删剩余窗口；批量接口不可用时整体退回逐封删。邮件数仅在清理执行后更新、不做后台轮询。彻底方案是在 Worker 端配置 cron 触发器 + 自动清理设置（见 DEPLOYMENT.md）。</div>
           </details>
         </div>
         <p class="faq-empty" id="faq-empty" hidden>没有匹配的问题，请换一个错误码或现象关键词。</p>
@@ -2270,7 +2713,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="proxy-table-wrap">
           <table class="proxy-table">
             <thead><tr><th><input class="proxy-select" id="proxy-select-page" type="checkbox" aria-label="全选本页" onchange="toggleProxyPageSelection(this.checked)"/></th><th>状态</th><th>代理端点</th><th>出口 / ASN</th><th>使用次数</th><th>延迟</th><th>最近状态</th><th>启用</th><th>操作</th></tr></thead>
-            <tbody id="proxy-body"><tr><td colspan="8" class="proxy-empty">正在读取代理池</td></tr></tbody>
+            <tbody id="proxy-body"><tr><td colspan="9" class="proxy-empty">正在读取代理池</td></tr></tbody>
           </table>
         </div>
         <div class="proxy-pagination">
@@ -2300,9 +2743,43 @@ HTML = r"""<!DOCTYPE html>
           <p class="domain-view-subtitle">所有任务累计的出口 IP 使用次数（log/ip_usage.json）</p>
         </div>
         <span class="domain-job" id="ip-usage-heading-label">--</span>
+        <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+          <button class="danger" id="ip-usage-reset-btn" onclick="resetIpUsage()">清空全部统计</button>
+        </div>
       </div>
 
       <div class="proxy-summary" id="ip-usage-summary"></div>
+
+      <section class="mail-provider-panel" aria-labelledby="ip-pool-label">
+        <div class="mail-provider-toolbar">
+          <div>
+            <div class="mail-source-kicker">Ready IP pool</div>
+            <h2 id="ip-pool-label">可用 IP 池（预筛可用出口，worker 优先取用）</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
+              面板后台批量探测 sticky 身份，筛出未超限出口写入池；注册 worker 换口时优先从这里取已确认可用的身份（不再随机碰运气）。身份在会话有效期（默认 10 分钟）内有效，过期自动清理并补充。
+            </p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <label style="display:inline-flex;gap:6px;align-items:center" title="开启后 worker 取口与入池探测都跳过机房/云厂商 ASN 段（Oracle/AWS/Hetzner 等），只用住宅出口">
+              <input type="checkbox" id="ip-pool-filter-dc" onchange="saveIpPoolDatacenterFilter(this.checked)"/> 只用住宅出口（过滤机房 IP）
+            </label>
+            <button class="primary" id="ip-pool-probe-btn" onclick="probeIpPool()">立即探测</button>
+            <span class="mail-provider-meta mono" id="ip-pool-status">--</span>
+          </div>
+        </div>
+        <div class="msg" id="ip-pool-msg" role="status" aria-live="polite"></div>
+        <details class="domain-advanced" id="ip-pool-details">
+          <summary><span class="domain-advanced-title" id="ip-pool-summary-label">查看池详情</span></summary>
+          <div class="table-scroll" style="margin-top:8px">
+            <table class="proxy-table ip-pool-table">
+              <thead><tr>
+                <th>出口 IP</th><th>累计次数</th><th>上限</th><th>状态</th><th>剩余有效期</th><th>占用</th>
+              </tr></thead>
+              <tbody id="ip-pool-body"><tr><td colspan="6" class="proxy-empty">暂无数据</td></tr></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
 
       <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
         <div class="mail-provider-toolbar">
@@ -2322,10 +2799,10 @@ HTML = r"""<!DOCTYPE html>
       <div class="table-scroll" style="margin-top:12px">
         <table class="proxy-table ip-usage-table">
           <thead><tr>
-            <th>出口 IP</th><th>国家</th><th>延迟</th>
+            <th>出口 IP</th>
             <th>累计次数</th><th>上限占比</th><th>每IP上限</th><th>操作</th>
           </tr></thead>
-          <tbody id="ip-usage-body"><tr><td colspan="7" class="proxy-empty">正在读取</td></tr></tbody>
+          <tbody id="ip-usage-body"><tr><td colspan="5" class="proxy-empty">正在读取</td></tr></tbody>
         </table>
       </div>
       <div class="proxy-pagination">
@@ -2384,7 +2861,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
           <div>
             <div class="mail-source-kicker">Multiple configs</div>
-            <h2 style="margin:0;font-size:15px" id="email-profiles-label">多配置档（自动轮流使用）</h2>
+            <h2 id="email-profiles-label">多配置档（自动轮流使用）</h2>
             <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">启用多个配置档时，注册自动按顺序轮流使用；验证码取信始终用建号时的同一档。没有配置档时使用上方的单配置。</p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
@@ -2420,6 +2897,40 @@ HTML = r"""<!DOCTYPE html>
           </div>
           <div class="mail-provider-fields" id="email-profile-fields" style="margin-top:10px"></div>
         </div>
+      </section>
+
+      <section class="mail-provider-panel" aria-labelledby="mail-cleanup-label" style="margin-top:12px">
+        <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div class="mail-source-kicker">Server mail cleanup</div>
+            <h2 id="mail-cleanup-label">服务端邮件自动清理</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">定期删除自建邮箱服务（cloudflare temp-email）N 小时前的历史邮件，防止 D1 数据库涨满、并压低每日行读取配额消耗。清理用组合策略：先调 Worker 批量接口删整数天前的大头（保留不足 24 小时也先删 1 天前的），再分页逐封删剩余窗口，把 D1 查询次数压到最低；批量接口不可用时整体退回逐封删。正在注册的验证码邮件只会存活几分钟，保留期内的邮件不会被清理。上方邮件数仅在清理执行（定时/手动）后更新，面板不做后台轮询。</p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="badge mono" id="mail-cleanup-count">-- 封</span>
+            <button id="mail-cleanup-refresh-btn" onclick="refreshMailCleanup(false)">刷新</button>
+            <button class="danger" id="mail-cleanup-run-btn" onclick="runMailCleanup()">立即清理</button>
+          </div>
+        </div>
+        <div class="msg" id="mail-cleanup-msg" role="status" aria-live="polite"></div>
+        <div class="mail-provider-fields" style="margin-top:10px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+          <div class="field" style="width:150px">
+            <label for="mail-cleanup-keep-hours">保留时间（小时）</label>
+            <input id="mail-cleanup-keep-hours" type="number" min="1" max="720" step="1" autocomplete="off"/>
+          </div>
+          <div class="field" style="width:170px">
+            <label for="mail-cleanup-interval">自动清理间隔（小时）</label>
+            <input id="mail-cleanup-interval" type="number" min="1" max="168" step="1" autocomplete="off"/>
+          </div>
+          <div class="field" style="display:flex;gap:14px;align-items:center;padding-bottom:6px">
+            <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="mail-cleanup-enabled"/> 启用自动清理</label>
+            <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="mail-cleanup-clean-unknow"/> 含孤儿邮件</label>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;padding-bottom:2px">
+            <button class="primary" id="mail-cleanup-save-btn" onclick="saveMailCleanupSettings()">保存设置</button>
+          </div>
+        </div>
+        <p class="mail-provider-meta mono" id="mail-cleanup-last" style="margin:8px 0 0">上次清理：--</p>
       </section>
 
       <details class="domain-advanced" id="domain-advanced">
@@ -2495,42 +3006,284 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <section class="metric-grid panel-gap" id="kpis" aria-label="核心指标"></section>
+  <section class="sso-view" id="sso-view" aria-labelledby="sso-view-title" hidden>
+    <div class="sso-view-inner">
+      <div class="sso-view-heading">
+        <div>
+          <div class="mail-source-kicker">Account state</div>
+          <div class="page-title" id="sso-view-title">SSO 风控</div>
+          <p class="sso-view-subtitle">用 SSO 读取 grok.com 的 botFlagSource / policy，不换 token、不入库</p>
+        </div>
+        <span class="sso-job mono" id="sso-heading-status">尚未扫描</span>
+      </div>
 
-  <section class="card panel rate-panel">
-    <div class="section-head">
-      <h2>时段成功率</h2>
-      <span class="section-meta mono" id="rates-updated">register_results.jsonl</span>
-    </div>
-    <div class="rate-grid" id="rate-kpis"></div>
-  </section>
+      <div class="sso-summary" id="sso-summary" aria-label="SSO 风控扫描结果">
+        <div class="sso-summary-item"><div class="sso-summary-label">总数</div><div class="sso-summary-value" id="sso-kpi-total">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">干净</div><div class="sso-summary-value ok" id="sso-kpi-clean">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">标记</div><div class="sso-summary-value fail" id="sso-kpi-flagged">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">deny</div><div class="sso-summary-value warn" id="sso-kpi-denied">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">失败</div><div class="sso-summary-value" id="sso-kpi-error">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">进度</div><div class="sso-summary-value" id="sso-kpi-progress">--</div></div>
+      </div>
 
-  <section class="card panel">
-    <div class="progress-head">
-      <h2>当前批次</h2>
-      <div class="mono" id="prog-text">--</div>
-    </div>
-    <div class="bar-wrap"><div class="bar" id="bar"></div></div>
-    <div class="progress-sub" id="prog-sub"></div>
-  </section>
+      <div class="sso-import">
+        <div class="field">
+          <label for="sso-input">SSO 列表（每行一条）</label>
+          <textarea id="sso-input" spellcheck="false" autocomplete="off" placeholder="email----sso&#10;email----password----sso&#10;eyJ..."></textarea>
+        </div>
+        <div class="sso-import-actions">
+          <div>
+            <div class="sso-source-row" role="group" aria-label="数据来源">
+              <button type="button" id="sso-src-paste" aria-pressed="true" onclick="setSsoSource('paste')">粘贴</button>
+              <button type="button" id="sso-src-pending" aria-pressed="false" onclick="setSsoSource('pending')">待处理</button>
+              <button type="button" id="sso-src-accounts" aria-pressed="false" onclick="setSsoSource('accounts')">全部账号</button>
+              <button type="button" id="sso-src-risk" aria-pressed="false" onclick="setSsoSource('risk')">已隔离</button>
+            </div>
+            <div class="sso-settings" style="margin-top:10px">
+              <div class="field">
+                <label for="sso-delay">间隔秒</label>
+                <input type="number" id="sso-delay" min="0" max="10" step="0.1" value="0.4"/>
+              </div>
+              <div class="field">
+                <label for="sso-proxy">代理（可空）</label>
+                <input id="sso-proxy" type="text" autocomplete="off" placeholder="沿用 config.proxy"/>
+              </div>
+            </div>
+            <p class="sso-format" id="sso-source-hint">粘贴 JWT 或 email----sso。判定规则与注册门禁一致：botFlag 1/2 或 policy=deny 记为标记。</p>
+          </div>
+          <div class="button-group">
+            <button class="primary" id="sso-start" onclick="startSsoScan()">开始检测</button>
+            <button class="danger" id="sso-stop" onclick="stopSsoScan()">停止</button>
+            <button id="sso-export-flagged" onclick="exportSsoState('flagged')">导出标记</button>
+            <button id="sso-export-clean" onclick="exportSsoState('clean')">导出干净</button>
+          </div>
+        </div>
+      </div>
+      <div class="msg" id="sso-msg" role="status" aria-live="polite"></div>
 
-  <section class="card panel recovery-panel" aria-labelledby="recovery-title">
-    <div class="section-head">
-      <h2 id="recovery-title">账号补录</h2>
-      <span class="section-meta mono" id="recovery-status">等待检查</span>
-    </div>
-    <div class="recovery-layout">
-      <div class="chips" id="recovery-kpis"></div>
-      <div class="button-group recovery-actions">
-        <button id="recovery-pending" onclick="startRecovery('pending')">补录待处理</button>
-        <button id="recovery-accounts" onclick="startRecovery('accounts')">扫描全部账号</button>
-        <button class="danger" id="recovery-stop" onclick="stopRecovery()">停止补录</button>
+      <div class="sso-list-section">
+        <div class="sso-list-head">
+          <div>
+            <h2>检测明细</h2>
+            <div class="sso-job mono" id="sso-job-status" role="status" aria-live="polite">等待开始</div>
+          </div>
+          <div class="sso-filter" role="group" aria-label="结果筛选">
+            <button type="button" id="sso-filter-all" aria-pressed="true" onclick="setSsoFilter('all')">全部</button>
+            <button type="button" id="sso-filter-flagged" aria-pressed="false" onclick="setSsoFilter('flagged')">标记</button>
+            <button type="button" id="sso-filter-clean" aria-pressed="false" onclick="setSsoFilter('clean')">干净</button>
+            <button type="button" id="sso-filter-error" aria-pressed="false" onclick="setSsoFilter('error')">失败</button>
+          </div>
+        </div>
+        <div class="sso-table-wrap">
+          <table class="sso-table">
+            <thead><tr><th>邮箱</th><th>bot</th><th>policy</th><th>risk</th><th>event</th><th>判定</th><th>说明</th></tr></thead>
+            <tbody id="sso-body"><tr><td colspan="7" class="sso-empty">粘贴 SSO 或选择库存后开始检测</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
-    <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
   </section>
 
-  <div class="three panel-gap">
+  <section class="accounts-view" id="accounts-view" aria-labelledby="accounts-view-title" hidden>
+    <div class="accounts-view-inner">
+      <div class="accounts-view-heading">
+        <div>
+          <div class="mail-source-kicker">Account manager</div>
+          <div class="page-title" id="accounts-view-title">账号管理</div>
+          <p class="accounts-view-subtitle">管理 accounts/tasks 下全部已注册账号：多选复制（完整信息 / 仅 SSO / 邮箱）、标记使用状态、删除并自动重建聚合导出</p>
+        </div>
+        <span class="accounts-job mono" id="accounts-heading-status">尚未加载</span>
+      </div>
+
+      <div class="accounts-summary" id="accounts-summary" aria-label="账号统计">
+        <div class="accounts-summary-item"><div class="accounts-summary-label">总账号</div><div class="accounts-summary-value" id="acc-kpi-total">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">任务批次</div><div class="accounts-summary-value" id="acc-kpi-tasks">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">未使用</div><div class="accounts-summary-value" id="acc-kpi-unused">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">已使用</div><div class="accounts-summary-value ok" id="acc-kpi-used">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">已禁用</div><div class="accounts-summary-value fail" id="acc-kpi-disabled">--</div></div>
+        <div class="accounts-summary-item"><div class="accounts-summary-label">筛选结果</div><div class="accounts-summary-value" id="acc-kpi-filtered">--</div></div>
+      </div>
+
+      <div class="accounts-toolbar">
+        <div class="field">
+          <label for="acc-search">搜索邮箱</label>
+          <input id="acc-search" type="search" autocomplete="off" placeholder="关键字，如 anna / snkjvpn" oninput="accSearchDebounced()"/>
+        </div>
+        <div class="field">
+          <label for="acc-task">批次任务</label>
+          <select id="acc-task" onchange="accSetFilter('task', this.value)"><option value="">全部任务</option></select>
+        </div>
+        <div class="field">
+          <label for="acc-status">状态</label>
+          <select id="acc-status" onchange="accSetFilter('status', this.value)">
+            <option value="">全部状态</option>
+            <option value="unused">未使用</option>
+            <option value="used">已使用</option>
+            <option value="disabled">已禁用</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="acc-sort">排序</label>
+          <select id="acc-sort" onchange="accSetFilter('sort', this.value)">
+            <option value="newest">最新注册优先</option>
+            <option value="oldest">最早注册优先</option>
+            <option value="email">邮箱 A→Z</option>
+            <option value="email_desc">邮箱 Z→A</option>
+          </select>
+        </div>
+        <div class="accounts-toolbar-actions">
+          <button id="acc-reveal" aria-pressed="false" onclick="accToggleReveal()" title="切换明文 / 脱敏显示密码与 SSO">显示明文</button>
+          <button class="primary" onclick="refreshAccounts(true)">刷新</button>
+        </div>
+      </div>
+
+      <div class="accounts-bulk" id="accounts-bulk" hidden>
+        <span class="accounts-bulk-count" id="acc-bulk-count">已选 0</span>
+        <button type="button" class="select-all-filtered" id="acc-select-filtered" onclick="accSelectAllFiltered()">全选筛选结果</button>
+        <button type="button" onclick="accCopy('full')">复制账号</button>
+        <button type="button" onclick="accCopy('sso')">复制 SSO</button>
+        <button type="button" onclick="accCopy('emails')">复制邮箱</button>
+        <button type="button" onclick="accExport('full')">导出 TXT</button>
+        <button type="button" onclick="accExport('jsonl')">导出 JSONL</button>
+        <button type="button" onclick="accSetStatus('used')">标记已使用</button>
+        <button type="button" onclick="accSetStatus('unused')">标记未使用</button>
+        <button type="button" onclick="accSetStatus('disabled')">标记禁用</button>
+        <button type="button" class="danger" onclick="accDelete()">删除选中</button>
+      </div>
+
+      <div class="msg" id="acc-msg" role="status" aria-live="polite"></div>
+
+      <div class="accounts-list-section">
+        <div class="accounts-list-head">
+          <h2>账号列表</h2>
+          <span class="accounts-job mono" id="accounts-job-status" role="status" aria-live="polite">--</span>
+        </div>
+        <div class="accounts-table-wrap">
+          <table class="accounts-table">
+            <thead><tr>
+              <th><input type="checkbox" id="acc-check-page" aria-label="全选本页" onchange="accToggleSelectPage(this.checked)"/></th>
+              <th>邮箱</th><th>密码</th><th>SSO</th><th>状态</th><th>批次任务</th><th>注册时间</th><th>操作</th>
+            </tr></thead>
+            <tbody id="acc-body"><tr><td colspan="8" class="accounts-empty">点击"刷新"加载账号</td></tr></tbody>
+          </table>
+        </div>
+        <div class="accounts-pagination">
+          <div class="accounts-page-controls">
+            <button type="button" onclick="accPage(-1)" aria-label="上一页">‹ 上一页</button>
+            <span class="accounts-page-info mono" id="acc-page-info">-</span>
+            <button type="button" onclick="accPage(1)" aria-label="下一页">下一页 ›</button>
+            <select id="acc-page-size" onchange="accSetFilter('page_size', this.value)" aria-label="每页条数">
+              <option value="50">每页 50</option>
+              <option value="100">每页 100</option>
+              <option value="200">每页 200</option>
+            </select>
+          </div>
+          <span class="accounts-page-info mono" id="acc-dir-info"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="metric-grid panel-gap" id="kpis" aria-label="核心指标"></section>
+
+  <div class="two panel-gap">
+    <section class="card rate-panel">
+      <div class="section-head">
+        <h2>时段成功率</h2>
+        <span class="section-meta mono" id="rates-updated">register_results.jsonl</span>
+      </div>
+      <div class="rate-grid" id="rate-kpis"></div>
+    </section>
+    <section class="card">
+      <div class="progress-head">
+        <h2>当前批次</h2>
+        <div class="mono" id="prog-text">--</div>
+      </div>
+      <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+      <div class="progress-sub" id="prog-sub"></div>
+    </section>
+  </div>
+
+  <div class="two panel-gap">
+    <details class="card recovery-panel" aria-labelledby="recovery-title">
+      <summary class="panel-summary">
+        <h2 id="recovery-title">账号补录</h2>
+        <span class="section-meta mono" id="recovery-status">等待检查</span>
+      </summary>
+      <div class="recovery-layout">
+        <div class="chips" id="recovery-kpis"></div>
+        <div class="button-group recovery-actions">
+          <button id="recovery-pending" onclick="startRecovery('pending')">补录待处理</button>
+          <button id="recovery-accounts" onclick="startRecovery('accounts')">扫描全部账号</button>
+          <button class="danger" id="recovery-stop" onclick="stopRecovery()">停止补录</button>
+        </div>
+      </div>
+      <div class="msg" id="recovery-msg" role="status" aria-live="polite"></div>
+      <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">
+        <div class="domain-view-heading" style="margin-bottom:6px">
+          <div>
+            <div class="mail-source-kicker">Grok2API upload</div>
+            <div class="page-title" style="font-size:14px">上传到 grok2api（导入 + 转 Build + 转 Console）</div>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:560px">
+              把注册产生的 Web SSO 账号批量上传到 grok2api 管理 API，自动执行转 Build / 转 Console。
+              后台执行不阻塞注册。需先在 config 配置 grok2api_admin_url / user / password。
+            </p>
+          </div>
+          <span class="domain-job mono" id="grok2api-status">--</span>
+        </div>
+        <div class="chips" id="grok2api-kpis"></div>
+        <div class="button-group recovery-actions">
+          <button id="grok2api-upload" onclick="startGrok2apiUpload()">上传到 grok2api</button>
+          <button class="danger" id="grok2api-stop" onclick="stopGrok2apiUpload()">停止上传</button>
+        </div>
+        <div class="msg" id="grok2api-msg" role="status" aria-live="polite"></div>
+      </div>
+    </details>
+
+    <section class="card panel" aria-labelledby="sso-dash-title">
+      <div class="section-head">
+        <h2 id="sso-dash-title">SSO 风控</h2>
+        <span class="section-meta mono" id="sso-dash-status">grok.com botFlag</span>
+      </div>
+      <p style="margin:0 0 10px;color:var(--muted);font-size:13px;line-height:1.5">
+        用 SSO 访问 grok.com，检查 <code>botFlagSource</code> / <code>policy=deny</code>，不换 token。
+      </p>
+      <div class="chips" id="sso-dash-kpis"></div>
+      <div class="button-group" style="margin-top:10px">
+        <button class="primary" onclick="toggleSsoView()">打开检测面板</button>
+        <button onclick="refreshSsoState()">刷新</button>
+      </div>
+    </section>
+
+    <details class="card" aria-labelledby="bfs-title">
+      <summary class="panel-summary">
+        <h2 id="bfs-title">BFS 检测</h2>
+        <span class="section-meta mono" id="bfs-status">JWT claim</span>
+      </summary>
+      <p style="margin:6px 0 10px;color:var(--muted);font-size:12px;line-height:1.5">
+        解码 CPA / Grok2API auth 中的 access_token，检查是否含 <code>bfs</code> claim（与 botFlagSource 独立）。
+        注册换 token 后会自动检测并写入 <code>accounts/sso_bfs_flagged.txt</code>。
+      </p>
+      <div class="chips" id="bfs-kpis"></div>
+      <div class="button-group" style="margin:10px 0 8px">
+        <button id="bfs-scan" onclick="runBfsScan()">扫描 auth 目录</button>
+      </div>
+      <div class="msg" id="bfs-msg" role="status" aria-live="polite"></div>
+      <div class="table-scroll">
+        <table class="bfs-table">
+          <thead><tr><th>邮箱</th><th>bfs</th><th>来源</th><th>文件</th></tr></thead>
+          <tbody id="bfs-body"><tr><td colspan="4" class="proxy-empty">尚未扫描（点「扫描 auth 目录」）</td></tr></tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <details class="card panel" aria-labelledby="stats-collapse-title">
+    <summary class="panel-summary">
+      <h2 id="stats-collapse-title">统计明细</h2>
+      <span class="section-meta mono">成功统计 · 黑名单 · 黑名单更新记录</span>
+    </summary>
+    <div class="three">
     <div class="card">
       <div class="section-head">
         <h2>成功统计</h2>
@@ -2565,7 +3318,8 @@ HTML = r"""<!DOCTYPE html>
         <tbody id="bl-added"></tbody></table>
       </div>
     </div>
-  </div>
+    </div>
+  </details>
 
   <div class="two panel-gap">
     <div class="card"><h2>Worker 成功 / 失败</h2><div class="chips" id="workers-stats"></div></div>
@@ -2596,13 +3350,17 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </div>
   <details class="card panel" open>
-    <summary class="log-summary">日志尾部（点击展开或收起）</summary>
+    <summary class="panel-summary">
+      <h2>日志尾部</h2>
+      <span class="section-meta mono" id="tail-meta">实时 · 每 2 秒刷新</span>
+    </summary>
     <div class="log-tools">
       <div class="field log-retention">
         <label for="log-retention-days">保留最近天数</label>
         <input type="number" id="log-retention-days" min="1" max="365" value="7"/>
       </div>
       <button class="danger" id="btn-clean-logs" onclick="cleanupLogs()">清理过期日志</button>
+      <button id="tail-follow" onclick="toggleTailFollow()" aria-pressed="true" title="新日志到达时自动滚动到底部">自动滚动</button>
       <span class="log-cleanup-msg" id="log-cleanup-msg" role="status" aria-live="polite"></span>
     </div>
     <div class="tail mono" id="tail"></div>
@@ -2611,6 +3369,7 @@ HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 let last = null;
+let fullStats = null;
 let proxyData = null;
 let proxyPage = 1;
 let proxyPageSize = 50;
@@ -2628,6 +3387,9 @@ let domainProviderTouched = false;
 const THEME_KEY = "GROK_REGISTER_THEME";
 const APP_VIEW_KEY = "GROK_REGISTER_APP_VIEW";
 const HELP_TAB_KEY = "GROK_REGISTER_HELP_TAB";
+let ssoSource = "paste";
+let ssoFilter = "all";
+let lastSsoState = null;
 function syncThemeButtons() {
   const theme = document.documentElement.dataset.theme || "light";
   document.querySelectorAll("[data-theme-choice]").forEach(button => {
@@ -2643,12 +3405,14 @@ function setTheme(theme) {
   syncThemeButtons();
 }
 function setAppView(view, options = {}) {
-  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "ip-usage") return;
+  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "ip-usage" && view !== "sso" && view !== "accounts") return;
   const dashboard = document.getElementById("dashboard-view");
   const help = document.getElementById("help-view");
   const proxies = document.getElementById("proxy-view");
   const domains = document.getElementById("domain-view");
   const ipUsage = document.getElementById("ip-usage-view");
+  const sso = document.getElementById("sso-view");
+  const accounts = document.getElementById("accounts-view");
   const domainToggle = document.getElementById("domain-view-toggle");
   const domainLabel = document.getElementById("domain-view-label");
   const toggle = document.getElementById("help-view-toggle");
@@ -2657,13 +3421,19 @@ function setAppView(view, options = {}) {
   const proxyLabel = document.getElementById("proxy-view-label");
   const ipUsageToggle = document.getElementById("ip-usage-view-toggle");
   const ipUsageLabel = document.getElementById("ip-usage-view-label");
-  if (!dashboard || !help || !proxies || !domains || !ipUsage || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ipUsageToggle || !ipUsageLabel) return;
+  const ssoToggle = document.getElementById("sso-view-toggle");
+  const ssoLabel = document.getElementById("sso-view-label");
+  const accountsToggle = document.getElementById("accounts-view-toggle");
+  const accountsLabel = document.getElementById("accounts-view-label");
+  if (!dashboard || !help || !proxies || !domains || !ipUsage || !sso || !accounts || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ipUsageToggle || !ipUsageLabel || !ssoToggle || !ssoLabel || !accountsToggle || !accountsLabel) return;
   const isHelp = view === "help";
   const isProxies = view === "proxies";
   const isDomains = view === "domains";
   const isIpUsage = view === "ip-usage";
-  const isOverlay = isHelp || isProxies || isDomains || isIpUsage;
-  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== ipUsage);
+  const isSso = view === "sso";
+  const isAccounts = view === "accounts";
+  const isOverlay = isHelp || isProxies || isDomains || isIpUsage || isSso || isAccounts;
+  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== ipUsage && element !== sso && element !== accounts);
   dashboardChildren.forEach(element => {
     element.inert = isOverlay;
     if (isOverlay) element.setAttribute("aria-hidden", "true");
@@ -2677,10 +3447,16 @@ function setAppView(view, options = {}) {
   domains.inert = !isDomains;
   ipUsage.hidden = !isIpUsage;
   ipUsage.inert = !isIpUsage;
+  sso.hidden = !isSso;
+  sso.inert = !isSso;
+  accounts.hidden = !isAccounts;
+  accounts.inert = !isAccounts;
   document.body.classList.toggle("help-view-open", isHelp);
   document.body.classList.toggle("proxy-view-open", isProxies);
   document.body.classList.toggle("domain-view-open", isDomains);
   document.body.classList.toggle("ip-usage-view-open", isIpUsage);
+  document.body.classList.toggle("sso-view-open", isSso);
+  document.body.classList.toggle("accounts-view-open", isAccounts);
   toggle.dataset.active = String(isHelp);
   toggle.setAttribute("aria-expanded", String(isHelp));
   toggle.setAttribute("aria-label", isHelp ? "返回控制台" : "打开问题和使用");
@@ -2701,6 +3477,16 @@ function setAppView(view, options = {}) {
   ipUsageToggle.setAttribute("aria-label", isIpUsage ? "返回控制台" : "打开IP使用统计");
   ipUsageToggle.title = isIpUsage ? "返回控制台" : "IP使用统计";
   ipUsageLabel.textContent = isIpUsage ? "返回控制台" : "IP使用";
+  ssoToggle.dataset.active = String(isSso);
+  ssoToggle.setAttribute("aria-expanded", String(isSso));
+  ssoToggle.setAttribute("aria-label", isSso ? "返回控制台" : "打开 SSO 风控");
+  ssoToggle.title = isSso ? "返回控制台" : "SSO 风控";
+  ssoLabel.textContent = isSso ? "返回控制台" : "SSO 风控";
+  accountsToggle.dataset.active = String(isAccounts);
+  accountsToggle.setAttribute("aria-expanded", String(isAccounts));
+  accountsToggle.setAttribute("aria-label", isAccounts ? "返回控制台" : "打开账号管理");
+  accountsToggle.title = isAccounts ? "返回控制台" : "账号管理";
+  accountsLabel.textContent = isAccounts ? "返回控制台" : "账号管理";
   if (options.persist !== false) {
     try { localStorage.setItem(APP_VIEW_KEY, view); } catch (e) {}
   }
@@ -2709,13 +3495,16 @@ function setAppView(view, options = {}) {
     refreshEmailProvider();
     refreshEmailDomains();
     refreshEmailProfiles();
+    refreshMailCleanup(false, true);
   }
   if (isIpUsage) refreshIpUsage();
+  if (isSso) refreshSsoState();
+  if (isAccounts) refreshAccounts();
   if (options.focus) {
     requestAnimationFrame(() => {
       const target = isHelp
         ? document.querySelector('[data-help-tab][aria-selected="true"]')
-        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-usage-limit-page") : (view === "dashboard" ? domainToggle : toggle))));
+        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-usage-limit-page") : (isSso ? document.getElementById("sso-input") : (isAccounts ? document.getElementById("acc-search") : (view === "dashboard" ? domainToggle : toggle))))));
       if (target) target.focus();
     });
   }
@@ -2735,6 +3524,14 @@ function toggleDomainView() {
 function toggleIpUsageView() {
   const isIpUsage = document.body.classList.contains("ip-usage-view-open");
   setAppView(isIpUsage ? "dashboard" : "ip-usage", { focus: true });
+}
+function toggleSsoView() {
+  const isSso = document.body.classList.contains("sso-view-open");
+  setAppView(isSso ? "dashboard" : "sso", { focus: true });
+}
+function toggleAccountsView() {
+  const isAccounts = document.body.classList.contains("accounts-view-open");
+  setAppView(isAccounts ? "dashboard" : "accounts", { focus: true });
 }
 function setHelpTab(name) {
   if (name !== "guide" && name !== "faq") return;
@@ -2790,23 +3587,48 @@ function initHelp() {
     view = localStorage.getItem(APP_VIEW_KEY) || "dashboard";
     tab = localStorage.getItem(HELP_TAB_KEY) || "guide";
   } catch (e) {}
-  if (!["dashboard", "help", "proxies", "domains", "ip-usage"].includes(view)) view = "dashboard";
+  if (!["dashboard", "help", "proxies", "domains", "ip-usage", "sso", "accounts"].includes(view)) view = "dashboard";
   setHelpTab(tab);
   filterFaq("");
   setAppView(view, { persist: false, focus: false });
 }
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("ip-usage-view-open"))) {
+  if (event.key === "Escape" && (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("ip-usage-view-open") || document.body.classList.contains("sso-view-open") || document.body.classList.contains("accounts-view-open"))) {
     setAppView("dashboard", { focus: true });
   }
 });
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return Math.round(bytes) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = bytes / 1024;
+  let unit = units[0];
+  for (let i = 1; i < units.length && scaled >= 1024; i += 1) {
+    scaled /= 1024;
+    unit = units[i];
+  }
+  const digits = scaled >= 100 ? 0 : (scaled >= 10 ? 1 : 2);
+  return scaled.toFixed(digits) + " " + unit;
+}
 function setMsg(id, text, cls) {
   const el = document.getElementById(id);
   el.textContent = text || "";
   el.className = "msg" + (cls ? " " + cls : "");
+  el.hidden = false;
+}
+function flashMsg(id, text, cls, ms) {
+  // 顶部导航栏等紧凑位置的瞬时反馈：显示后自动隐藏
+  setMsg(id, text, cls);
+  setTimeout(() => {
+    const el = document.getElementById(id);
+    if (el && el.textContent === text) {
+      el.textContent = "";
+      el.hidden = true;
+    }
+  }, ms || 6000);
 }
 function getToken() {
   const el = document.getElementById("monitor-token");
@@ -3115,17 +3937,13 @@ function renderIpUsage(data) {
     const per = it.limit != null ? Number(it.limit) : 0;
     const pct = eff > 0 ? Math.min(100, Math.round(100 * count / eff)) : 0;
     const over = eff > 0 && count >= eff;
-    const meta = it.meta || {};
-    const latency = it.latency_ms != null ? it.latency_ms + " ms" : "--";
     return `<tr>
       <td class="mono">${esc(ip)}${over ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">超限</span>' : ""}</td>
-      <td>${esc(meta.country || "--")}</td>
-      <td class="mono">${esc(latency)}</td>
       <td class="mono">${esc(count)}</td>
       <td style="min-width:160px">
         <div style="display:flex;align-items:center;gap:8px">
-          <div class="bar-wrap" style="flex:1;min-width:90px"><div class="bar" style="width:${pct}%;${over ? "background:var(--danger, #e5484d)" : ""}"></div></div>
-          <span class="mono" style="color:${over ? "var(--danger, #e5484d)" : "var(--muted)"}">${eff > 0 ? pct + "%" : "--"}</span>
+          <div class="bar-wrap" style="flex:1;min-width:90px"><div class="bar" style="width:${pct}%;${over ? "background:var(--fail)" : ""}"></div></div>
+          <span class="mono" style="color:${over ? "var(--fail)" : "var(--muted)"}">${eff > 0 ? pct + "%" : "--"}</span>
         </div>
       </td>
       <td>
@@ -3140,7 +3958,51 @@ function renderIpUsage(data) {
         <button class="danger" onclick="deleteIpUsageItem('${esc(ip)}')" title="删除该 IP 的使用记录、上限与元数据">删除</button>
       </td>
     </tr>`;
-  }).join("") : '<tr><td colspan="7" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+  }).join("") : '<tr><td colspan="5" class="proxy-empty">暂无使用记录（注册成功或失败后自动累计）</td></tr>';
+}
+async function refreshIpPool(silent) {
+  try {
+    const j = await api("/api/ip-pool?_=" + Date.now(), { authHelp: !silent });
+    const st = j.stats || {};
+    const label = document.getElementById("ip-pool-status");
+    if (label) label.textContent = "可用 " + (st.usable ?? 0) + " / 总数 " + (st.total ?? 0)
+      + " / 超限 " + (st.over_limit ?? 0) + " / 占用 " + (st.in_use ?? 0)
+      + (j.updated_at ? " / 更新 " + esc(j.updated_at) : "");
+    const rows = (j.items || []).map(it => {
+      const used = Number(it.used) || 0;
+      const limit = Number(it.limit) || 0;
+      let state = '<span class="badge" style="color:var(--ok)">可用</span>';
+      if (it.consumer) state = '<span class="badge" style="color:var(--accent)">占用中</span>';
+      else if (!it.usable) state = '<span class="badge" style="color:var(--fail)">超限</span>';
+      const ttl = Math.floor(Number(it.ttl_remaining) / 60) + "m" + (Number(it.ttl_remaining) % 60) + "s";
+      return `<tr>
+        <td class="mono">${esc(it.exit_ip || "--")}</td>
+        <td class="mono">${esc(used)}</td>
+        <td class="mono">${limit > 0 ? esc(limit) : "不限"}</td>
+        <td>${state}</td>
+        <td class="mono">${ttl}</td>
+        <td class="mono">${esc(it.consumer || "--")}</td>
+      </tr>`;
+    }).join("");
+    const body = document.getElementById("ip-pool-body");
+    if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">池为空：点击「立即探测」或等待后台补池</td></tr>';
+    document.getElementById("ip-pool-summary-label").textContent = "查看池详情（" + (j.items || []).length + " 条）";
+  } catch (e) {
+    if (!silent) setMsg("ip-pool-msg", String(e.message || e), "err");
+  }
+}
+async function probeIpPool() {
+  const btn = document.getElementById("ip-pool-probe-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "探测中…"; }
+  try {
+    const j = await api("/api/ip-pool/probe", { method: "POST", body: "{}" });
+    const st = j.stats || {};
+    setMsg("ip-pool-msg", "探测完成：新增可用 " + (j.added ?? 0) + " 个，池内可用 " + (st.usable ?? 0) + " 个", "ok");
+    await refreshIpPool(true);
+  } catch (e) {
+    setMsg("ip-pool-msg", String(e.message || e), "err");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "立即探测"; }
 }
 async function savePerIpLimit(ip, btn) {
   const input = btn.closest("div").querySelector("input[data-ip-limit-input]");
@@ -3163,6 +4025,127 @@ async function deleteIpUsageItem(ip) {
     await refreshIpUsage(false);
   } catch (e) {
     setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  }
+}
+async function resetIpUsage() {
+  if (!confirm("清空全部 IP 使用统计？将删除所有累计次数、每 IP 上限、软拉黑与 IP 元数据（log/ip_usage.json），不可恢复。")) return;
+  const btn = document.getElementById("ip-usage-reset-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const j = await api("/api/ip-usage/reset", { method: "POST" });
+    setMsg("ip-usage-limit-msg", j.cleared ? "已清空全部 IP 使用统计" : "清空失败", j.cleared ? "ok" : "err");
+    await refreshIpUsage(false);
+    await refreshIpPool(false);
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+let mailCleanupTimer = null;
+function mailCleanupSettingsToInputs(settings) {
+  if (!settings) return;
+  const keepHours = document.getElementById("mail-cleanup-keep-hours");
+  const interval = document.getElementById("mail-cleanup-interval");
+  if (keepHours) keepHours.value = settings.mail_cleanup_keep_hours ?? 1;
+  if (interval) interval.value = settings.mail_cleanup_interval_hours ?? 1;
+  const enabled = document.getElementById("mail-cleanup-enabled");
+  if (enabled) enabled.checked = !!settings.mail_cleanup_enabled;
+  const cleanUnknow = document.getElementById("mail-cleanup-clean-unknow");
+  if (cleanUnknow) cleanUnknow.checked = !!settings.mail_cleanup_clean_unknow;
+}
+function renderMailCleanup(data, applySettings) {
+  data = data || {};
+  const countEl = document.getElementById("mail-cleanup-count");
+  if (countEl) countEl.textContent = (data.count === null || data.count === undefined) ? "待清理后更新" : (Number(data.count).toLocaleString() + " 封");
+  const lastEl = document.getElementById("mail-cleanup-last");
+  if (lastEl) {
+    const r = data.last_result;
+    if (data.last_error) {
+      lastEl.textContent = "上次清理失败：" + data.last_error;
+    } else if (r) {
+      lastEl.textContent = "上次清理：" + (r.finished_at || "--") + " · 删除 " + (r.deleted === null || r.deleted === undefined ? "--" : Number(r.deleted).toLocaleString()) + " 封 · " + (r.mode === "server_batch" ? "服务端批量+逐封扫尾" : "纯逐封删除") + " · 清理前 " + (r.before === null || r.before === undefined ? "--" : Number(r.before).toLocaleString()) + " 封";
+    } else {
+      lastEl.textContent = "上次清理：尚未运行";
+    }
+  }
+  const runBtn = document.getElementById("mail-cleanup-run-btn");
+  if (runBtn) runBtn.disabled = !!data.running;
+  // 仅在打开页面/保存成功后回填设置，后台轮询绝不覆盖正在编辑的输入框
+  if (applySettings) mailCleanupSettingsToInputs(data.settings);
+}
+async function refreshMailCleanup(silent = false, applySettings = false) {
+  try {
+    const data = await api("/api/mail-cleanup" + (silent ? "?_=" + Date.now() : ""));
+    renderMailCleanup(data, applySettings);
+    if (data.count_error) {
+      setMsg("mail-cleanup-msg", "读取服务端邮件数失败：" + data.count_error, "err");
+    } else if (data.running) {
+      setMsg("mail-cleanup-msg", mailCleanupProgressText(data.progress), "");
+      if (!mailCleanupTimer) mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 3000);
+    } else {
+      setMsg("mail-cleanup-msg", "", "");
+    }
+  } catch (e) {
+    if (!silent) setMsg("mail-cleanup-msg", String(e.message || e), "err");
+  }
+}
+function mailCleanupProgressText(progress) {
+  const p = progress || {};
+  let text;
+  if (p.phase === "scan") {
+    text = "清理进行中：正在扫描服务端邮件（已拉取 " + Number(p.scanned || 0).toLocaleString() + " 封，发现待删 " + Number(p.stale || 0).toLocaleString() + " 封）";
+  } else if (p.phase === "delete") {
+    text = "清理进行中：正在逐封删除（已处理 " + Number(p.done || 0).toLocaleString() + "/" + Number(p.total || 0).toLocaleString() + "，成功 " + Number(p.deleted || 0).toLocaleString() + "，失败 " + Number(p.failed || 0).toLocaleString() + "）";
+  } else if (p.phase === "batch") {
+    text = "清理进行中：已调用服务端批量接口（cleanDays=" + Number(p.clean_days || 0) + "），等待结果…";
+  } else {
+    text = "清理进行中…";
+  }
+  return text + "，3 秒后刷新…";
+}
+async function saveMailCleanupSettings() {
+  const keepHours = Math.max(1, Math.min(720, Number((document.getElementById("mail-cleanup-keep-hours") || {}).value || 1)));
+  const interval = Math.max(1, Math.min(168, Number((document.getElementById("mail-cleanup-interval") || {}).value || 1)));
+  const payload = {
+    mail_cleanup_keep_hours: keepHours,
+    mail_cleanup_interval_hours: interval,
+    mail_cleanup_enabled: !!(document.getElementById("mail-cleanup-enabled") || {}).checked,
+    mail_cleanup_clean_unknow: !!(document.getElementById("mail-cleanup-clean-unknow") || {}).checked,
+  };
+  const btn = document.getElementById("mail-cleanup-save-btn");
+  if (btn) btn.disabled = true;
+  try {
+    const j = await api("/api/mail-cleanup/settings", { method: "POST", body: JSON.stringify(payload) });
+    mailCleanupSettingsToInputs(j.settings);
+    setMsg("mail-cleanup-msg", j.settings && j.settings.mail_cleanup_enabled ? "清理设置已保存，后台将按间隔自动清理" : "清理设置已保存（自动清理已关闭）", "ok");
+  } catch (e) {
+    setMsg("mail-cleanup-msg", String(e.message || e), "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+async function runMailCleanup() {
+  const btn = document.getElementById("mail-cleanup-run-btn");
+  if (btn) btn.disabled = true;
+  try {
+    await api("/api/mail-cleanup/run", { method: "POST", body: JSON.stringify({}) });
+    setMsg("mail-cleanup-msg", "清理已启动，正在后台执行…", "");
+    if (mailCleanupTimer) { clearTimeout(mailCleanupTimer); }
+    mailCleanupTimer = setTimeout(async () => { mailCleanupTimer = null; await refreshMailCleanup(true); }, 3000);
+  } catch (e) {
+    setMsg("mail-cleanup-msg", String(e.message || e), "err");
+    if (btn) btn.disabled = false;
+  }
+}
+async function saveIpPoolDatacenterFilter(enabled) {
+  try {
+    await api("/api/control", { method: "POST", body: JSON.stringify({ ip_pool_filter_datacenter: !!enabled }) });
+    setMsg("ip-usage-limit-msg", enabled ? "已开启只住宅出口：换口与入池探测将跳过机房/云段" : "已关闭只住宅出口", "ok");
+  } catch (e) {
+    setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+    const box = document.getElementById("ip-pool-filter-dc");
+    if (box) box.checked = !enabled;
   }
 }
 async function saveIpUsageLimit() {
@@ -3190,9 +4173,9 @@ async function exportConfig() {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
-    setMsg("config-backup-msg", "已导出（含敏感凭据，请妥善保管）", "ok");
+    flashMsg("config-backup-msg", "已导出（含敏感凭据，请妥善保管）", "ok");
   } catch (e) {
-    setMsg("config-backup-msg", String(e.message || e), "err");
+    flashMsg("config-backup-msg", String(e.message || e), "err");
   }
 }
 async function importConfigFile(file) {
@@ -3208,9 +4191,9 @@ async function importConfigFile(file) {
     const msg = "导入完成：" + (j.written || []).join("、")
       + (j.skipped && j.skipped.length ? "；跳过：" + j.skipped.join("、") : "")
       + "。请重启面板/注册进程生效。";
-    setMsg("config-backup-msg", msg, "ok");
+    flashMsg("config-backup-msg", msg, "ok");
   } catch (e) {
-    setMsg("config-backup-msg", "导入失败：" + String(e.message || e), "err");
+    flashMsg("config-backup-msg", "导入失败：" + String(e.message || e), "err");
   } finally {
     document.getElementById("config-import-file").value = "";
   }
@@ -3694,6 +4677,8 @@ function fillControl(d) {
   if (c.ip_failure_rotate_threshold != null) document.getElementById("ip_failure_rotate_threshold").value = c.ip_failure_rotate_threshold;
   if (c.ip_usage_limit != null && document.getElementById("ip_usage_limit")) document.getElementById("ip_usage_limit").value = c.ip_usage_limit;
   if (c.mode) document.getElementById("mode").value = c.mode;
+  const dcFilter = document.getElementById("ip-pool-filter-dc");
+  if (dcFilter && document.activeElement !== dcFilter) dcFilter.checked = !!c.ip_pool_filter_datacenter;
   syncIpPolicyUi();
 }
 function controlBody() {
@@ -3737,6 +4722,29 @@ async function doStop() {
     await refresh();
   } catch (e) { setMsg("ctrl-msg", String(e.message || e), "err"); }
   document.getElementById("btn-stop").disabled = false;
+}
+let tailFollow = true;
+function toggleTailFollow() {
+  tailFollow = !tailFollow;
+  const btn = document.getElementById("tail-follow");
+  if (btn) btn.setAttribute("aria-pressed", String(tailFollow));
+  if (tailFollow) {
+    const tail = document.getElementById("tail");
+    if (tail) tail.scrollTop = tail.scrollHeight;
+  }
+}
+function bindTailFollow() {
+  const tail = document.getElementById("tail");
+  if (!tail || tail._followBound) return;
+  tail._followBound = true;
+  tail.addEventListener("scroll", () => {
+    // 用户手动上滚时自动关闭跟随，避免新日志强行拉回底部
+    if (tailFollow && tail.scrollHeight - tail.scrollTop - tail.clientHeight > 24) {
+      tailFollow = false;
+      const btn = document.getElementById("tail-follow");
+      if (btn) btn.setAttribute("aria-pressed", "false");
+    }
+  });
 }
 async function cleanupLogs() {
   const days = Number(document.getElementById("log-retention-days").value || 7);
@@ -3787,7 +4795,8 @@ async function refreshBlacklist() {
 async function refreshStats(authHelp = true) {
   try {
     const j = await api("/api/stats?_=" + Date.now(), { authHelp });
-    renderStats(j);
+    fullStats = j;
+    renderStats(fullStats);
     setMsg("stats-msg", "统计已刷新 " + (j.refreshed_at || ""), "ok");
   } catch (e) { setMsg("stats-msg", String(e.message || e), "err"); }
 }
@@ -3830,6 +4839,554 @@ async function stopRecovery() {
     setMsg("recovery-msg", "补录已停止，结束进程 " + JSON.stringify(data.killed || []), "ok");
     await refreshRecovery();
   } catch (e) { setMsg("recovery-msg", String(e.message || e), "err"); }
+}
+function renderGrok2api(data) {
+  data = data || {};
+  const report = data.last_report || {};
+  const imported = report.imported || {};
+  const converted = report.converted || {};
+  const synced = report.synced || {};
+  const statusEl = document.getElementById("grok2api-status");
+  if (!statusEl) return;
+  statusEl.textContent = data.running
+    ? "上传中 #" + (data.pid || "?")
+    : (data.configured ? "已配置（空闲）" : "未配置服务地址");
+  const kpis = [
+    ["配置", data.configured ? "就绪" : "未配置", data.configured ? "ok" : "warn"],
+    ["上次导入", report.ok ? ((imported.created ?? 0) + " 新 / " + (imported.skipped ?? 0) + " 跳过") : "--", report.ok ? "ok" : ""],
+    ["转 Build", report.ok ? ((converted.created ?? 0) + " 建 / " + (converted.skipped ?? 0) + " 跳过") : "--", report.ok ? "accent" : ""],
+    ["转 Console", report.ok ? ((synced.created ?? 0) + " 建 / " + (synced.syncFailed ?? 0) + " 失败") : "--", report.ok ? "accent" : ""],
+    ["账号总数", report.total_accounts ?? "--", ""],
+  ];
+  const el = document.getElementById("grok2api-kpis");
+  if (el) el.innerHTML = kpis.map(([label, value, cls]) =>
+    `<div class="chip"><span>${esc(label)}</span><b class="${cls}">${esc(value)}</b></div>`
+  ).join("");
+  document.getElementById("grok2api-upload").disabled = !!data.running || !data.configured;
+  document.getElementById("grok2api-stop").disabled = !data.running;
+}
+async function refreshGrok2api() {
+  try {
+    const data = await api("/api/grok2api?_=" + Date.now(), { authHelp: false });
+    renderGrok2api(data);
+  } catch (e) {
+    const message = String(e.message || e);
+    document.getElementById("grok2api-status").textContent = message.includes("令牌") ? "等待令牌" : "检查失败";
+  }
+}
+async function startGrok2apiUpload() {
+  setMsg("grok2api-msg", "正在启动上传…", "");
+  try {
+    const data = await api("/api/grok2api/upload", { method: "POST", body: "{}" });
+    setMsg("grok2api-msg", data.ok ? ("上传已启动，进程 " + (data.pid || "?")) : String(data.error || "启动失败"), data.ok ? "ok" : "err");
+    await refreshGrok2api();
+  } catch (e) { setMsg("grok2api-msg", String(e.message || e), "err"); }
+}
+async function stopGrok2apiUpload() {
+  try {
+    const data = await api("/api/grok2api/stop", { method: "POST", body: "{}" });
+    setMsg("grok2api-msg", "上传已停止，结束进程 " + JSON.stringify(data.killed || []), "ok");
+    await refreshGrok2api();
+  } catch (e) { setMsg("grok2api-msg", String(e.message || e), "err"); }
+}
+function renderBfs(data) {
+  data = data || {};
+  const last = data.last_report || {};
+  const rj = data.results_jsonl || {};
+  const el = document.getElementById("bfs-kpis");
+  if (!el) return;
+  el.innerHTML = [
+    ["上次扫描", last.total ?? "--", ""],
+    ["BFS", last.bfs_count ?? "--", (last.bfs_count || 0) > 0 ? "warn" : "ok"],
+    ["Clean", last.clean_count ?? "--", "ok"],
+    ["比率", last.bfs_rate != null ? (last.bfs_rate + "%") : "--", (last.bfs_rate || 0) > 0 ? "warn" : ""],
+    ["队列文件", data.flagged_file_count ?? 0, (data.flagged_file_count || 0) > 0 ? "warn" : ""],
+    ["jsonl bfs", rj.bfs ?? 0, (rj.bfs || 0) > 0 ? "warn" : ""],
+  ].map(([label, value, cls]) => `<div class="chip"><span>${esc(label)}</span><b class="${cls}">${esc(value)}</b></div>`).join("");
+  const st = document.getElementById("bfs-status");
+  if (st) st.textContent = last.scanned_at ? ("扫描 " + last.scanned_at) : "尚未扫描";
+  const body = document.getElementById("bfs-body");
+  if (body && Array.isArray(data.items)) {
+    const rows = data.items.filter(it => it.has_bfs).slice(0, 50);
+    body.innerHTML = rows.length ? rows.map(it =>
+      `<tr><td class="mono">${esc(it.email || "-")}</td><td class="warn">${esc(it.bfs != null ? it.bfs : "yes")}</td><td class="mono">${esc(it.source || "")}</td><td class="mono">${esc(it.file || "")}</td></tr>`
+    ).join("") : '<tr><td colspan="4" style="color:var(--muted)">无 bfs 记录（先点扫描）</td></tr>';
+  }
+}
+async function refreshBfs(authHelp = false) {
+  try {
+    const data = await api("/api/bfs?_=" + Date.now(), { authHelp });
+    renderBfs(data);
+  } catch (e) {
+    const st = document.getElementById("bfs-status");
+    if (st) st.textContent = String(e.message || e).includes("令牌") ? "等待令牌" : "检查失败";
+  }
+}
+async function runBfsScan() {
+  setMsg("bfs-msg", "正在扫描 CPA / Grok2API auth …", "");
+  const btn = document.getElementById("bfs-scan");
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api("/api/bfs/scan", { method: "POST", body: JSON.stringify({}) });
+    renderBfs(Object.assign({}, data, { last_report: data, items: data.items || [] }));
+    setMsg("bfs-msg",
+      "完成 total=" + (data.total ?? 0) +
+      " bfs=" + (data.bfs_count ?? 0) +
+      " clean=" + (data.clean_count ?? 0) +
+      " rate=" + (data.bfs_rate ?? 0) + "%" +
+      (data.export_path ? (" → " + data.export_path) : ""),
+      "ok");
+  } catch (e) {
+    setMsg("bfs-msg", String(e.message || e), "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+function setSsoSource(source) {
+  if (!["paste", "pending", "accounts", "risk"].includes(source)) return;
+  ssoSource = source;
+  ["paste", "pending", "accounts", "risk"].forEach(name => {
+    const btn = document.getElementById("sso-src-" + name);
+    if (btn) btn.setAttribute("aria-pressed", String(name === source));
+  });
+  const hint = document.getElementById("sso-source-hint");
+  const counts = (lastSsoState && lastSsoState.sources) || {};
+  const labels = {
+    paste: "粘贴 JWT 或 email----sso。判定规则与注册门禁一致：botFlag 1/2 或 policy=deny 记为标记。",
+    pending: "扫描 accounts/sso_pending.txt（待补录队列，" + (counts.pending ?? 0) + " 行）。",
+    accounts: "扫描 accounts/*.txt，不含已隔离风控和 bfs 名单（" + (counts.accounts ?? 0) + " 行）。",
+    risk: "复检 accounts/sso_risk_rejected.txt（已隔离，" + (counts.risk ?? 0) + " 行）。",
+  };
+  if (hint) hint.textContent = labels[source] || labels.paste;
+}
+function setSsoFilter(name) {
+  if (!["all", "flagged", "clean", "error"].includes(name)) return;
+  ssoFilter = name;
+  ["all", "flagged", "clean", "error"].forEach(key => {
+    const btn = document.getElementById("sso-filter-" + key);
+    if (btn) btn.setAttribute("aria-pressed", String(key === name));
+  });
+  renderSsoRows(lastSsoState);
+}
+function renderSsoState(data) {
+  data = data || {};
+  lastSsoState = data;
+  const sum = data.summary || {};
+  const running = !!data.running;
+  const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+  setText("sso-kpi-total", sum.total ?? data.total ?? "--");
+  setText("sso-kpi-clean", sum.clean_count ?? "--");
+  setText("sso-kpi-flagged", sum.flagged_count ?? "--");
+  setText("sso-kpi-denied", sum.denied_count ?? "--");
+  setText("sso-kpi-error", sum.error_count ?? "--");
+  const progress = (data.progress || 0) + "/" + (data.total || sum.total || 0);
+  setText("sso-kpi-progress", running ? progress : (sum.total ? String(sum.total) : "--"));
+  const status = running
+    ? ("扫描中 " + progress)
+    : (data.error ? String(data.error) : (sum.scanned_at ? ("上次 " + sum.scanned_at) : "尚未扫描"));
+  setText("sso-heading-status", status);
+  setText("sso-job-status", status);
+  setText("sso-dash-status", running ? "扫描中" : (sum.scanned_at || "grok.com botFlag"));
+  const dash = document.getElementById("sso-dash-kpis");
+  if (dash) {
+    dash.innerHTML = [
+      ["总数", sum.total ?? 0, ""],
+      ["干净", sum.clean_count ?? 0, "ok"],
+      ["标记", sum.flagged_count ?? 0, (sum.flagged_count || 0) > 0 ? "fail" : ""],
+      ["deny", sum.denied_count ?? 0, (sum.denied_count || 0) > 0 ? "warn" : ""],
+    ].map(([label, value, cls]) => `<div class="chip"><span>${esc(label)}</span><b class="${cls}">${esc(value)}</b></div>`).join("");
+  }
+  const startBtn = document.getElementById("sso-start");
+  const stopBtn = document.getElementById("sso-stop");
+  if (startBtn) startBtn.disabled = running;
+  if (stopBtn) stopBtn.disabled = !running;
+  setSsoSource(ssoSource);
+  renderSsoRows(data);
+}
+function renderSsoRows(data) {
+  const body = document.getElementById("sso-body");
+  if (!body) return;
+  const rows = ((data && data.items) || []).filter(it => {
+    if (ssoFilter === "all") return true;
+    if (ssoFilter === "error") return it.verdict === "error" || it.verdict === "unknown";
+    return it.verdict === ssoFilter;
+  });
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7" class="sso-empty">没有匹配的检测结果</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.slice(-400).map(it => {
+    const verdict = it.verdict || "unknown";
+    const note = it.bot_flag_details || it.error || "-";
+    return `<tr>
+      <td class="mono">${esc(it.email || "-")}</td>
+      <td class="mono">${esc(it.bot_flag_source == null ? "-" : it.bot_flag_source)}</td>
+      <td class="mono">${esc(it.policy || "-")}</td>
+      <td class="mono">${esc(it.risk == null ? "-" : it.risk)}</td>
+      <td class="mono">${esc(it.event || "-")}</td>
+      <td><span class="sso-verdict ${esc(verdict)}">${esc(verdict)}</span></td>
+      <td>${esc(note)}</td>
+    </tr>`;
+  }).join("");
+}
+async function refreshSsoState(authHelp = false) {
+  try {
+    const data = await api("/api/sso-state?_=" + Date.now(), { authHelp });
+    renderSsoState(data);
+  } catch (e) {
+    const st = document.getElementById("sso-dash-status");
+    if (st) st.textContent = String(e.message || e).includes("令牌") ? "等待令牌" : "检查失败";
+  }
+}
+async function startSsoScan() {
+  setMsg("sso-msg", "正在启动 SSO 风控扫描 ...", "");
+  try {
+    const payload = {
+      source: ssoSource,
+      text: (document.getElementById("sso-input") || {}).value || "",
+      delay: Number((document.getElementById("sso-delay") || {}).value || 0.4),
+      proxy: (document.getElementById("sso-proxy") || {}).value || "",
+    };
+    const data = await api("/api/sso-state/start", { method: "POST", body: JSON.stringify(payload) });
+    setMsg("sso-msg", "已启动，共 " + (data.total || 0) + " 条", "ok");
+    await refreshSsoState();
+  } catch (e) { setMsg("sso-msg", String(e.message || e), "err"); }
+}
+async function stopSsoScan() {
+  try {
+    await api("/api/sso-state/stop", { method: "POST", body: "{}" });
+    setMsg("sso-msg", "已请求停止", "ok");
+    await refreshSsoState();
+  } catch (e) { setMsg("sso-msg", String(e.message || e), "err"); }
+}
+async function exportSsoState(kind) {
+  try {
+    const data = await api("/api/sso-state/export", { method: "POST", body: JSON.stringify({ kind }) });
+    const blob = new Blob([data.content || ""], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = kind === "clean" ? "sso_clean.txt" : "sso_flagged.jsonl";
+    a.click();
+    URL.revokeObjectURL(url);
+    setMsg("sso-msg", "已导出 " + (data.lines || 0) + " 行 → " + (data.path || kind), "ok");
+  } catch (e) { setMsg("sso-msg", String(e.message || e), "err"); }
+}
+
+// ---------------- 账号管理 ----------------
+const ACC_STATUS_OPTIONS = [["unused", "未使用"], ["used", "已使用"], ["disabled", "已禁用"]];
+const ACC_EXPORT_NAMES = { full: "accounts_export", sso: "accounts_sso", emails: "accounts_emails", jsonl: "accounts_grok2api" };
+let accState = {
+  page: 1, pageSize: 50, search: "", task: "", status: "", sort: "newest",
+  reveal: false, loading: false, data: null,
+  selection: new Set(), selectAllFiltered: false,
+};
+let accSearchTimer = null;
+function accSearchDebounced() {
+  clearTimeout(accSearchTimer);
+  accSearchTimer = setTimeout(() => accSetFilter("search", (document.getElementById("acc-search") || {}).value || ""), 350);
+}
+function accSetFilter(key, value) {
+  if (["search", "task", "status", "sort"].includes(key)) {
+    accState[key] = String(value || "");
+    accState.page = 1;
+    // 筛选变化后不可见账号不允许留在选择集里，避免误删/误标
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    refreshAccounts();
+  } else if (key === "page_size") {
+    accState.pageSize = Math.max(1, Math.min(200, Number(value) || 50));
+    accState.page = 1;
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    refreshAccounts();
+  }
+}
+function accPage(delta) {
+  const d = accState.data;
+  if (!d) return;
+  const next = Math.max(1, Math.min(d.pages || 1, (d.page || 1) + Number(delta || 0)));
+  if (next === accState.page) return;
+  accState.page = next;
+  refreshAccounts();
+}
+async function refreshAccounts(force = false, authHelp = true) {
+  if (accState.loading) return;
+  accState.loading = true;
+  const st = document.getElementById("accounts-heading-status");
+  if (st && force) st.textContent = "刷新中 ...";
+  try {
+    const params = new URLSearchParams({
+      page: String(accState.page), page_size: String(accState.pageSize),
+      search: accState.search, task: accState.task, status: accState.status,
+      sort: accState.sort, reveal: accState.reveal ? "1" : "0",
+      force: force ? "1" : "0", _: String(Date.now()),
+    });
+    const data = await api("/api/accounts?" + params.toString(), { authHelp });
+    accState.data = data;
+    renderAccounts();
+  } catch (e) {
+    if (st) st.textContent = String(e.message || e).includes("令牌") ? "等待令牌" : "加载失败";
+  } finally { accState.loading = false; }
+}
+function accStatusSelect(it) {
+  const opts = ACC_STATUS_OPTIONS.map(([v, l]) =>
+    '<option value="' + v + '"' + (v === it.status ? " selected" : "") + ">" + l + "</option>").join("");
+  const title = it.status_updated_at ? ("更新于 " + esc(it.status_updated_at)) : "默认未使用";
+  return '<select class="acc-status ' + esc(it.status) + '" data-email="' + esc(it.email) + '" title="' + title + '" onchange="accSetRowStatus(this)">' + opts + "</select>";
+}
+function renderAccounts() {
+  const d = accState.data;
+  if (!d) return;
+  const stats = d.stats || {};
+  const setKpi = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
+  setKpi("acc-kpi-total", stats.total ?? 0);
+  setKpi("acc-kpi-tasks", (d.tasks || []).length);
+  setKpi("acc-kpi-unused", stats.unused ?? 0);
+  setKpi("acc-kpi-used", stats.used ?? 0);
+  setKpi("acc-kpi-disabled", stats.disabled ?? 0);
+  setKpi("acc-kpi-filtered", d.filtered ?? 0);
+
+  const taskSel = document.getElementById("acc-task");
+  if (taskSel && document.activeElement !== taskSel) {
+    const prev = accState.task;
+    taskSel.innerHTML = '<option value="">全部任务</option>' + (d.tasks || []).map(t =>
+      '<option value="' + esc(t.key) + '">' + esc(t.key === "__root__" ? "根目录(遗留)" : t.id) + " (" + t.count + ")</option>").join("");
+    taskSel.value = prev;
+    if (taskSel.value !== prev) { taskSel.value = ""; accState.task = ""; }
+  }
+  const sizeSel = document.getElementById("acc-page-size");
+  if (sizeSel && document.activeElement !== sizeSel) sizeSel.value = String(accState.pageSize);
+  const revealBtn = document.getElementById("acc-reveal");
+  if (revealBtn) {
+    revealBtn.setAttribute("aria-pressed", String(accState.reveal));
+    revealBtn.textContent = accState.reveal ? "脱敏显示" : "显示明文";
+  }
+
+  accRenderBulk();
+
+  const secretCls = () => "accounts-secret" + (accState.reveal ? " reveal" : "");
+  const body = document.getElementById("acc-body");
+  if (body) {
+    const items = d.items || [];
+    body.innerHTML = items.length ? items.map(it => {
+      const checked = accState.selection.has(it.email);
+      const taskLabel = it.task ? esc(it.task) : "根目录(遗留)";
+      const copies = it.copies > 1
+        ? ' <span class="accounts-job" title="同一邮箱在 ' + it.copies + ' 个目录出现，展示最新一份">×' + it.copies + "</span>"
+        : "";
+      return "<tr>" +
+        '<td><input type="checkbox" data-email="' + esc(it.email) + '" aria-label="选择 ' + esc(it.email) + '"' + (checked ? " checked" : "") + ' onchange="accRowCheck(this)"/></td>' +
+        '<td class="mono" title="' + esc(it.email) + '">' + esc(it.email) + "</td>" +
+        '<td><span class="' + secretCls() + '">' + esc(it.password || "-") + "</span></td>" +
+        '<td><span class="' + secretCls() + '" title="SSO 长度 ' + it.sso_len + '">' + esc(it.sso || "-") + "</span></td>" +
+        "<td>" + accStatusSelect(it) + "</td>" +
+        '<td class="mono" title="' + taskLabel + '">' + taskLabel + copies + "</td>" +
+        '<td class="mono" title="' + esc(it.registered_at) + '">' + esc(it.registered_at) + "</td>" +
+        '<td><div class="row-actions">' +
+          '<button type="button" onclick="accCopyOne(\'full\', this)" data-email="' + esc(it.email) + '">复制</button>' +
+          '<button type="button" onclick="accCopyOne(\'sso\', this)" data-email="' + esc(it.email) + '">SSO</button>' +
+        "</div></td>" +
+      "</tr>";
+    }).join("") : '<tr><td colspan="8" class="accounts-empty">没有匹配的账号（调整筛选或点"刷新"）</td></tr>';
+  }
+
+  const info = document.getElementById("acc-page-info");
+  if (info) info.textContent = "第 " + (d.page || 1) + " / " + (d.pages || 1) + " 页 · 共 " + (d.filtered || 0) + " 条";
+  const dirInfo = document.getElementById("acc-dir-info");
+  if (dirInfo) dirInfo.textContent = d.accounts_dir || "";
+  const st = document.getElementById("accounts-heading-status");
+  if (st) st.textContent = "共 " + (stats.total ?? 0) + " 个账号 · " + (d.tasks || []).length + " 个批次";
+}
+function accRenderBulk() {
+  const d = accState.data;
+  if (!d) return;
+  const picked = accState.selectAllFiltered ? (d.filtered || 0) : accState.selection.size;
+  const bulk = document.getElementById("accounts-bulk");
+  if (bulk) {
+    bulk.hidden = picked <= 0;
+    document.getElementById("acc-bulk-count").textContent =
+      accState.selectAllFiltered ? ("已选全部筛选 " + picked + " 条") : ("已选 " + picked + " 条");
+  }
+  const head = document.getElementById("acc-check-page");
+  if (head) {
+    const items = d.items || [];
+    const selCount = items.filter(it => accState.selection.has(it.email)).length;
+    head.checked = items.length > 0 && selCount === items.length;
+    head.indeterminate = selCount > 0 && selCount < items.length;
+  }
+}
+function accRowCheck(box) {
+  const email = String(box.dataset.email || "");
+  if (!email) return;
+  if (box.checked) accState.selection.add(email);
+  else accState.selection.delete(email);
+  accState.selectAllFiltered = false;
+  accRenderBulk();
+}
+function accToggleSelectPage(checked) {
+  const items = (accState.data && accState.data.items) || [];
+  items.forEach(it => {
+    if (checked) accState.selection.add(it.email);
+    else accState.selection.delete(it.email);
+  });
+  accState.selectAllFiltered = false;
+  // 仅同步行内勾选框，不重建表格，避免滚动位置/焦点丢失
+  document.querySelectorAll("#acc-body input[data-email]").forEach(box => {
+    box.checked = accState.selection.has(box.dataset.email);
+  });
+  accRenderBulk();
+}
+function accSelectAllFiltered() {
+  if (!accState.data || !(accState.data.filtered > 0)) {
+    setMsg("acc-msg", "当前筛选没有可选择的账号", "err");
+    return;
+  }
+  accState.selectAllFiltered = true;
+  renderAccounts();
+  setMsg("acc-msg", "已按当前筛选全选 " + accState.data.filtered + " 条（改动筛选会重置）", "ok");
+}
+async function copyTextToClipboard(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch (e) { return false; }
+}
+async function accCopy(fmt) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    const ok = await copyTextToClipboard(data.content || "");
+    const label = { full: "账号信息", sso: "SSO", emails: "邮箱" }[fmt] || fmt;
+    setMsg("acc-msg",
+      "已复制 " + (data.count || 0) + " 条" + label + (ok ? "到剪贴板" : "失败（浏览器限制，请改用导出）") +
+      (data.missing_count ? "；" + data.missing_count + " 条已不存在" : ""),
+      ok ? "ok" : "err");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accCopyOne(fmt, btn) {
+  const email = String((btn && btn.dataset.email) || "");
+  if (!email) return;
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({ emails: [email], fmt }),
+    });
+    const ok = await copyTextToClipboard(data.content || "");
+    setMsg("acc-msg", (ok ? "已复制 " : "复制失败 ") + email + (fmt === "sso" ? " 的 SSO" : " 的账号信息"), ok ? "ok" : "err");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accExport(fmt) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+    const ext = fmt === "jsonl" ? "jsonl" : "txt";
+    const blob = new Blob([data.content || ""], { type: fmt === "jsonl" ? "application/jsonl" : "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (ACC_EXPORT_NAMES[fmt] || "accounts_export") + "_" + stamp + "." + ext;
+    a.click();
+    URL.revokeObjectURL(url);
+    setMsg("acc-msg", "已导出 " + (data.count || 0) + " 条", "ok");
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accSetStatus(target) {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  try {
+    const data = await api("/api/accounts/status", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        target, search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    setMsg("acc-msg", "已把 " + (data.changed || 0) + " 条标记为「" + (data.label || target) + "」", "ok");
+    await refreshAccounts();
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); }
+}
+async function accSetRowStatus(select) {
+  const email = String((select && select.dataset.email) || "");
+  const target = String((select && select.value) || "");
+  if (!email || !target) return;
+  try {
+    await api("/api/accounts/status", {
+      method: "POST",
+      body: JSON.stringify({ emails: [email], target }),
+    });
+    const found = ACC_STATUS_OPTIONS.find(([v]) => v === target);
+    setMsg("acc-msg", "已把 " + email + " 标记为「" + ((found && found[1]) || target) + "」", "ok");
+  } catch (e) {
+    setMsg("acc-msg", String(e.message || e), "err");
+  }
+  await refreshAccounts();
+}
+async function accDelete() {
+  const hasSel = accState.selection.size > 0 || accState.selectAllFiltered;
+  if (!hasSel) { setMsg("acc-msg", "请先勾选账号，或点“全选筛选结果”", "err"); return; }
+  // 先解析将要删除的完整名单，确认框里明示邮箱，避免误删不可见账号
+  let emails = [];
+  try {
+    const resolved = await api("/api/accounts/copy", {
+      method: "POST",
+      body: JSON.stringify({
+        emails: Array.from(accState.selection), all_filtered: accState.selectAllFiltered,
+        fmt: "emails", search: accState.search, task: accState.task, status: accState.status,
+      }),
+    });
+    emails = String(resolved.content || "").split("\n").map(s => s.trim()).filter(Boolean);
+  } catch (e) { setMsg("acc-msg", String(e.message || e), "err"); return; }
+  if (!emails.length) { setMsg("acc-msg", "没有可删除的账号", "err"); return; }
+  const sample = emails.slice(0, 6).join("\n") + (emails.length > 6 ? ("\n... 共 " + emails.length + " 个") : "");
+  if (!confirm("确认删除 " + emails.length + " 个账号？将删除：\n" + sample + "\n\n对应账号文件会被删除，所在批次聚合导出（accounts_all.txt / grok2api 导入文件）自动重建，操作不可恢复。")) return;
+  try {
+    const data = await api("/api/accounts/delete", {
+      method: "POST",
+      body: JSON.stringify({ emails }),
+    });
+    accState.selection.clear();
+    accState.selectAllFiltered = false;
+    const taskCount = (data.tasks || []).length;
+    setMsg("acc-msg", "已删除 " + (data.deleted_count || 0) + " 个账号文件（涉及 " + taskCount + " 个目录，聚合已重建）", "ok");
+    await refreshAccounts(true);
+  } catch (e) {
+    setMsg("acc-msg", String(e.message || e), "err");
+    await refreshAccounts(true);
+  }
+}
+function accToggleReveal() {
+  accState.reveal = !accState.reveal;
+  refreshAccounts();
 }
 function renderBlacklist(bl, upd) {
   bl = bl || {};
@@ -3901,6 +5458,27 @@ function renderStats(s) {
     `<tr><td class="mono">${esc(d)}</td><td class="ok">${v.ok||0}</td><td class="warn">${v.risk||0}</td><td class="fail">${v.fail||0}</td></tr>`
   ).join("") : '<tr><td colspan="4" style="color:var(--muted)">无 jsonl 数据</td></tr>';
 }
+function statsForSnapshot(d) {
+  const liveStats = {
+    cpa: d.cpa,
+    cpa_delta: d.cpa_delta,
+    base_cpa: d.base_cpa,
+    batch_ok: d.ok,
+    batch_fail: d.fail,
+    rates: d.rates || {},
+  };
+  if (!fullStats) {
+    return Object.assign({}, liveStats, {
+      jsonl_ok: "--",
+      jsonl_risk: "--",
+      by_day: {},
+      refreshed_at: d.ts_human,
+    });
+  }
+  return Object.assign({}, fullStats, liveStats, {
+    rates: d.rates || fullStats.rates || {},
+  });
+}
 function render(d) {
   document.getElementById("clock").textContent = d.ts_human || "--";
   document.getElementById("logname").textContent =
@@ -3923,13 +5501,35 @@ function render(d) {
   document.getElementById("btn-stop").disabled = !on;
   fillControl(d);
 
+  const traffic = d.traffic || {};
+  const hasTrafficBatch = !!traffic.batch_id;
+  const trafficTotal = Number(traffic.bytes_total) || 0;
+  const trafficState = traffic.running ? "运行中" : "上一批";
+  const trafficSub = hasTrafficBatch
+    ? trafficState + " / 上行 " + formatBytes(traffic.bytes_up) + " / 下行 " + formatBytes(traffic.bytes_down)
+      + ((Number(traffic.unmetered_proxies) || 0) > 0 ? " / 未计量 " + traffic.unmetered_proxies : "")
+    : "等待批次计量";
+  const trafficSummary = d.traffic_summary || {};
+  const trafficBatchCount = Number(trafficSummary.batch_count) || 0;
+  const trafficSuccessCount = Number(trafficSummary.successful_accounts) || 0;
+  const trafficAverageSub = trafficBatchCount
+    ? trafficBatchCount + " 批样本 / 累计 " + formatBytes(trafficSummary.total_bytes)
+      + (trafficSummary.includes_current ? " / 含本批" : "")
+    : "等待批次样本";
+  const trafficSuccessSub = trafficSuccessCount
+    ? "累计成功 " + trafficSuccessCount + " / 含失败流量"
+    : "等待成功账号样本";
   const kpis = [
     ["本批成功", d.ok ?? 0, "ok", "目标 " + (d.target ?? "--")],
     ["本批失败", d.fail ?? 0, "fail", d.success_rate != null ? "成功率 " + d.success_rate + "%" : "暂无数据"],
     ["CPA 总量", d.cpa ?? "--", "accent", "较基线 " + (d.cpa_delta != null ? ((Number(d.cpa_delta) >= 0 ? "+" : "") + d.cpa_delta) : "--")],
     ["正常 / 风控", (d.bot0 ?? 0) + " / " + (d.bot1 ?? 0), (d.bot1 ?? 0) > 0 ? "warn" : "ok", "注册结果采样"],
+    ["BFS 标记", d.bfs ?? 0, (d.bfs ?? 0) > 0 ? "warn" : "ok", "JWT claim 命中"],
     ["黑名单 ASN", (d.blacklist && d.blacklist.count) ?? "--", "accent", "更新错误 " + ((d.blacklist_update && d.blacklist_update.error_count) ?? 0)],
+    ["本批代理流量", hasTrafficBatch ? formatBytes(trafficTotal) : "--", "accent", trafficSub],
     ["预计完成", d.ended ? "已完成" : (d.eta || "--"), "", "并发 " + (d.workers ?? "--") + (d.rate_per_min != null ? " / " + d.rate_per_min + " 每分钟" : "")],
+    ["每批平均流量", trafficSummary.bytes_per_batch != null ? formatBytes(trafficSummary.bytes_per_batch) : "--", "accent", trafficAverageSub],
+    ["每个成功号平均流量", trafficSummary.bytes_per_success != null ? formatBytes(trafficSummary.bytes_per_success) : "--", "ok", trafficSuccessSub],
   ];
   document.getElementById("kpis").innerHTML = kpis.map(([label, val, cls, sub]) =>
     `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(val)}</div><div class="sub">${esc(sub)}</div></div>`
@@ -3967,13 +5567,8 @@ function render(d) {
   }
 
   renderBlacklist(d.blacklist, d.blacklist_update);
-  // light stats from snapshot
-  renderStats({
-    cpa: d.cpa, cpa_delta: d.cpa_delta, base_cpa: d.base_cpa,
-    batch_ok: d.ok, batch_fail: d.fail,
-    jsonl_ok: "--", jsonl_risk: "--",
-    by_day: {}, refreshed_at: d.ts_human,
-  });
+  // Keep full jsonl/day statistics while the 2-second snapshot updates live counters.
+  renderStats(statsForSnapshot(d));
 
   const wset = new Set([...(Object.keys(d.worker_ok || {})), ...(Object.keys(d.worker_fail || {}))]);
   const ws = [...wset].sort((a, b) => parseInt(a.slice(1)) - parseInt(b.slice(1)));
@@ -3989,7 +5584,12 @@ function render(d) {
   document.getElementById("fail-body").innerHTML = (d.recent_fail || []).map(r =>
     `<tr><td class="mono">${esc(r.t)}</td><td>${esc(r.w)}</td><td>${esc(r.kind)}</td><td class="mono">${esc(r.msg)}</td></tr>`
   ).join("") || '<tr><td colspan="4" style="color:var(--muted)">暂无记录</td></tr>';
-  document.getElementById("tail").textContent = (d.tail || []).join("\n");
+  const tailEl = document.getElementById("tail");
+  const tailLines = d.tail || [];
+  tailEl.textContent = tailLines.join("\n");
+  const tailMeta = document.getElementById("tail-meta");
+  if (tailMeta) tailMeta.textContent = "最近 " + tailLines.length + " 行 · 每 2 秒刷新";
+  if (tailFollow) tailEl.scrollTop = tailEl.scrollHeight;
   document.getElementById("footer").textContent =
     "服务 " + location.host + " / 日志 " + (d.log || "") + " / 2 秒轮询 / "
     + (d.log_size ? (d.log_size / 1024).toFixed(0) + " KB" : "0 KB")
@@ -4029,21 +5629,55 @@ function changeOkPageSize(value) {
 syncThemeButtons();
 initHelp();
 loadTokenField();
+bindTailFollow();
 refresh();
 setInterval(refresh, 2000);
-// full stats once on load
+// full stats once on load, then refresh every 30s
 refreshStats(false);
+setInterval(() => refreshStats(false), 30000);
 refreshRecovery();
 setInterval(refreshRecovery, 5000);
+setInterval(refreshGrok2api, 5000);
+refreshBfs();
+setInterval(refreshBfs, 15000);
+refreshSsoState();
+setInterval(() => {
+  if (document.body.classList.contains("sso-view-open") || (lastSsoState && lastSsoState.running)) {
+    refreshSsoState(false);
+  }
+}, 2000);
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
-  if (document.body.classList.contains("ip-usage-view-open")) refreshIpUsage(false);
+  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
 }, 3000);
+setInterval(() => {
+  if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
+}, 10000);
 </script>
 </body>
 </html>
 """
+
+
+def _accounts_resolve_request_emails(payload: dict) -> list[str]:
+    """解析账号管理请求的邮箱集合：显式列表优先，否则按筛选条件全选。"""
+    emails = (payload or {}).get("emails")
+    if isinstance(emails, list) and emails:
+        return emails
+    if (payload or {}).get("all_filtered"):
+        return accounts_resolve_filtered(
+            search=str((payload or {}).get("search") or ""),
+            task=str((payload or {}).get("task") or ""),
+            status=str((payload or {}).get("status") or ""),
+        )
+    return []
+
+
+def _accounts_payload_from_request(body: dict, *, default_fmt: str) -> dict:
+    payload = body or {}
+    emails = _accounts_resolve_request_emails(payload)
+    return accounts_build_payload(emails, str(payload.get("fmt") or default_fmt))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4114,14 +5748,15 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"), "application/json; charset=utf-8")
 
-    def _read_body(self):
+    def _read_body(self, max_size=None):
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError as exc:
             raise ValueError("invalid Content-Length") from exc
         if n <= 0:
             return {}
-        if n > MAX_REQUEST_BODY:
+        limit = MAX_REQUEST_BODY if max_size is None else int(max_size)
+        if n > limit:
             raise OverflowError("request body too large")
         raw = self.rfile.read(n)
         try:
@@ -4153,7 +5788,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/ip-usage", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4185,6 +5820,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if u.path == "/api/grok2api":
+            try:
+                from webui.grok2api_upload_ops import upload_status as _g2api_status
+
+                self._json(200, _g2api_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/proxies":
             try:
                 query = parse_qs(u.query)
@@ -4203,10 +5846,8 @@ class Handler(BaseHTTPRequestHandler):
                 from ip_usage_store import (
                     get_all_ip_usage_detail,
                     get_total_usage,
-                    set_ip_usage_meta,
                     usage_file_path,
                 )
-                from browser_session import lookup_exit_meta
 
                 control = load_control()
                 global_limit = int(control.get("ip_usage_limit", 0) or 0)
@@ -4217,50 +5858,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 items = get_all_ip_usage_detail()
-                # 延迟/服务商：优先复用代理池里该出口的探测结果
-                latency_by_ip: dict[str, int] = {}
-                isp_by_ip: dict[str, str] = {}
-                try:
-                    pool = read_proxy_pool(page_size=500)
-                    for item in pool.get("items") or []:
-                        ip = str(item.get("exit_ip") or "").strip()
-                        if not ip:
-                            continue
-                        if item.get("latency_ms") is not None:
-                            latency_by_ip[ip] = int(item["latency_ms"])
-                        if item.get("asn_org"):
-                            isp_by_ip.setdefault(ip, str(item["asn_org"]))
-                except Exception:
-                    pass
-                # 元数据懒查询：只查有次数、尚无 meta 且不在失败冷却期的 IP。
-                # 每轮最多 3 个，避免地理 API 不可达时拖垮轮询（失败 IP 记
-                # 10 分钟冷却；成功结果由 lookup_exit_meta 进程内缓存复用）。
-                lazy = 0
-                now_ts = time.monotonic()
                 for item in items:
-                    ip = item["ip"]
-                    meta = item.get("meta") or {}
-                    if not meta and item.get("count", 0) > 0 and lazy < 3:
-                        if _ip_usage_meta_fail_until.get(ip, 0) > now_ts:
-                            continue
-                        lazy += 1
-                        info = lookup_exit_meta(ip)
-                        if info.get("status") == "success":
-                            meta = {
-                                "country": str(info.get("country") or ""),
-                                "isp": str(info.get("isp") or ""),
-                                "org": str(info.get("org") or ""),
-                                "asn": str(info.get("as") or ""),
-                            }
-                            try:
-                                set_ip_usage_meta(ip, meta)
-                            except Exception:
-                                pass
-                        else:
-                            _ip_usage_meta_fail_until[ip] = now_ts + 600
-                    item["meta"] = meta
-                    item["latency_ms"] = latency_by_ip.get(ip)
-                    item["isp_label"] = isp_by_ip.get(ip) or meta.get("isp") or meta.get("org") or ""
                     # 生效上限：该 IP 单独覆盖优先，否则回退全局
                     per = item.get("limit")
                     item["limit_effective"] = int(per) if per else global_limit
@@ -4277,12 +5875,88 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/ip-pool":
+            try:
+                from webui.ip_ready_pool import get_pool_state
+
+                self._json(200, get_pool_state())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/config/export":
             try:
                 from webui.config_backup import export_all
 
                 # 导出含敏感凭据，返回完整配置 JSON；由前端下载为备份文件
                 self._json(200, export_all())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/bfs":
+            try:
+                self._json(200, bfs_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/sso-state":
+            try:
+                self._json(200, sso_state_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/mail-cleanup":
+            try:
+                from webui.mail_cleanup_ops import cleanup_status, last_known_count
+
+                state = cleanup_status()
+                ctl = load_control()
+                # 计数只在清理执行（定时/手动）时更新，读接口只返回缓存值，
+                # 不发起任何对邮件服务的实时查询（保护 D1 每日行读取配额）
+                count_value, count_error = last_known_count()
+                payload = {
+                    "ok": True,
+                    "running": bool(state.get("running")),
+                    "progress": state.get("progress") or {},
+                    "last_result": state.get("last_result"),
+                    "last_error": state.get("last_error"),
+                    "settings": {
+                        "mail_cleanup_enabled": bool(
+                            ctl.get("mail_cleanup_enabled", True)
+                        ),
+                        "mail_cleanup_keep_hours": ctl.get(
+                            "mail_cleanup_keep_hours", 1
+                        ),
+                        "mail_cleanup_interval_hours": ctl.get(
+                            "mail_cleanup_interval_hours", 1
+                        ),
+                        "mail_cleanup_clean_unknow": bool(
+                            ctl.get("mail_cleanup_clean_unknow", True)
+                        ),
+                    },
+                    "count": count_value,
+                }
+                if count_error:
+                    payload["count_error"] = redact_log_line(count_error)
+                self._json(200, payload)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts":
+            try:
+                query = parse_qs(u.query)
+                self._json(
+                    200,
+                    accounts_list(
+                        page=(query.get("page") or ["1"])[0],
+                        page_size=(query.get("page_size") or ["50"])[0],
+                        search=(query.get("search") or [""])[0],
+                        task=(query.get("task") or [""])[0],
+                        status=(query.get("status") or [""])[0],
+                        sort=(query.get("sort") or ["newest"])[0],
+                        reveal=(query.get("reveal") or ["0"])[0] in ("1", "true"),
+                        force=(query.get("force") or ["0"])[0] in ("1", "true"),
+                    ),
+                )
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4314,7 +5988,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_write():
             return
         try:
-            body = self._read_body()
+            body_limit = 4 * 1024 * 1024 if u.path == "/api/sso-state/start" else None
+            body = self._read_body(max_size=body_limit)
         except OverflowError as exc:
             self._json(413, {"ok": False, "error": str(exc)})
             return
@@ -4331,6 +6006,54 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 deleted = delete_ip_usage(ip)
                 self._json(200, {"ok": True, "deleted": deleted})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-usage/reset":
+            try:
+                from ip_usage_store import reset_ip_usage
+
+                reset_ip_usage()
+                self._json(200, {"ok": True, "cleared": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/mail-cleanup/run":
+            try:
+                from webui.mail_cleanup_ops import start_cleanup
+
+                ctl = load_control()
+                keep_hours = (body or {}).get("keep_hours")
+                if keep_hours in (None, ""):
+                    keep_hours = ctl.get("mail_cleanup_keep_hours", 1)
+                clean_unknow = bool((body or {}).get("clean_unknow", ctl.get("mail_cleanup_clean_unknow", True)))
+                outcome = start_cleanup(keep_hours, clean_unknow=clean_unknow)
+                if not outcome.get("started"):
+                    self._json(409, {"ok": False, "error": outcome.get("error") or "无法启动清理"})
+                    return
+                self._json(200, {"ok": True, "running": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/mail-cleanup/settings":
+            try:
+                from webui.mail_cleanup_ops import normalize_settings
+
+                saved = save_control(normalize_settings(body))
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "settings": {
+                            "mail_cleanup_enabled": bool(saved.get("mail_cleanup_enabled", True)),
+                            "mail_cleanup_keep_hours": saved.get("mail_cleanup_keep_hours", 1),
+                            "mail_cleanup_interval_hours": saved.get("mail_cleanup_interval_hours", 1),
+                            "mail_cleanup_clean_unknow": bool(saved.get("mail_cleanup_clean_unknow", True)),
+                        },
+                    },
+                )
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": str(e)})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4360,6 +6083,31 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/ip-pool/probe":
+            try:
+                from webui.ip_ready_pool import get_pool_state, probe_round
+
+                cfg = _runtime_config()
+                stats_before = get_pool_state()["stats"]
+                stats = probe_round(
+                    target_count=int(cfg.get("ip_pool_target") or 20),
+                    concurrency=int(cfg.get("ip_pool_probe_concurrency") or 12),
+                    ttl=float(cfg.get("ip_pool_identity_ttl") or 600),
+                )
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "stats": stats,
+                        "added": max(
+                            0,
+                            int(stats.get("total") or 0) - int(stats_before.get("total") or 0),
+                        ),
+                    },
+                )
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/control":
             try:
                 self._json(200, save_control(body))
@@ -4375,6 +6123,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/bfs/scan":
+            try:
+                limit = int((body or {}).get("limit") or 0)
+                include_clean = bool((body or {}).get("include_clean"))
+                result = run_bfs_scan(limit=limit, include_clean=include_clean)
+                self._json(200, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/bfs/check":
+            try:
+                token = str((body or {}).get("token") or "").strip()
+                if not token:
+                    self._json(400, {"ok": False, "error": "token required"})
+                    return
+                self._json(200, check_token_text(token))
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/start":
             try:
@@ -4410,6 +6177,76 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if result.get("ok") else 409, result)
             except Exception as e:
                 self._json(500, {"ok": False, "error": str(e)})
+            return
+        if u.path == "/api/sso-state/start":
+            try:
+                result = start_sso_state_scan(
+                    source=str((body or {}).get("source") or "paste"),
+                    text=str((body or {}).get("text") or ""),
+                    delay=(body or {}).get("delay", 0.4),
+                    proxy=str((body or {}).get("proxy") or ""),
+                )
+                code = 200 if result.get("ok") else (409 if result.get("running") else 400)
+                self._json(code, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/sso-state/stop":
+            try:
+                self._json(200, stop_sso_state_scan())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/sso-state/export":
+            try:
+                result = read_sso_state_export(str((body or {}).get("kind") or "flagged"))
+                self._json(200 if result.get("ok") else 404, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/copy":
+            try:
+                result = _accounts_payload_from_request(body, default_fmt="full")
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/status":
+            try:
+                payload = body or {}
+                emails = _accounts_resolve_request_emails(payload)
+                result = accounts_set_status(emails or [], str(payload.get("target") or ""))
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/delete":
+            try:
+                payload = body or {}
+                emails = _accounts_resolve_request_emails(payload)
+                result = accounts_delete(emails or [])
+                self._json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api/upload":
+            try:
+                from webui.grok2api_upload_ops import start_upload as _g2api_start
+
+                with START_LOCK:
+                    result = _g2api_start()
+                self._json(200 if result.get("ok") else 409, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/grok2api/stop":
+            try:
+                from webui.grok2api_upload_ops import stop_upload as _g2api_stop
+
+                result = _g2api_stop()
+                self._json(200, result)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/recovery/stop":
             try:
@@ -4676,6 +6513,101 @@ def main():
             flush=True,
         )
     print(f"[monitor] http://{host}:{BIND_PORT}/  (bound {host}:{BIND_PORT})", flush=True)
+
+    # 可用 IP 池后台补池线程：定时清理过期项，可用项不足目标时探测补充。
+    # 探测走代理（每身份 2-8s），并发进行；daemon 线程不阻塞 HTTP。
+    def _ip_pool_loop(stop_event: threading.Event):
+        import time as _time
+
+        while not stop_event.is_set():
+            try:
+                from webui.ip_ready_pool import probe_round, refresh_pool
+
+                cfg = _runtime_config()
+                target = max(1, int(cfg.get("ip_pool_target") or 20))
+                interval = max(20.0, float(cfg.get("ip_pool_refresh_interval") or 120))
+                concurrency = max(1, int(cfg.get("ip_pool_probe_concurrency") or 12))
+                ttl = max(30.0, float(cfg.get("ip_pool_identity_ttl") or 600))
+                stats = refresh_pool()
+                if int(stats.get("usable") or 0) < target:
+                    stats = probe_round(
+                        target_count=target,
+                        concurrency=concurrency,
+                        ttl=ttl,
+                    )
+                    if stats.get("usable"):
+                        print(
+                            f"[monitor] ip-pool usable={stats.get('usable')} "
+                            f"total={stats.get('total')}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(f"[monitor] ip-pool loop error: {redact_log_line(str(exc))}", flush=True)
+            stop_event.wait(interval)
+
+    _ip_pool_stop = threading.Event()
+    threading.Thread(
+        target=_ip_pool_loop,
+        args=(_ip_pool_stop,),
+        name="ip-pool-refresh",
+        daemon=True,
+    ).start()
+
+    # 服务端历史邮件自动清理：启动即按保留期清一次（只删 N 天前旧邮件，
+    # 不影响在用验证码），之后每次唤醒重读设置并按间隔等待。
+    def _mail_cleanup_loop(stop_event: threading.Event):
+        while True:
+            try:
+                ctl = load_control()
+                if bool(ctl.get("mail_cleanup_enabled", True)):
+                    from webui.mail_cleanup_ops import start_cleanup
+
+                    outcome = start_cleanup(
+                        ctl.get("mail_cleanup_keep_hours", 1),
+                        clean_unknow=bool(
+                            ctl.get("mail_cleanup_clean_unknow", True)
+                        ),
+                    )
+                    if outcome.get("started"):
+                        print(
+                            f"[monitor] mail cleanup started "
+                            f"keep_hours={outcome.get('keep_hours')}",
+                            flush=True,
+                        )
+                    elif outcome.get("error"):
+                        print(
+                            f"[monitor] mail cleanup skipped: {outcome.get('error')}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                print(
+                    f"[monitor] mail cleanup loop error: {redact_log_line(str(exc))}",
+                    flush=True,
+                )
+            try:
+                hours = max(
+                    1,
+                    min(
+                        168,
+                        int(
+                            load_control().get(
+                                "mail_cleanup_interval_hours", 24
+                            )
+                        ),
+                    ),
+                )
+            except Exception:
+                hours = 24
+            if stop_event.wait(hours * 3600):
+                break
+
+    _mail_cleanup_stop = threading.Event()
+    threading.Thread(
+        target=_mail_cleanup_loop,
+        args=(_mail_cleanup_stop,),
+        name="mail-cleanup",
+        daemon=True,
+    ).start()
     stop_tasks_on_exit = os.environ.get(
         "MONITOR_STOP_TASKS_ON_EXIT",
         "1",
@@ -4695,6 +6627,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        _ip_pool_stop.set()
+        _mail_cleanup_stop.set()
         httpd.server_close()
         if stop_tasks_on_exit:
             stopped = kill_all()

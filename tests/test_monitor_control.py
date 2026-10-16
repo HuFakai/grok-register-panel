@@ -60,7 +60,7 @@ def test_ip_policy_control_round_trip_and_bounds():
             monitor.CONTROL_FILE = previous
 
 
-def test_batch_and_add_count_have_no_upper_bound():
+def test_batch_and_add_count_are_bounded():
     previous = monitor.CONTROL_FILE
     with tempfile.TemporaryDirectory() as tmp:
         monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
@@ -72,7 +72,8 @@ def test_batch_and_add_count_have_no_upper_bound():
                 }
             )
             assert big["batch_count"] == 100000
-            assert big["add_count"] == 500000
+            # add_count 封顶 2000（上游 dbcd902 收紧，防误填拉爆批次）
+            assert big["add_count"] == 2000
 
             floor = monitor.save_control(
                 {
@@ -109,8 +110,89 @@ def test_base_ok_persists_through_save_control():
             monitor.CONTROL_FILE = previous
 
 
+def test_mail_cleanup_settings_defaults_and_bounds():
+    """服务端邮件清理设置：默认开启保留 1 小时；时长/间隔按范围夹紧。"""
+    previous = monitor.CONTROL_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
+        try:
+            defaults = monitor.load_control()
+            assert defaults["mail_cleanup_enabled"] is True
+            assert defaults["mail_cleanup_keep_hours"] == 1
+            assert defaults["mail_cleanup_interval_hours"] == 1
+            assert defaults["mail_cleanup_clean_unknow"] is True
+            assert "mail_cleanup_keep_days" not in defaults
+
+            saved = monitor.save_control(
+                {
+                    "mail_cleanup_enabled": False,
+                    "mail_cleanup_keep_hours": 12,
+                    "mail_cleanup_interval_hours": 6,
+                    "mail_cleanup_clean_unknow": False,
+                }
+            )
+            assert saved["mail_cleanup_enabled"] is False
+            assert saved["mail_cleanup_keep_hours"] == 12
+            assert saved["mail_cleanup_interval_hours"] == 6
+            assert saved["mail_cleanup_clean_unknow"] is False
+
+            clamped = monitor.save_control(
+                {
+                    "mail_cleanup_keep_hours": 0,
+                    "mail_cleanup_interval_hours": 999,
+                }
+            )
+            assert clamped["mail_cleanup_keep_hours"] == 1
+            assert clamped["mail_cleanup_interval_hours"] == 168
+
+            defaults["ip_pool_filter_datacenter"] = False
+            dc_on = monitor.save_control({"ip_pool_filter_datacenter": True})
+            assert dc_on["ip_pool_filter_datacenter"] is True
+            dc_off = monitor.save_control({"ip_pool_filter_datacenter": "x"})
+            assert dc_off["ip_pool_filter_datacenter"] is True  # 非空真值仍为真
+            assert monitor.load_control()["ip_pool_filter_datacenter"] is True
+
+            dropped = monitor.save_control({"mail_cleanup_bad_key": "x"})
+            assert "mail_cleanup_bad_key" not in dropped
+        finally:
+            monitor.CONTROL_FILE = previous
+
+
+def test_mail_cleanup_legacy_days_key_migrates():
+    """旧键 keep_days（天）→ keep_hours（小时）；旧默认 1 天切到新默认 1 小时。"""
+    previous = monitor.CONTROL_FILE
+    with tempfile.TemporaryDirectory() as tmp:
+        monitor.CONTROL_FILE = Path(tmp) / "monitor_control.json"
+        try:
+            monitor.CONTROL_FILE.write_text(
+                '{\n'
+                '  "mail_cleanup_enabled": true,\n'
+                '  "mail_cleanup_keep_days": 1,\n'
+                '  "mail_cleanup_interval_hours": 24,\n'
+                '  "mail_cleanup_clean_unknow": true\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            loaded = monitor.load_control()
+            # 旧默认（1 天 + 24h 间隔）→ 新默认（1 小时 + 1 小时）
+            assert loaded["mail_cleanup_keep_hours"] == 1
+            assert loaded["mail_cleanup_interval_hours"] == 1
+            assert "mail_cleanup_keep_days" not in loaded
+
+            # 非默认旧值按 1 天 = 24 小时换算
+            monitor.CONTROL_FILE.write_text(
+                '{"mail_cleanup_keep_days": 7}', encoding="utf-8"
+            )
+            loaded = monitor.load_control()
+            assert loaded["mail_cleanup_keep_hours"] == 168
+        finally:
+            monitor.CONTROL_FILE = previous
+
+
 if __name__ == "__main__":
     test_ip_policy_control_round_trip_and_bounds()
-    test_batch_and_add_count_have_no_upper_bound()
+    test_batch_and_add_count_are_bounded()
     test_base_ok_persists_through_save_control()
+    test_mail_cleanup_settings_defaults_and_bounds()
+    test_mail_cleanup_legacy_days_key_migrates()
     print("OK monitor_control")
