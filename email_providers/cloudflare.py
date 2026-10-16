@@ -295,6 +295,53 @@ def get_message_detail(
     raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
 
 
+def admin_get_messages(
+    http_get: HttpGet,
+    api_base: str,
+    admin_pass: str,
+    address: str,
+    *,
+    custom_auth: str = "",
+    size: int = 20,
+) -> List[dict]:
+    """管理端按地址轮询邮件（GET /admin/mails?address=）。
+
+    v1.10+ 的 /api/mails 要求 address_id>0 且地址已注册，catch-all 自签
+    JWT 会被拒；管理端列表不受限，任何部署版本都可用。行结构归一化为
+    get_messages 兼容形状（id + raw，raw 为完整 RFC822 原文）。
+    """
+    if not admin_pass or not address:
+        raise Exception("CloudMail 管理端轮询需要 admin 凭据与收件地址")
+    headers = build_headers(admin_pass, "x-admin-auth", custom_auth)
+    resp = http_get(
+        f"{api_base.rstrip('/')}/admin/mails",
+        headers=headers,
+        params={"limit": size, "offset": 0, "address": address},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"Cloudflare admin mails 返回非JSON: {resp.text[:300]}")
+    rows = pick_list_payload(data)
+    normalized = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        mid = row.get("id")
+        if mid is None:
+            continue
+        normalized.append(
+            {
+                "id": mid,
+                "raw": str(row.get("raw") or ""),
+                "created_at": str(row.get("created_at") or ""),
+            }
+        )
+    return normalized
+
+
 def create_mailbox_fallback(
     http_get: HttpGet,
     http_post: HttpPost,
@@ -389,6 +436,7 @@ def wait_for_code(
     on_code_mail: Optional[Callable[[object], None]] = None,
     http_delete: Optional[Callable[..., Any]] = None,
     purge_on_failure: bool = False,
+    poll_via_admin: bool = False,
 ) -> str:
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
@@ -407,15 +455,24 @@ def wait_for_code(
                     log_callback(f"[Debug] 触发重发验证码失败: {exc}")
             next_resend_at = time.time() + 35
         try:
-            messages = get_messages(
-                http_get,
-                api_base,
-                dev_token,
-                messages_path=messages_path,
-                api_key=api_key,
-                auth_mode=auth_mode,
-                custom_auth=custom_auth,
-            )
+            if poll_via_admin:
+                messages = admin_get_messages(
+                    http_get,
+                    api_base,
+                    api_key,
+                    email,
+                    custom_auth=custom_auth,
+                )
+            else:
+                messages = get_messages(
+                    http_get,
+                    api_base,
+                    dev_token,
+                    messages_path=messages_path,
+                    api_key=api_key,
+                    auth_mode=auth_mode,
+                    custom_auth=custom_auth,
+                )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
@@ -527,24 +584,36 @@ def purge_mailbox(
     auth_mode: str = "none",
     custom_auth: str = "",
     max_rounds: int = 5,
+    poll_via_admin: bool = False,
 ) -> int:
     """清空该邮箱全部邮件（尽力而为，返回成功删除数量）。
 
     用于验证码超时/失败后清理残留，避免服务端（D1/SQLite）邮件表持续膨胀。
     删除走 admin 凭证（x-admin-auth）；单封失败不中断，列表拉取失败即停。
+    poll_via_admin 时列表改走管理端 /admin/mails?address=（catch-all 自签
+    JWT 在 v1.10+/v1.12 的 /api/mails 上会被拒）。
     """
     deleted = 0
     for _ in range(max(1, int(max_rounds))):
         try:
-            messages = get_messages(
-                http_get,
-                api_base,
-                dev_token,
-                messages_path=messages_path,
-                api_key=api_key,
-                auth_mode=auth_mode,
-                custom_auth=custom_auth,
-            )
+            if poll_via_admin:
+                messages = admin_get_messages(
+                    http_get,
+                    api_base,
+                    api_key,
+                    email,
+                    custom_auth=custom_auth,
+                )
+            else:
+                messages = get_messages(
+                    http_get,
+                    api_base,
+                    dev_token,
+                    messages_path=messages_path,
+                    api_key=api_key,
+                    auth_mode=auth_mode,
+                    custom_auth=custom_auth,
+                )
         except Exception:
             break
         if not messages:

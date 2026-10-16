@@ -2696,6 +2696,12 @@ def cloudflare_get_oai_code(
         # 超时后清理该邮箱残留（解析失败的/迟到的）邮件，避免服务端存储持续膨胀
         http_delete=http_delete,
         purge_on_failure=True,
+        # catch-all 自签 JWT 在 Worker v1.10+/v1.12 的 /api/mails 会被拒
+        # （要求 address_id>0 且地址已注册）；admin 凭证可用时改走管理端轮询
+        poll_via_admin=(
+            get_cloudflare_auth_mode() == "x-admin-auth"
+            and bool(get_cloudflare_api_key())
+        ),
     )
 
 
@@ -2741,6 +2747,10 @@ def purge_cloudflare_mailbox_quiet(dev_token, email="", *, log_callback=None):
             api_key=get_cloudflare_api_key(),
             auth_mode=get_cloudflare_auth_mode(),
             custom_auth=get_cloudflare_custom_auth(),
+            poll_via_admin=(
+                get_cloudflare_auth_mode() == "x-admin-auth"
+                and bool(get_cloudflare_api_key())
+            ),
         )
         if count and log_callback:
             log_callback(f"[*] 已清理邮箱残留邮件 {count} 封")

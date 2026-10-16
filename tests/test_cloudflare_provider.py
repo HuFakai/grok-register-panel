@@ -227,6 +227,51 @@ def test_purge_mailbox_stops_when_list_fails():
     assert count == 0
 
 
+def test_wait_for_code_admin_polling_parses_raw():
+    """catch-all 自签 JWT 被 v1.10+/v1.12 拒收：admin 轮询按地址取信。"""
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs.get("params") or {}))
+        if url.endswith("/admin/mails"):
+            return FakeResponse(
+                200,
+                data={
+                    "results": [
+                        {
+                            "id": 9,
+                            "address": "u@mail.example",
+                            "raw": "From: SpaceXAI <noreply@x.ai>\n"
+                                   "confirmation code: 019-579",
+                        }
+                    ],
+                    "count": 1,
+                },
+            )
+        raise AssertionError(f"unexpected url {url}")
+
+    code = _without_sleep(
+        lambda: cloudflare.wait_for_code(
+            fake_get,
+            "https://mail.example",
+            "self-signed-jwt",
+            "u@mail.example",
+            timeout=5,
+            poll_interval=1,
+            api_key="admin-pass",
+            auth_mode="x-admin-auth",
+            raise_if_cancelled=lambda _cb: None,
+            sleep_with_cancel=lambda _s, _cb: None,
+            poll_via_admin=True,
+        )
+    )
+    assert code == "019-579"
+    assert any(
+        url.endswith("/admin/mails") and params.get("address") == "u@mail.example"
+        for url, params in calls
+    )
+
+
 if __name__ == "__main__":
     test_address_collision_retries_with_admin_payload()
     test_nonretryable_400_is_not_retried_or_echoed()
@@ -235,4 +280,5 @@ if __name__ == "__main__":
     test_wait_for_code_timeout_without_purge_keeps_mail()
     test_purge_mailbox_tolerates_delete_failures()
     test_purge_mailbox_stops_when_list_fails()
+    test_wait_for_code_admin_polling_parses_raw()
     print("OK cloudflare provider")
