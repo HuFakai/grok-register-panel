@@ -512,31 +512,34 @@ def wait_for_code(
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
-            try:
-                detail = get_message_detail(
-                    http_get,
-                    api_base,
-                    dev_token,
-                    msg_id,
-                    messages_path=messages_path,
-                    api_key=api_key,
-                    auth_mode=auth_mode,
-                    custom_auth=custom_auth,
-                )
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
+            if not poll_via_admin:
+                # admin 轮询的 raw 已含完整原文；跳过单封详情，避免每次用
+                # 自签 JWT 打 /api/mail/{id}（v1.10+ 会 401）产生无谓请求
+                try:
+                    detail = get_message_detail(
+                        http_get,
+                        api_base,
+                        dev_token,
+                        msg_id,
+                        messages_path=messages_path,
+                        api_key=api_key,
+                        auth_mode=auth_mode,
+                        custom_auth=custom_auth,
+                    )
+                    for field in ("text", "raw", "content", "intro", "body", "snippet"):
+                        value = detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            combined += "\n" + value
+                    html_list2 = detail.get("html") or []
+                    if isinstance(html_list2, str):
+                        html_list2 = [html_list2]
+                    for h in html_list2:
+                        combined += "\n" + re.sub(r"<[^>]+>", " ", h)
+                    if not subject:
+                        subject = str(detail.get("subject", "") or "")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
