@@ -2781,6 +2781,31 @@ HTML = r"""<!DOCTYPE html>
         </details>
       </section>
 
+      <section class="mail-provider-panel" aria-labelledby="ip-health-label">
+        <div class="mail-provider-toolbar">
+          <div>
+            <div class="mail-source-kicker">Exit health</div>
+            <h2 id="ip-health-label">住宅出口健康（成功 IP 复用 + 会话核验）</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
+              注册成功/失败自动回写出口档案。成功出口按最近会话身份周期核验 sticky 存活（resin 租期内可长期复用），存活的直接回灌可用池优先消费；连续失败且从未成功的出口自动拉黑不再取用。
+            </p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <button class="primary" id="ip-health-verify-btn" onclick="verifyIpHealth()">核验会话</button>
+            <span class="mail-provider-meta mono" id="ip-health-status">--</span>
+          </div>
+        </div>
+        <div class="msg" id="ip-health-msg" role="status" aria-live="polite"></div>
+        <div class="table-scroll" style="margin-top:8px">
+          <table class="proxy-table ip-pool-table">
+            <thead><tr>
+              <th>出口 IP</th><th>成功</th><th>失败</th><th>归属</th><th>会话状态</th><th>上次成功</th>
+            </tr></thead>
+            <tbody id="ip-health-body"><tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
         <div class="mail-provider-toolbar">
           <div class="field">
@@ -3498,6 +3523,7 @@ function setAppView(view, options = {}) {
     refreshMailCleanup(false, true);
   }
   if (isIpUsage) refreshIpUsage();
+  if (isIpUsage) refreshIpHealth();
   if (isSso) refreshSsoState();
   if (isAccounts) refreshAccounts();
   if (options.focus) {
@@ -3972,6 +3998,7 @@ async function refreshIpPool(silent) {
       const used = Number(it.used) || 0;
       const limit = Number(it.limit) || 0;
       let state = '<span class="badge" style="color:var(--ok)">可用</span>';
+      if (it.trusted) state = '<span class="badge" style="color:var(--ok)">★ 可信复用</span>';
       if (it.consumer) state = '<span class="badge" style="color:var(--accent)">占用中</span>';
       else if (!it.usable) state = '<span class="badge" style="color:var(--fail)">超限</span>';
       const ttl = Math.floor(Number(it.ttl_remaining) / 60) + "m" + (Number(it.ttl_remaining) % 60) + "s";
@@ -4003,6 +4030,49 @@ async function probeIpPool() {
     setMsg("ip-pool-msg", String(e.message || e), "err");
   }
   if (btn) { btn.disabled = false; btn.textContent = "立即探测"; }
+}
+async function refreshIpHealth(silent) {
+  try {
+    const j = await api("/api/ip-health?_=" + Date.now(), { authHelp: !silent });
+    const st = j.stats || {};
+    const label = document.getElementById("ip-health-status");
+    if (label) label.textContent = "可信 " + (st.trusted ?? 0) + " / 存活 " + (st.alive ?? 0)
+      + " / 待核验 " + (st.due_check ?? 0) + " / 拉黑 " + (j.bad || []).length;
+    const rows = (j.trusted || []).map(e => {
+      const alive = e.session_alive;
+      const state = alive === true
+        ? '<span class="badge" style="color:var(--ok)">存活</span>'
+        : alive === false ? '<span class="badge" style="color:var(--fail)">失效</span>'
+        : '<span class="badge">待核验</span>';
+      const ts = e.last_success_at ? new Date(e.last_success_at * 1000).toLocaleString() : "--";
+      const geo = [e.country, (e.as || "").split(" ")[0]].filter(Boolean).join(" ");
+      return `<tr>
+        <td class="mono">${esc(e.ip)}</td>
+        <td class="mono">${esc(e.successes || 0)}</td>
+        <td class="mono">${esc(e.fails || 0)}</td>
+        <td>${esc(geo || "--")}</td>
+        <td>${state}</td>
+        <td class="mono">${esc(ts)}</td>
+      </tr>`;
+    }).join("");
+    const body = document.getElementById("ip-health-body");
+    if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr>';
+  } catch (e) {
+    if (!silent) setMsg("ip-health-msg", String(e.message || e), "err");
+  }
+}
+async function verifyIpHealth() {
+  const btn = document.getElementById("ip-health-verify-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "核验中…"; }
+  try {
+    const j = await api("/api/ip-pool/probe", { method: "POST", body: "{}" });
+    setMsg("ip-health-msg", "已触发会话核验 + 补池（池内可用 " + ((j.stats || {}).usable ?? 0) + "）", "ok");
+    await refreshIpHealth(true);
+    await refreshIpPool(true);
+  } catch (e) {
+    setMsg("ip-health-msg", String(e.message || e), "err");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "核验会话"; }
 }
 async function savePerIpLimit(ip, btn) {
   const input = btn.closest("div").querySelector("input[data-ip-limit-input]");
@@ -5649,7 +5719,7 @@ setInterval(() => {
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
-  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); }
+  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); refreshIpHealth(false); }
 }, 3000);
 setInterval(() => {
   if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
@@ -5788,7 +5858,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/ip-health", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -5880,6 +5950,18 @@ class Handler(BaseHTTPRequestHandler):
                 from webui.ip_ready_pool import get_pool_state
 
                 self._json(200, get_pool_state())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-health":
+            try:
+                from webui.ip_health import stats, trusted_exits, bad_ips
+                _ = stats
+                self._json(200, {
+                    "stats": stats(),
+                    "trusted": trusted_exits(),
+                    "bad": sorted(bad_ips()),
+                })
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -6086,9 +6168,15 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/ip-pool/probe":
             try:
                 from webui.ip_ready_pool import get_pool_state, probe_round
+                from webui.ip_health import verify_due_sessions
 
                 cfg = _runtime_config()
                 stats_before = get_pool_state()["stats"]
+                # 手动探测顺带核验一次可信出口会话（面板按钮即触发）。
+                try:
+                    verify_due_sessions(limit=8)
+                except Exception:
+                    pass
                 stats = probe_round(
                     target_count=int(cfg.get("ip_pool_target") or 20),
                     concurrency=int(cfg.get("ip_pool_probe_concurrency") or 12),
@@ -6522,12 +6610,28 @@ def main():
         while not stop_event.is_set():
             try:
                 from webui.ip_ready_pool import probe_round, refresh_pool
+                from webui.ip_health import verify_due_sessions
 
                 cfg = _runtime_config()
                 target = max(1, int(cfg.get("ip_pool_target") or 20))
                 interval = max(20.0, float(cfg.get("ip_pool_refresh_interval") or 120))
                 concurrency = max(1, int(cfg.get("ip_pool_probe_concurrency") or 12))
                 ttl = max(30.0, float(cfg.get("ip_pool_identity_ttl") or 600))
+                # 先核验注册成功过出口的 sticky 会话存活（resin 租期内可
+                # 长期复用）：存活回灌 trusted 池，连续失效降级。
+                try:
+                    hs = verify_due_sessions(
+                        max_age=max(300.0, float(cfg.get("ip_pool_session_check_interval") or 1800)),
+                        limit=6,
+                    )
+                    if hs.get("checked"):
+                        print(
+                            f"[monitor] ip-health session check: "
+                            f"alive={hs.get('alive')} dead={hs.get('dead')}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(f"[monitor] ip-health check error: {redact_log_line(str(exc))}", flush=True)
                 stats = refresh_pool()
                 if int(stats.get("usable") or 0) < target:
                     stats = probe_round(

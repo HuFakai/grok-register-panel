@@ -338,13 +338,19 @@ def pick_usable(
 ) -> Optional[dict]:
     """挑一个可用项（未过期、未占用、IP 不在 exclude），标记占用后返回。
 
-    返回的项由调用方核验后 remove_item（用完即弃）；无可用项返回 None。
+    优先返回 trusted=True 的出口（注册成功过的 IP 复用项），其余按入池
+    顺序。返回的项由调用方核验后 remove_item（用完即弃）；无可用项返回
+    None。bad_ips 由调用方在 exclude 中传入。
     """
     now = time.time() if now is None else now
     exclude = set(exclude_ips or ())
     with _POOL_LOCK:
         items = _read_items()
-        for it in items:
+        ordered = sorted(
+            items,
+            key=lambda it: 0 if it.get("trusted") else 1,
+        )
+        for it in ordered:
             if float(it.get("expires_at") or 0) <= now:
                 continue
             if it.get("consumer"):
@@ -359,6 +365,66 @@ def pick_usable(
             _write_items(items)
             return dict(it)
     return None
+
+
+def upsert_trusted_exit(ip: str, *, proxy_url: str = "", meta: dict | None = None) -> bool:
+    """把注册成功过的出口（连同会话身份）写入/续期池内 trusted 项。
+
+    trusted 项在 pick_usable 中优先被取用；会话核验存活时由 ip_health
+    续期 expires_at，实现"成功 IP 在 resin 7 天租期内反复复用"。
+    """
+    ip = str(ip or "").strip()
+    if not ip:
+        return False
+    now = time.time()
+    with _POOL_LOCK:
+        items = _read_items()
+        target = next((it for it in items if it.get("exit_ip") == ip), None)
+        if target is None:
+            target = {
+                "id": _item_id(f"trusted-{ip}"),
+                "template_url": "",
+                "expanded_url": "",
+                "exit_ip": ip,
+                "used": 0,
+                "limit": 0,
+                "usable": True,
+                "checked_at": now,
+                "expires_at": 0.0,
+                "consumer": "",
+                "consumed_at": 0.0,
+            }
+            items.append(target)
+        target["trusted"] = True
+        target["usable"] = True
+        target["expires_at"] = now + 604800.0  # resin sticky 租期 7 天
+        if proxy_url:
+            target["expanded_url"] = proxy_url
+        if meta:
+            target["health"] = {
+                "successes": int(meta.get("successes") or 0),
+                "fails": int(meta.get("fails") or 0),
+                "session_alive": meta.get("session_alive"),
+            }
+        _write_items(items)
+    return True
+
+
+def demote_trusted_exit(ip: str, *, reason: str = "") -> bool:
+    """会话连续死亡等原因下放 trusted 项为普通项（不删，等待补池清理）。"""
+    ip = str(ip or "").strip()
+    with _POOL_LOCK:
+        items = _read_items()
+        hit = False
+        for it in items:
+            if it.get("exit_ip") == ip and it.get("trusted"):
+                it["trusted"] = False
+                it["demoted_reason"] = str(reason or "")
+                it["usable"] = False
+                hit = True
+        if hit:
+            _write_items(items)
+    return hit
 
 
 def remove_item(item_id: str) -> bool:
@@ -387,6 +453,8 @@ def get_pool_state() -> dict:
                 "used": it.get("used", 0),
                 "limit": it.get("limit", 0),
                 "usable": bool(it.get("usable")),
+                    "trusted": bool(it.get("trusted")),
+                    "health": it.get("health") or {},
                 "consumer": it.get("consumer", ""),
                 "checked_at": it.get("checked_at", 0),
                 "expires_at": it.get("expires_at", 0),

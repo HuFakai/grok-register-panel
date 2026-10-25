@@ -495,6 +495,19 @@ def record_register_result(
             _record_managed_proxy_result(proxy, "network", detail)
     except Exception:
         pass
+    # 出口健康档案回写：成功→可信复用+会话归档；失败→黑历史（≥2 且零成功
+    # 的出口后续取口直接跳过）。注册失败即弃，不浪费下一槽位。
+    try:
+        if exit_ip:
+            from webui.ip_health import record_exit_result
+            record_exit_result(
+                exit_ip,
+                status == "ok",
+                proxy_url=proxy if status == "ok" else "",
+                log_callback=log_callback,
+            )
+    except Exception:
+        pass
     # 从 proxy URL 抽端口
     port = ""
     try:
@@ -841,6 +854,12 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     rot = max(0, int(rotate_idx))
     by_url = {str(row.get("url") or ""): row for row in details}
     now = datetime.datetime.now(datetime.timezone.utc)
+    # 出口健康档案：失败≥2 且从未成功的 IP 直接跳过（策略是失败即弃）。
+    try:
+        from webui.ip_health import bad_ips
+        bad = bad_ips()
+    except Exception:
+        bad = set()
 
     def _age(url: str) -> float:
         row = by_url.get(url) or {}
@@ -874,6 +893,8 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             if cand in avoid:
                 continue
             ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
+            if ip and ip in bad:
+                continue
             if ip and ip in hot_ips and cand != current:
                 continue
             ranked.append((-_age(cand), offset, cand))
@@ -888,6 +909,24 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             leftovers.sort()
             selected = leftovers[0][2] if leftovers else ""
         if not selected:
+            # 池内全空：优先复用注册成功过的可信出口（固定身份）。
+            # resin 租期内会话存活即可直接出号，避开随机 sticky 风控抽奖。
+            try:
+                from webui.ip_health import trusted_exits
+                for e in trusted_exits():
+                    ip = str(e.get("ip") or "")
+                    url = str(e.get("best_identity") or "")
+                    if not ip or not url or ip in bad:
+                        continue
+                    if ip in hot_ips or ip == str(
+                        (by_url.get(current) or {}).get("exit_ip") or ""
+                    ):
+                        continue
+                    selected = url
+                    break
+            except Exception:
+                pass
+        if not selected:
             selected = pool[(wid + rot) % len(pool)]
         _proxy_leases[wid] = selected
     try:
@@ -896,9 +935,10 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
         pass
     # Resin {session}/{worker} 模板展开为本 worker 的粘性身份
     try:
-        return expand_proxy_template(selected, wid, rot)
+        expanded = expand_proxy_template(selected, wid, rot)
     except Exception:
-        return selected
+        expanded = selected
+    return expanded
 
 
 def release_proxy_for_worker(worker_id: int) -> None:
@@ -1044,6 +1084,12 @@ def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
             return False, exit_ip, f"累计使用 {used}/{limit} 已到上限"
     except Exception:
         pass
+    try:
+        from webui.ip_health import bad_ips
+        if exit_ip in bad_ips():
+            return False, exit_ip, "健康档案黑历史（连续失败且从未成功）"
+    except Exception:
+        pass
     return True, exit_ip, ""
 
 
@@ -1093,6 +1139,14 @@ def rotate_browser_to_new_exit(
     # 池择优：已预探测确认"未超限 + 非黑名单"的身份，直接核验使用，
     # 避免起浏览器随机试错（树脂偏向分配已超限的热门节点）。
     tried_ips = {previous_ip} if previous_ip else set()
+    # 健康档案黑历史：失败≥2 且从未成功的出口直接跳过（失败即弃策略）。
+    try:
+        from webui.ip_health import bad_ips as _bad_ips
+        _bad = _bad_ips()
+        if _bad:
+            tried_ips |= set(_bad)
+    except Exception:
+        pass
     pool_tries = 0
     while pool_tries < 3:
         item = ip_ready_pool.pick_usable(
@@ -1107,6 +1161,12 @@ def rotate_browser_to_new_exit(
         except Exception:
             pass
         proxy = str(item.get("expanded_url") or "")
+        if not proxy:
+            # trusted 复用项没有身份 URL（档案里 best_identity 空），
+            # 说明无法重建会话，标记后跳过。
+            ip_ready_pool.demote_trusted_exit(item.get("exit_ip") or "", reason="no-identity")
+            tried_ips.add(item.get("exit_ip") or "")
+            continue
         set_thread_proxy(proxy)
         log_callback(
             f"[*] [IP策略] 可用池取出口 {item.get('exit_ip') or '?'} "
