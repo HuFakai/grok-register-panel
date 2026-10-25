@@ -12,6 +12,17 @@ from typing import Any, Dict
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 
+from signup_decisions import (
+    email_submit_deny_keywords,
+    email_submit_needs_turnstile,
+    fill_gave_up_message,
+    label_matches_deny,
+    native_type_confirmed,
+    should_reload_blank,
+    signup_block_reason,
+    signup_code_sent,
+    signup_probe_kind,
+)
 from browser_session import (
     active_browser,
     active_page,
@@ -148,7 +159,7 @@ def _native_click_action(keywords, deny_keywords=()) -> str:
                 continue
             label = _native_label(element)
             compact = re.sub(r"\s+", "", label).lower()
-            if not compact or any(item in compact for item in denied):
+            if label_matches_deny(label, deny_keywords):
                 continue
             score = max((len(item) for item in keys if item and item in compact), default=0)
             if score:
@@ -185,8 +196,7 @@ def _native_type_element(element, value: str, per_char: bool = True) -> bool:
             current = str(element.property("value") or "")
         except Exception:
             current = ""
-        # 某些 React 控件异步更新 property；调用成功且无法读取值时交给页面推进检查。
-        return not current or current.strip() == text.strip()
+        return native_type_confirmed(current, text)
     except Exception:
         return False
 
@@ -488,7 +498,7 @@ return inputs.length + actions.length > 0;
         return False
 
 
-def _wait_signup_shell(timeout=8, log_callback=None, cancel_callback=None):
+def _wait_signup_shell(timeout=20, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -498,7 +508,7 @@ def _wait_signup_shell(timeout=8, log_callback=None, cancel_callback=None):
     return _page_has_email_form() or _page_shell_ready()
 
 
-def _wait_email_form(timeout=8, log_callback=None, cancel_callback=None):
+def _wait_email_form(timeout=20, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -526,7 +536,7 @@ def _reload_signup_and_open_email(log_callback=None, cancel_callback=None):
             except Exception:
                 pass
         sleep_with_cancel(1.2, cancel_callback)
-        _wait_signup_shell(timeout=8, log_callback=log_callback, cancel_callback=cancel_callback)
+        _wait_signup_shell(timeout=20, log_callback=log_callback, cancel_callback=cancel_callback)
         if _page_has_email_form():
             if log_callback:
                 log_callback("[*] 空页恢复：reload 后已有邮箱框")
@@ -534,7 +544,7 @@ def _reload_signup_and_open_email(log_callback=None, cancel_callback=None):
         click_email_signup_button(
             timeout=10, log_callback=log_callback, cancel_callback=cancel_callback
         )
-        ok = _wait_email_form(timeout=8, log_callback=log_callback, cancel_callback=cancel_callback)
+        ok = _wait_email_form(timeout=20, log_callback=log_callback, cancel_callback=cancel_callback)
         if log_callback:
             log_callback(f"[*] 空页恢复：重新点击邮箱注册 form_ready={ok}")
         return ok
@@ -544,7 +554,7 @@ def _reload_signup_and_open_email(log_callback=None, cancel_callback=None):
         return False
 
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+def click_email_signup_button(timeout=25, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     first_attempt = True
     while time.time() < deadline:
@@ -709,7 +719,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     sleep_with_cancel(1.0, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
-    if not _wait_signup_shell(timeout=8, log_callback=log_callback, cancel_callback=cancel_callback):
+    if not _wait_signup_shell(timeout=20, log_callback=log_callback, cancel_callback=cancel_callback):
         if log_callback:
             log_callback("[!] 注册页壳为空，尝试 reload 恢复")
         if not _reload_signup_and_open_email(log_callback=log_callback, cancel_callback=cancel_callback):
@@ -725,7 +735,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
-    if not _wait_email_form(timeout=8, log_callback=log_callback, cancel_callback=cancel_callback):
+    if not _wait_email_form(timeout=20, log_callback=log_callback, cancel_callback=cancel_callback):
         if log_callback:
             log_callback("[!] 点击邮箱注册后仍无输入框，reload 重试")
         if not _reload_signup_and_open_email(log_callback=log_callback, cancel_callback=cancel_callback):
@@ -879,6 +889,13 @@ function textOf(node) {
     ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
 }
 // 1. 出现验证码输入框 => 已前进
+const body = ((document.body && document.body.innerText) || '').toLowerCase();
+if (
+    body.includes('verify your email') ||
+    body.includes('one time security code') ||
+    body.includes('one-time security code') ||
+    body.includes('emailed a one time')
+) return true;
 const codeInput = Array.from(document.querySelectorAll('input')).find((node) => {
     if (!isVisible(node)) return false;
     const type = (node.getAttribute('type') || '').toLowerCase();
@@ -952,13 +969,27 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     return False
 
 
-def fill_email_and_submit(timeout=10, log_callback=None, cancel_callback=None):
+def fill_email_and_submit(timeout=25, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     email, dev_token = _deps['get_email_and_token']()
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
+    try:
+        return _fill_email_body(email, dev_token, timeout, log_callback, cancel_callback)
+    except BaseException:
+        # 取号后在填邮箱/提交环节失败：把未注册的邮箱回收到池尾
+        _rel = _deps.get("release_email")
+        if _rel and email:
+            try:
+                _rel(email)
+            except Exception:
+                pass
+        raise
+
+
+def _fill_email_body(email, dev_token, timeout, log_callback, cancel_callback):
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
@@ -1193,6 +1224,7 @@ return candidates[0].text || true;
                 # 日语
                 "登録",
             ),
+            deny_keywords=email_submit_deny_keywords(),
         )
         if not clicked:
             clicked = page.run_js(

@@ -13,11 +13,28 @@
 | 项 | Commit |
 |---|---|
 | 本地 fork 点（本地已包含其全部内容） | `280c98e` |
-| 上次合并到的上游 HEAD | `ae281f9`（本次已评估） |
-| 下次合并起始点 | `ae281f9` 之后的上游新提交 |
+| 上次合并到的上游 HEAD | `bc17ebd`（本次已评估，2026-10-26 第四轮） |
+| 下次合并起始点 | `bc17ebd` 之后的上游新提交 |
 
 > 本地仓库与上游**无共同祖先**（独立重写历史），不能用 `git merge`，
 > 需按文件逐个人工移植（`git show <commit> -- <file>` 取补丁）。
+
+## 本次合并内容（2026-10-26 第四轮：ae281f9 → bc17ebd）
+
+### 已收编（P0+P1）
+
+| Commit | 标题 | 说明 |
+|---|---|---|
+| `90fd1a5` | fix: keep signup scripts out of the static asset cache | 静态缓存不再回放 JS（JS/Castle 脚本与 400 email-signup-unavailable 相关），`context.route("**/*")` 改按扩展名精确 glob；verify-email 页按已发码处理。新文件 `signup_decisions.py` + `tests/test_signup_page_decision.py`；`static_asset_cache.py` 直接取上游版；register_flow 接入（与本地限流识别/域名拒绝融合）。**注**：`/Users/macm2/code/grok-register-panel/log/static-asset-cache` 已中毒，同步前已清空重建 |
+| `35edb43` | feat: Outlook 卡池 provider、住宅出口等待放宽、CPA chat 版本头升至 1.0.13 (#45) | `email_providers/outlook.py` + 测试直接取上游；ttk 取号/收码分发、CLI worker 三处回收钩子（域名拒绝/卡住跳过/通用失败）、GUI 配置页、config 三键；**本地扩展**：GUI worker（run_registration）同步补了 4 处回收钩子（mail 换邮箱重试、域名拒绝、卡住跳过、通用失败），上游只覆盖 CLI；`camoufox_adapter` domcontentloaded + register_flow 等待放宽 8s→20s/10s→25s（补丁干净应用）；`sso_to_auth_json` GROK_CLIENT_VERSION=1.0.13（env 可覆盖，CPA 头专用，token 交换保持 0.2.93） |
+
+### 忽略
+
+| Commit/范围 | 原因 |
+|---|---|
+| `8e268bc`/`e4987eb` release prep、star history ×15、docs（README/IPWO/landing）、WINDOWS.md、Windows runtime（5ee2366） | 文档/版本/平台不适用 |
+| `quality_probe.py` 降智测试、`webui/quality_ops.py`、botFlagSource 风控门降级（88ca73c/2776166/bdcf598） | P2 范围，用户暂缓，后续评估 |
+| `97d7dcf` SpaceXAI 数字验证码、`dbcd902` EPIPE+overlay wait、`a4f2d7f`/`d5ea007` inbucket、`bf359a0`/`40f2104`/`11ff721`/`94fc9b8` outlook_rt/SSO 状态、`710ec39` SSO 隔离 | 之前轮次本地已收编等价实现（common.py 字节级一致、inbucket/outlook_rt/epipe-guard 一致、SSO 面板本地超集），无需重复 |
 
 ## 本次合并内容（2026-08-12 第三轮：0371716 → ae281f9）
 
@@ -127,7 +144,7 @@
 ## 下次合并指引
 
 1. `git fetch https://github.com/lij768423-svg/grok-register-panel main:refs/remotes/upstream-lij/main`
-2. `git log --oneline ae281f9..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
+2. `git log --oneline bc17ebd..refs/remotes/upstream-lij/main`（只看到检查点之后的新提交）
 3. 逐个人工移植新功能（无共同祖先，勿用 git merge）
 4. 移植后更新本文档的「上次合并到的上游 HEAD」为新 HEAD
 
