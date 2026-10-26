@@ -697,6 +697,9 @@ def success_stats():
                     elif st == "risk":
                         if day:
                             by_day[day]["risk"] += 1
+                    elif st == "throttle":
+                        # 注册限流不是失败：只留审计行，不计数
+                        pass
                     elif st:
                         if day:
                             by_day[day]["fail"] += 1
@@ -712,11 +715,13 @@ def success_stats():
                                 bucket["ok"] += 1
                             elif st == "risk":
                                 bucket["risk"] += 1
+                            elif st == "throttle":
+                                pass
                             elif st:
                                 bucket["fail"] += 1
                             if st in ("ok", "risk", "fail", "sso_timeout", "browser", "other"):
                                 bucket["total"] += 1
-                            elif st:
+                            elif st and st != "throttle":
                                 bucket["total"] += 1
     except Exception:
         pass

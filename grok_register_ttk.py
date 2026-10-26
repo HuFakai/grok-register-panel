@@ -61,6 +61,7 @@ from ip_usage_store import (
     is_soft_blacklisted,
     record_blank_page,
     record_ip_usage,
+    soft_blacklist_ip,
     soft_blacklist_until,
 )
 from batch_supervisor import mark_slot_completed
@@ -470,7 +471,8 @@ def record_register_result(
 ) -> dict:
     """记录单次注册结果 + 出口 IP（控制台一行 + jsonl）。
 
-    status: ok / fail / risk / sso_timeout / browser / other
+    status: ok / fail / risk / sso_timeout / browser / other / throttle
+    （throttle = 邮箱注册限流：仅留审计记录，不计入 ok/fail/risk 统计）
     bfs: True/False/None — JWT claim 检测（与 botFlagSource 不同）
     """
     import json as _json
@@ -562,6 +564,81 @@ def record_register_result(
             except Exception:
                 pass
     return rec
+
+
+_SIGNUP_THROTTLE_MARKERS = (
+    "Email sign-up isn't available",
+    "Email sign-up isn’t available",
+    "邮箱注册被限流",
+)
+
+
+def is_signup_throttle(error) -> bool:
+    """是否为 xAI 邮箱注册限流（确定性拒绝：同出口短时无解，不重试）。"""
+    low = str(error or "").lower()
+    return any(marker.lower() in low for marker in _SIGNUP_THROTTLE_MARKERS)
+
+
+def handle_signup_throttle(
+    active_ip,
+    *,
+    email: str = "",
+    detail: str = "",
+    worker: str = "",
+    release_email: bool = False,
+    log_callback=None,
+) -> str:
+    """邮箱注册限流统一处置：出口拉黑置超限、池项下线、邮箱回收、留审计记录。
+
+    - 不计失败：只写 status=throttle 审计行，不写 fail 统计、不加连续失败。
+    - 不重试不等待：调用方收到后直接结束当前槽位并开始下一个。
+    - 出口处置三件：ip_usage_store 计数置超限（取口即跳过）、ip_health 拉黑
+      （bad_ips 恒命中，后续若成功会自动解封）、ip_ready_pool 池项标记不可用。
+    """
+    active_ip = str(active_ip or "").strip()
+    log = log_callback or (lambda _message: None)
+    if active_ip:
+        try:
+            soft_blacklist_ip(active_ip)
+        except Exception:
+            pass
+        try:
+            from webui.ip_health import ban_exit
+
+            ban_exit(active_ip, reason="signup-throttle", log_callback=log)
+        except Exception:
+            pass
+        try:
+            ip_ready_pool.block_exit(active_ip, reason="signup-throttle")
+        except Exception:
+            pass
+    if release_email and email:
+        try:
+            outlook_provider.release(
+                config.get("outlook_accounts_file", "keys/outlook_pending.txt"),
+                config.get("outlook_used_file", "keys/outlook_used.txt"),
+                email,
+                log_callback=log,
+            )
+        except Exception:
+            pass
+    try:
+        record_register_result(
+            "throttle",
+            email or "",
+            kind="throttle",
+            detail=str(detail)[:300],
+            worker=worker,
+            log_callback=log,
+        )
+    except Exception:
+        pass
+    log(
+        "[!] 邮箱注册被限流"
+        + (f"，出口 {active_ip} 已拉黑并置超限" if active_ip else "")
+        + "（不计失败、不重试、不等待）"
+    )
+    return active_ip
 
 
 def classify_failure(exc) -> str:
@@ -3414,6 +3491,7 @@ class GrokRegisterGUI:
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
+        self.throttle_count = 0  # 邮箱注册限流：不计失败，仅算已跳过
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
@@ -4187,17 +4265,27 @@ class GrokRegisterGUI:
         if self._queue_ui_call(self.update_stats):
             return
         fail_detail = format_fail_stats(getattr(self, "fail_stats", {}) or {})
+        throttle_suffix = (
+            f" | 限流跳过: {int(self.throttle_count)}" if self.throttle_count else ""
+        )
         if self.fail_count:
             self.stats_var.set(
-                f"成功: {self.success_count} | 失败: {self.fail_count}（{fail_detail}）"
+                f"成功: {self.success_count} | 失败: {self.fail_count}"
+                f"（{fail_detail}）{throttle_suffix}"
             )
         else:
-            self.stats_var.set(f"成功: {self.success_count} | 失败: 0")
+            self.stats_var.set(
+                f"成功: {self.success_count} | 失败: 0{throttle_suffix}"
+            )
         self._update_progress()
 
     def _update_progress(self):
         total = max(int(getattr(self, "batch_count", 0) or 0), 1)
-        done = int(self.success_count) + int(self.fail_count)
+        done = (
+            int(self.success_count)
+            + int(self.fail_count)
+            + int(getattr(self, "throttle_count", 0) or 0)
+        )
         pct = min(100.0, 100.0 * done / total)
         if hasattr(self, "progress_var"):
             self.progress_var.set(pct)
@@ -4504,6 +4592,7 @@ class GrokRegisterGUI:
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
+        self.throttle_count = 0
         self.fail_stats = empty_fail_stats()
         self.results = []
         self.batch_count = count
@@ -4637,6 +4726,7 @@ class GrokRegisterGUI:
             retry_count_for_slot = 0
             max_slot_retry = slot_retries()
             retry_same_slot = False
+            throttle_skip_wait = False
             while True:
                 if self.should_stop():
                     break
@@ -4827,21 +4917,55 @@ class GrokRegisterGUI:
                         )
                         retry_count_for_slot = 0
                 except Exception as exc:
-                    if config.get("email_provider") == "outlook" and email and not registration_submitted:
-                        outlook_provider.release(
-                            config.get("outlook_accounts_file", "keys/outlook_pending.txt"),
-                            config.get("outlook_used_file", "keys/outlook_used.txt"),
-                            email,
+                    if is_signup_throttle(exc):
+                        # 邮箱注册限流：不记失败、不重试、不等待，直接结束当前
+                        # 账号并拉黑该出口（GUI 路径与 CLI 口径一致）。
+                        throttle_ip = ""
+                        try:
+                            throttle_ip = get_exit_ip() or ""
+                        except Exception:
+                            throttle_ip = ""
+                        handle_signup_throttle(
+                            throttle_ip,
+                            email=email,
+                            detail=str(exc),
+                            worker=f"W{worker_id + 1}" if workers > 1 else "",
+                            release_email=(
+                                config.get("email_provider") == "outlook"
+                                and bool(email)
+                                and not registration_submitted
+                            ),
                             log_callback=wlog,
                         )
-                    kind = self._record_failure(exc)
-                    retry_count_for_slot = 0
-                    wlog(
-                        f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
-                        f"{redact_sensitive_log_line(str(exc))}"
-                    )
+                        retry_count_for_slot = 0
+                        retry_same_slot = False
+                        throttle_skip_wait = True
+                        lock = getattr(self, "_stats_lock", None)
+                        if lock:
+                            with lock:
+                                self.throttle_count += 1
+                        else:
+                            self.throttle_count += 1
+                        wlog("[*] 直接结束当前账号，开始下一个")
+                    else:
+                        if config.get("email_provider") == "outlook" and email and not registration_submitted:
+                            outlook_provider.release(
+                                config.get("outlook_accounts_file", "keys/outlook_pending.txt"),
+                                config.get("outlook_used_file", "keys/outlook_used.txt"),
+                                email,
+                                log_callback=wlog,
+                            )
+                        kind = self._record_failure(exc)
+                        retry_count_for_slot = 0
+                        wlog(
+                            f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: "
+                            f"{redact_sensitive_log_line(str(exc))}"
+                        )
                 finally:
                     self.update_stats()
+                if throttle_skip_wait:
+                    throttle_skip_wait = False
+                    continue
                 if self.should_stop():
                     break
                 # 每轮结束只关浏览器，不立刻再开。
@@ -5250,6 +5374,7 @@ def run_registration_cli(count):
                             break
                         i = claimed
                     slot_start_i = i
+                    throttle_rotate = False  # 本槽位是否因注册限流需强制换口
                     email = ""
                     registration_submitted = False
                     try:
@@ -5442,23 +5567,29 @@ def run_registration_cli(count):
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
                         )
-                        throttled = "Email sign-up isn't available" in msg
-                        if throttled and retry < max_slot_retry:
-                            # xAI 邮箱注册限流（按时段/提交量节流，不是出口质量
-                            # 问题）：不记空页惩罚、不冷却/拉黑出口；退避后同
-                            # 槽位换口重试。
-                            retry += 1
-                            backoff = 90
-                            cli_log(
-                                f"[W{wid+1}] [!] 邮箱注册被限流"
-                                f"（Email sign-up isn't available），"
-                                f"退避 {backoff}s 后同槽位换口重试 "
-                                f"{retry}/{max_slot_retry}"
+                        if is_signup_throttle(msg):
+                            # xAI 邮箱注册限流：该出口已被确定性拒绝，同 IP 短时
+                            # 无解。不计失败（不写 fail 统计、不加连续失败），
+                            # 不重试不等待；拉黑该出口（健康档案黑名单 + 累计
+                            # 使用置超限 + 池项不可用），直接消费当前槽位、换口
+                            # 开始下一个。
+                            handle_signup_throttle(
+                                active_ip,
+                                email=email,
+                                detail=str(exc),
+                                worker=f"W{wid+1}",
+                                release_email=(
+                                    config.get("email_provider") == "outlook"
+                                    and bool(email)
+                                    and not registration_submitted
+                                ),
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
-                            sleep_with_cancel(backoff, controller.should_stop)
-                            if accounts_per_ip > 0:
-                                rotate_idx += 1
-                            retry_same_slot = True
+                            i += 1
+                            retry = 0
+                            throttle_rotate = True
+                            mark_slot_completed()
+                            cli_log(f"[W{wid+1}] [*] 直接换口开始下一个账号")
                             continue
                         if blank_ui:
                             # 空页（reload 已尝试仍空白/无表单）：直接判定槽位
@@ -5588,6 +5719,9 @@ def run_registration_cli(count):
                                     consecutive_failures=consecutive_failures,
                                     failure_threshold=failure_rotate_threshold,
                                 )
+                                if not reason and throttle_rotate:
+                                    # 注册限流已拉黑该出口：即便上限设为“不限”也强制换口
+                                    reason = "注册限流（出口已拉黑）"
                             if reason:
                                 cli_log(
                                     f"[W{wid+1}] [*] [IP策略] {reason} 已到，"

@@ -105,6 +105,10 @@ def record_exit_result(ip, ok, *, proxy_url="", log_callback=None) -> Optional[d
             e["session_alive_streak"] = int(e.get("session_alive_streak") or 0) + 1
             e["session_dead_streak"] = 0
             e["session_checked_at"] = now
+            # 成功即证明出口可用：自动解除历史拉黑（如限流误伤/手动恢复）
+            e.pop("banned", None)
+            e.pop("ban_reason", None)
+            e.pop("banned_at", None)
         else:
             e["fails"] = int(e.get("fails") or 0) + 1
             e["last_fail_at"] = now
@@ -189,6 +193,8 @@ def trusted_exits(min_successes: int = 1) -> list:
         exits = [dict(e) for e in _read()["exits"].values()]
     out = []
     for e in exits:
+        if e.get("banned"):
+            continue
         if int(e.get("successes") or 0) < min_successes:
             continue
         if int(e.get("session_dead_streak") or 0) >= _DEAD_STREAK_LIMIT:
@@ -201,13 +207,46 @@ def trusted_exits(min_successes: int = 1) -> list:
 
 
 def bad_ips(min_fails: int = 2) -> set:
-    """黑历史出口：失败≥阈值且从未成功，取口时应跳过。"""
+    """黑名单出口：显式拉黑（banned）或失败≥阈值且从未成功，取口时跳过。"""
     with _HEALTH_LOCK:
         exits = _read()["exits"]
     return {
         ip for ip, e in exits.items()
-        if int(e.get("fails") or 0) >= min_fails and int(e.get("successes") or 0) == 0
+        if e.get("banned")
+        or (int(e.get("fails") or 0) >= min_fails and int(e.get("successes") or 0) == 0)
     }
+
+
+def ban_exit(ip, *, reason: str = "", log_callback=None) -> Optional[dict]:
+    """直接把出口打入黑名单（注册限流等确定性拒绝，单次即拉黑）。
+
+    banned 后 bad_ips() 恒包含该出口（取口/换口全部跳过）、trusted_exits()
+    不再返回；后续若该出口再次注册成功，record_exit_result(ok=True) 会自动解封。
+    """
+    ip = str(ip or "").strip()
+    if not ip:
+        return None
+    now = time.time()
+    with _HEALTH_LOCK:
+        data = _read()
+        exits = data["exits"]
+        e = exits.setdefault(ip, {
+            "ip": ip, "successes": 0, "fails": 0,
+            "identities": {}, "session_alive": None,
+            "session_checked_at": 0.0, "session_alive_streak": 0,
+            "session_dead_streak": 0,
+        })
+        e["banned"] = True
+        e["ban_reason"] = str(reason or "")[:120]
+        e["banned_at"] = now
+        e["last_fail_at"] = now
+        if not e.get("as"):
+            e.update({k: v for k, v in _ipapi_meta(ip).items() if v})
+        exits[ip] = e
+        _write(data)
+    if log_callback:
+        log_callback(f"[IP健康] 出口 {ip} 已拉黑（{reason or '手动'}）")
+    return dict(e)
 
 
 def session_due_exits(max_age: float = 1800.0, limit: int = 8) -> list:
@@ -274,7 +313,10 @@ def stats() -> dict:
     with _HEALTH_LOCK:
         exits = _read()["exits"]
     now = time.time()
-    trusted = [e for e in exits.values() if int(e.get("successes") or 0) >= 1]
+    trusted = [
+        e for e in exits.values()
+        if int(e.get("successes") or 0) >= 1 and not e.get("banned")
+    ]
     return {
         "total": len(exits),
         "trusted": len(trusted),

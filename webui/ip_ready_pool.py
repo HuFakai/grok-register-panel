@@ -427,6 +427,29 @@ def demote_trusted_exit(ip: str, *, reason: str = "") -> bool:
     return hit
 
 
+def block_exit(ip: str, *, reason: str = "") -> bool:
+    """把池内某出口（含 trusted/普通项）标记为不可用，保留记录便于审计。
+
+    注册限流等确定性拒绝后调用，pick_usable 之后不会再返回该出口。
+    """
+    ip = str(ip or "").strip()
+    if not ip:
+        return False
+    with _POOL_LOCK:
+        items = _read_items()
+        hit = False
+        for it in items:
+            if str(it.get("exit_ip") or "").strip() != ip:
+                continue
+            it["usable"] = False
+            it["trusted"] = False
+            it["blocked_reason"] = str(reason or "")
+            hit = True
+        if hit:
+            _write_items(items)
+    return hit
+
+
 def remove_item(item_id: str) -> bool:
     """核验成功/失败后从池中剔除该项（用完即弃）。"""
     if not item_id:
