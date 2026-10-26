@@ -28,6 +28,7 @@ PROVIDER_LABELS = {
     "mailnest": "MailNest",
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
+    "outlook": "Outlook 卡池",
     "outlook_rt": "Outlook RT 库存",
     "inbucket": "Inbucket",
 }
@@ -189,6 +190,23 @@ FIELD_DEFINITIONS = {
         "default": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
         "placeholder": "默认 Microsoft Authentication Broker",
     },
+    "outlook_accounts_file": {
+        "label": "待用池路径",
+        "type": "text",
+        "default": "keys/outlook_pending.txt",
+        "placeholder": "keys/outlook_pending.txt",
+    },
+    "outlook_used_file": {
+        "label": "已用记录路径",
+        "type": "text",
+        "default": "keys/outlook_used.txt",
+        "placeholder": "keys/outlook_used.txt",
+    },
+    "outlook_proxy": {
+        "label": "取号代理（可选）",
+        "type": "text",
+        "placeholder": "http://user:pass@host:port 或留空直连",
+    },
     "inbucket_api_base": {
         "label": "实例地址",
         "type": "url",
@@ -249,6 +267,11 @@ PROVIDER_FIELDS = {
         "outlook_rt_inventory",
         "outlook_rt_used_path",
         "outlook_rt_client_id",
+    ),
+    "outlook": (
+        "outlook_accounts_file",
+        "outlook_used_file",
+        "outlook_proxy",
     ),
     "inbucket": (
         "inbucket_api_base",
@@ -393,6 +416,11 @@ def _normalize_value(name: str, value: object):
         if text and any(ch in text for ch in "\n\r\0"):
             raise EmailProviderConfigError("库存路径无效")
         return text
+    if name in {"outlook_accounts_file", "outlook_used_file", "outlook_proxy"}:
+        text = _string(value)
+        if text and any(ch in text for ch in "\n\r\0"):
+            raise EmailProviderConfigError("Outlook 卡池路径无效")
+        return text
     return _string(value, strip=name != "cloudmail_password")
 
 
@@ -430,6 +458,10 @@ def _is_configured(provider: str, values: dict) -> bool:
         # 库存文件必须真实存在（否则取号必然失败，直接判定未配置）
         inventory = str(values.get("outlook_rt_inventory") or "").strip()
         return bool(inventory and Path(inventory).expanduser().is_file())
+    if provider == "outlook":
+        # 待用池文件必须真实存在（否则取号必然失败，直接判定未配置）
+        accounts = str(values.get("outlook_accounts_file") or "").strip()
+        return bool(accounts and Path(accounts).expanduser().is_file())
     if provider == "inbucket":
         return bool(
             values.get("inbucket_api_base") and values.get("inbucket_domain")

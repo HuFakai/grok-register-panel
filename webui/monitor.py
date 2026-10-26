@@ -2756,7 +2756,7 @@ HTML = r"""<!DOCTYPE html>
             <div class="mail-source-kicker">Ready IP pool</div>
             <h2 id="ip-pool-label">可用 IP 池（预筛可用出口，worker 优先取用）</h2>
             <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
-              面板后台批量探测 sticky 身份，筛出未超限出口写入池；注册 worker 换口时优先从这里取已确认可用的身份（不再随机碰运气）。身份在会话有效期（默认 10 分钟）内有效，过期自动清理并补充。
+              后台循环扫描 sticky 身份（ip-api hosting 标记 + 已知机房 ASN 双过滤，可只留住宅出口），未超限身份写入池；注册 worker 取口三级优先：池内 trusted（★ 成功 IP 复用）→ 池内普通身份 → 可信出口兜底。会话核验存活的出口自动续期， resin 租期（7 天）内可反复复用。
             </p>
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
@@ -2796,6 +2796,7 @@ HTML = r"""<!DOCTYPE html>
           </div>
         </div>
         <div class="msg" id="ip-health-msg" role="status" aria-live="polite"></div>
+        <div class="proxy-summary" id="ip-health-summary" style="margin-top:8px"></div>
         <div class="table-scroll" style="margin-top:8px">
           <table class="proxy-table ip-pool-table">
             <thead><tr>
@@ -2804,6 +2805,10 @@ HTML = r"""<!DOCTYPE html>
             <tbody id="ip-health-body"><tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr></tbody>
           </table>
         </div>
+        <details class="domain-advanced" id="ip-health-bad" style="display:none;margin-top:8px">
+          <summary><span class="domain-advanced-title" id="ip-health-bad-summary">拉黑出口</span></summary>
+          <div class="mail-provider-meta" id="ip-health-bad-list" style="margin-top:6px"></div>
+        </details>
       </section>
 
       <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
@@ -2811,7 +2816,10 @@ HTML = r"""<!DOCTYPE html>
           <div class="field">
             <label for="ip-usage-limit-page" id="ip-usage-limit-label">单 IP 累计使用上限（0=不限）</label>
             <input type="number" id="ip-usage-limit-page" min="0" max="100000" value="0"
-                   title="该出口 IP 在所有任务中的累计账号槽位数（成功/最终失败都计）达到此值后必须换 IP"/>
+                   title="该出口 IP 在所有任务中的累计账号槽位数（成功/最终失败都计）达到此值后必须换 IP；超限出口被取口/预检/换口三层拒绝"/>
+          </div>
+          <div class="mail-provider-meta" style="max-width:420px">
+            全局生效的累计槽位上限；也可在下方表格按 IP 单独覆盖（0=清除覆盖回退全局）。
           </div>
           <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
             <button class="primary" id="ip-usage-limit-save" onclick="saveIpUsageLimit()">保存上限</button>
@@ -2880,6 +2888,43 @@ HTML = r"""<!DOCTYPE html>
           <span class="mail-provider-meta mono" id="mail-provider-updated">尚未读取</span>
         </div>
         <div class="msg mail-provider-result" id="mail-provider-msg" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="mail-provider-panel" id="outlook-pool-panel" aria-labelledby="outlook-pool-label" style="margin-top:12px" hidden>
+        <div class="mail-provider-toolbar" style="align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div class="mail-source-kicker">Outlook pool</div>
+            <h2 id="outlook-pool-label">Outlook 卡池管理</h2>
+            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
+              管理待用/已用 Outlook 卡密（email----password----client_id----refresh_token）。注册 worker 失败的邮箱会自动回收到池尾重试；此处的删除只移除记录，不会动微软账号本身。
+            </p>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+            <span class="badge" id="outlook-pool-status">--</span>
+            <button id="outlook-pool-refresh" onclick="refreshOutlookPool(false)">刷新</button>
+          </div>
+        </div>
+        <div class="proxy-summary" id="outlook-pool-summary" style="margin-top:8px"></div>
+        <div class="msg" id="outlook-pool-msg" role="status" aria-live="polite"></div>
+        <div class="mail-provider-fields" id="outlook-pool-editor" style="margin-top:8px;flex-direction:column;align-items:stretch">
+          <div class="field" style="width:100%">
+            <label for="outlook-pool-import-text">导入卡密（每行一条 email----password----client_id----refresh_token，自动去重并剥 refresh_token 尾部污染）</label>
+            <textarea id="outlook-pool-import-text" rows="4" spellcheck="false"
+              placeholder="someone@hotmail.com----password----9e5f94bc-…----M.C5xx…" style="min-height:72px;font-family:'Geist Mono',monospace"></textarea>
+          </div>
+          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="primary" id="outlook-pool-import" onclick="importOutlookPool()">导入待用池</button>
+            <button id="outlook-pool-export" onclick="exportOutlookPool()">导出待用池</button>
+            <button class="danger" id="outlook-pool-delete" onclick="deleteSelectedOutlookRows()">删除选中</button>
+            <span class="mail-provider-meta mono" id="outlook-pool-paths">--</span>
+          </div>
+        </div>
+        <div class="table-scroll" style="margin-top:8px">
+          <table class="proxy-table">
+            <thead><tr><th style="width:28px"><input type="checkbox" id="outlook-pool-check-all" onchange="toggleAllOutlookRows(this.checked)"/></th><th>邮箱</th><th>状态</th><th>Client ID</th><th>Refresh Token</th></tr></thead>
+            <tbody id="outlook-pool-body"><tr><td colspan="5" class="proxy-empty">暂无数据</td></tr></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="mail-provider-panel" aria-labelledby="email-profiles-label" style="margin-top:12px">
@@ -3523,6 +3568,7 @@ function setAppView(view, options = {}) {
     refreshMailCleanup(false, true);
   }
   if (isIpUsage) refreshIpUsage();
+  if (isIpUsage) refreshIpHealthData();
   if (isIpUsage) refreshIpHealth();
   if (isSso) refreshSsoState();
   if (isAccounts) refreshAccounts();
@@ -3901,11 +3947,19 @@ function changeProxyPageSize(value) {
 let ipUsageData = null;
 let ipPage = 1;
 let ipPageSize = 50;
+let ipHealthData = null;
 async function refreshIpUsage(silent = true) {
   try {
     const data = await api("/api/ip-usage" + (silent ? "" : "?_=" + Date.now()));
     ipUsageData = data;
     renderIpUsage(data);
+  } catch (e) {
+    if (!silent) setMsg("ip-usage-limit-msg", String(e.message || e), "err");
+  }
+}
+async function refreshIpHealthData(silent = true) {
+  try {
+    ipHealthData = await api("/api/ip-health?_=" + Date.now(), { authHelp: false });
   } catch (e) {
     if (!silent) setMsg("ip-usage-limit-msg", String(e.message || e), "err");
   }
@@ -3961,10 +4015,15 @@ function renderIpUsage(data) {
     const count = Number(it.count) || 0;
     const eff = Number(it.limit_effective) || 0;
     const per = it.limit != null ? Number(it.limit) : 0;
+    const hMeta = ((ipHealthData && ipHealthData.trusted) || []).find(e => e.ip === ip);
+    const hBad = ipHealthData && (ipHealthData.bad || []).includes(ip);
+    const hBadge = hMeta
+      ? ` <span class="badge" style="color:var(--ok);padding:1px 6px;min-height:0" title="注册成功 ${hMeta.successes} 次，可优先复用">★${hMeta.successes}</span>`
+      : (hBad ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0" title="连续失败且从未成功，已停止取用">拉黑</span>' : "");
     const pct = eff > 0 ? Math.min(100, Math.round(100 * count / eff)) : 0;
     const over = eff > 0 && count >= eff;
     return `<tr>
-      <td class="mono">${esc(ip)}${over ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">超限</span>' : ""}</td>
+      <td class="mono">${esc(ip)}${hBadge}${over ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">超限</span>' : ""}</td>
       <td class="mono">${esc(count)}</td>
       <td style="min-width:160px">
         <div style="display:flex;align-items:center;gap:8px">
@@ -4038,6 +4097,17 @@ async function refreshIpHealth(silent) {
     const label = document.getElementById("ip-health-status");
     if (label) label.textContent = "可信 " + (st.trusted ?? 0) + " / 存活 " + (st.alive ?? 0)
       + " / 待核验 " + (st.due_check ?? 0) + " / 拉黑 " + (j.bad || []).length;
+    const healthSummary = [
+      ["已归档出口", st.total ?? 0, ""],
+      ["可信复用", st.trusted ?? 0, "ok"],
+      ["会话存活", st.alive ?? 0, "ok"],
+      ["待核验", st.due_check ?? 0, (st.due_check ?? 0) > 0 ? "accent" : ""],
+      ["已拉黑", (j.bad || []).length, (j.bad || []).length > 0 ? "fail" : ""],
+    ];
+    const healthSummaryEl = document.getElementById("ip-health-summary");
+    if (healthSummaryEl) healthSummaryEl.innerHTML = healthSummary.map(([h, v, cls]) =>
+      `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(h)}</div><div class="proxy-summary-value ${cls}">${esc(v)}</div></div>`
+    ).join("");
     const rows = (j.trusted || []).map(e => {
       const alive = e.session_alive;
       const state = alive === true
@@ -4057,6 +4127,15 @@ async function refreshIpHealth(silent) {
     }).join("");
     const body = document.getElementById("ip-health-body");
     if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr>';
+    const badCount = (j.bad || []).length;
+    const badSummary = document.getElementById("ip-health-bad-summary");
+    if (badSummary) badSummary.textContent = badCount
+      ? "拉黑出口（" + badCount + " 个，连续失败且从未成功，已停止取用）"
+      : "";
+    const badDetails = document.getElementById("ip-health-bad");
+    if (badDetails) badDetails.style.display = badCount ? "" : "none";
+    const badList = document.getElementById("ip-health-bad-list");
+    if (badList) badList.innerHTML = (j.bad || []).map(b => `<span class="mono" style="margin-right:10px">${esc(b)}</span>`).join("");
   } catch (e) {
     if (!silent) setMsg("ip-health-msg", String(e.message || e), "err");
   }
@@ -4351,6 +4430,7 @@ function renderEmailProviderFields(provider) {
     domainProvider.value = definition.id;
     if (domainData) renderEmailDomainPool(domainData);
   }
+  syncOutlookPoolPanel();
 }
 function renderEmailProviderConfig(data) {
   emailProviderData = data || {};
@@ -4371,6 +4451,146 @@ function renderEmailProviderConfig(data) {
 function selectEmailProvider(provider) {
   renderEmailProviderFields(provider);
   setMsg("mail-provider-msg", "", "");
+}
+let outlookPoolData = null;
+function syncOutlookPoolPanel() {
+  const panel = document.getElementById("outlook-pool-panel");
+  if (!panel) return;
+  const visible = selectedEmailProvider === "outlook";
+  panel.hidden = !visible;
+  if (visible) refreshOutlookPool(false);
+}
+function outlookPoolPaths() {
+  const values = (emailProviderData && emailProviderData.values) || {};
+  return {
+    accounts_file: values.outlook_accounts_file || "",
+    used_file: values.outlook_used_file || "",
+  };
+}
+function outlookPoolQuery() {
+  const paths = outlookPoolPaths();
+  const params = new URLSearchParams();
+  if (paths.accounts_file) params.set("accounts_file", paths.accounts_file);
+  if (paths.used_file) params.set("used_file", paths.used_file);
+  const qs = params.toString();
+  return qs ? "?" + qs : "";
+}
+async function refreshOutlookPool(silent = true) {
+  const panel = document.getElementById("outlook-pool-panel");
+  if (!panel || panel.hidden) return;
+  try {
+    const base = outlookPoolQuery();
+    const suffix = silent ? "" : (base ? "&_=" : "?_=") + Date.now();
+    const data = await api("/api/outlook-pool" + base + suffix, { authHelp: false });
+    outlookPoolData = data;
+    renderOutlookPool(data);
+  } catch (e) {
+    if (!silent) setMsg("outlook-pool-msg", String(e.message || e), "err");
+  }
+}
+function outlookPoolStateBadge(state) {
+  if (state === "used") return '<span class="badge" style="padding:1px 6px;min-height:0">已用</span>';
+  return '<span class="badge ok" style="padding:1px 6px;min-height:0">待用</span>';
+}
+function renderOutlookPool(data) {
+  const stats = data.stats || {};
+  const status = document.getElementById("outlook-pool-status");
+  if (status) status.textContent = "待用 " + (stats.pending ?? 0) + " / 已用 " + (stats.used ?? 0) + " / 可用 " + (stats.available ?? 0);
+  const summary = [
+    ["待用（可注册）", stats.available ?? 0, "ok"],
+    ["已用（含成功失败）", stats.used ?? 0, ""],
+    ["池内总行数", stats.pending ?? 0, ""],
+    ["重复行", (stats.duplicate_pending ?? 0) + (stats.duplicate_used ?? 0), (stats.duplicate_pending ?? 0) + (stats.duplicate_used ?? 0) > 0 ? "accent" : ""],
+    ["池已用重叠", stats.overlap ?? 0, (stats.overlap ?? 0) > 0 ? "warn" : ""],
+  ];
+  const summaryEl = document.getElementById("outlook-pool-summary");
+  if (summaryEl) summaryEl.innerHTML = summary.map(([h, v, cls]) =>
+    `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(h)}</div><div class="proxy-summary-value ${cls}">${esc(v)}</div></div>`
+  ).join("");
+  const paths = document.getElementById("outlook-pool-paths");
+  if (paths) paths.textContent = (stats.pending_path || "--") + " ⇄ " + (stats.used_path || "--");
+  const rows = data.rows || [];
+  const body = document.getElementById("outlook-pool-body");
+  if (body) body.innerHTML = rows.length ? rows.map(row => {
+    const checked = window._outlookPoolSelected && window._outlookPoolSelected.has(row.email) ? "checked" : "";
+    return `<tr>
+      <td><input type="checkbox" class="outlook-pool-row-check" data-email="${esc(row.email)}" ${checked} onchange="toggleOutlookRow('${esc(row.email)}', this.checked)"/></td>
+      <td class="mono" title="${esc(row.email)}">${esc(row.email_masked)}</td>
+      <td>${outlookPoolStateBadge(row.state)}</td>
+      <td class="mono">${esc(row.client_id || "--")}</td>
+      <td>${row.has_refresh ? '<span class="badge ok" style="padding:1px 6px;min-height:0">已存</span>' : '<span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0">缺失</span>'}</td>
+    </tr>`;
+  }).join("") : '<tr><td colspan="5" class="proxy-empty">暂无卡密（粘贴卡密文本后点「导入待用池」）</td></tr>';
+}
+function toggleOutlookRow(email, checked) {
+  window._outlookPoolSelected = window._outlookPoolSelected || new Set();
+  if (checked) window._outlookPoolSelected.add(email);
+  else window._outlookPoolSelected.delete(email);
+}
+function toggleAllOutlookRows(checked) {
+  window._outlookPoolSelected = window._outlookPoolSelected || new Set();
+  (outlookPoolData && outlookPoolData.rows || []).forEach(row => {
+    if (checked) window._outlookPoolSelected.add(row.email);
+    else window._outlookPoolSelected.delete(row.email);
+  });
+  document.querySelectorAll(".outlook-pool-row-check").forEach(box => { box.checked = checked; });
+}
+async function importOutlookPool() {
+  const button = document.getElementById("outlook-pool-import");
+  const text = (document.getElementById("outlook-pool-import-text") || {}).value || "";
+  if (!text.trim()) { setMsg("outlook-pool-msg", "请先粘贴卡密文本", "err"); return; }
+  button.disabled = true;
+  setMsg("outlook-pool-msg", "正在导入…", "");
+  try {
+    const payload = { text };
+    const paths = outlookPoolPaths();
+    if (paths.accounts_file) payload.accounts_file = paths.accounts_file;
+    if (paths.used_file) payload.used_file = paths.used_file;
+    const result = await api("/api/outlook-pool/import", { method: "POST", body: JSON.stringify(payload) });
+    document.getElementById("outlook-pool-import-text").value = "";
+    setMsg("outlook-pool-msg", "已导入 " + result.added + " 条，跳过重复 " + result.skipped_duplicate + " 条", "ok");
+    await refreshOutlookPool(true);
+  } catch (e) {
+    setMsg("outlook-pool-msg", String(e.message || e), "err");
+  }
+  button.disabled = false;
+}
+async function exportOutlookPool() {
+  const button = document.getElementById("outlook-pool-export");
+  button.disabled = true;
+  try {
+    const result = await api("/api/outlook-pool/export" + outlookPoolQuery(), { authHelp: false });
+    const blob = new Blob([result.text || ""], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "outlook_pending.txt";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    setMsg("outlook-pool-msg", "已导出待用池全文（含完整凭据，注意保管）", "ok");
+  } catch (e) {
+    setMsg("outlook-pool-msg", String(e.message || e), "err");
+  }
+  button.disabled = false;
+}
+async function deleteSelectedOutlookRows() {
+  const selected = Array.from(window._outlookPoolSelected || []);
+  if (!selected.length) { setMsg("outlook-pool-msg", "先勾选要删除的邮箱", "err"); return; }
+  if (!confirm("删除选中的 " + selected.length + " 条记录？（仅删除池文件记录；已用记录默认保留防复用）")) return;
+  const button = document.getElementById("outlook-pool-delete");
+  button.disabled = true;
+  try {
+    const payload = { emails: selected };
+    const paths = outlookPoolPaths();
+    if (paths.accounts_file) payload.accounts_file = paths.accounts_file;
+    if (paths.used_file) payload.used_file = paths.used_file;
+    const result = await api("/api/outlook-pool/delete", { method: "POST", body: JSON.stringify(payload) });
+    window._outlookPoolSelected = new Set();
+    setMsg("outlook-pool-msg", "已删除待用 " + result.deleted_pending + " 条；命中已用记录 " + result.skipped_used + " 条（保留）", "ok");
+    await refreshOutlookPool(true);
+  } catch (e) {
+    setMsg("outlook-pool-msg", String(e.message || e), "err");
+  }
+  button.disabled = false;
 }
 function toggleEmailProviderSecret(name) {
   const clearing = !clearedEmailSecrets.has(name);
@@ -5719,7 +5939,7 @@ setInterval(() => {
 setInterval(() => {
   if (document.body.classList.contains("proxy-view-open")) refreshProxies(false);
   if (document.body.classList.contains("domain-view-open")) { refreshEmailDomains(false); refreshEmailProfiles(false); }
-  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); refreshIpHealth(false); }
+  if (document.body.classList.contains("ip-usage-view-open")) { refreshIpUsage(false); refreshIpPool(false); refreshIpHealth(false); refreshIpHealthData(); }
 }, 3000);
 setInterval(() => {
   if (document.body.classList.contains("accounts-view-open")) refreshAccounts(false, false);
@@ -5858,7 +6078,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/ip-health", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/grok2api", "/api/proxies", "/api/ip-usage", "/api/ip-pool", "/api/ip-health", "/api/email-provider", "/api/email-profiles", "/api/email-domains", "/api/config/export", "/api/bfs", "/api/sso-state", "/api/accounts", "/api/mail-cleanup", "/api/outlook-pool", "/api/outlook-pool/export"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -6045,6 +6265,33 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/email-provider":
             try:
                 self._json(200, read_email_provider_config())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/outlook-pool":
+            try:
+                from webui import outlook_pool_ops
+
+                query = parse_qs(u.query)
+                accounts_file = (query.get("accounts_file") or [""])[0] or None
+                used_file = (query.get("used_file") or [""])[0] or None
+                with_rows = (query.get("rows") or ["1"])[0] in ("1", "true")
+                if with_rows:
+                    self._json(200, outlook_pool_ops.outlook_pool_rows(accounts_file, used_file))
+                else:
+                    self._json(200, outlook_pool_ops.outlook_pool_stats(accounts_file, used_file))
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/outlook-pool/export":
+            try:
+                from webui import outlook_pool_ops
+
+                query = parse_qs(u.query)
+                self._json(200, outlook_pool_ops.outlook_pool_export(
+                    (query.get("accounts_file") or [""])[0] or None,
+                    (query.get("used_file") or [""])[0] or None,
+                ))
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -6419,6 +6666,36 @@ class Handler(BaseHTTPRequestHandler):
 
                 deleted = delete_email_profile(body.get("profile_id"))
                 self._json(200, {"ok": True, "deleted": deleted})
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/outlook-pool/import":
+            try:
+                from webui import outlook_pool_ops
+
+                result = outlook_pool_ops.outlook_pool_import(
+                    body.get("text"),
+                    body.get("accounts_file") or None,
+                    body.get("used_file") or None,
+                )
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/outlook-pool/delete":
+            try:
+                from webui import outlook_pool_ops
+
+                result = outlook_pool_ops.outlook_pool_delete(
+                    body.get("emails") or [],
+                    body.get("accounts_file") or None,
+                    body.get("used_file") or None,
+                )
+                self._json(200, result)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             except Exception as e:

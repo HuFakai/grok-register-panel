@@ -23,11 +23,14 @@ class IsolatedConfig:
             email_provider_store.CONFIG_PATH,
             email_provider_store.LOCK_PATH,
         )
+        self.previous_cwd = Path.cwd()
+        os.chdir(base)  # 隔离相对路径（keys/outlook_pending.txt）的解析
         email_provider_store.CONFIG_PATH = base / "config.json"
         email_provider_store.LOCK_PATH = base / "config.json.lock"
         return email_provider_store.CONFIG_PATH
 
     def __exit__(self, exc_type, exc, tb):
+        os.chdir(self.previous_cwd)
         email_provider_store.CONFIG_PATH, email_provider_store.LOCK_PATH = self.previous
         self.temp.cleanup()
 
@@ -54,12 +57,14 @@ def test_provider_schema_and_defaults():
             "mailnest",
             "cloudmail",
             "moemail",
+            "outlook",
             "outlook_rt",
             "inbucket",
         }
         assert providers["duckmail"]["configured"] is True
         assert providers["cloudmail"]["configured"] is False
         assert providers["outlook_rt"]["configured"] is False
+        assert providers["outlook"]["configured"] is False
         assert providers["inbucket"]["configured"] is False
         assert any(
             field["name"] == "cloudmail_password" and field["secret"] is True
@@ -68,6 +73,10 @@ def test_provider_schema_and_defaults():
         assert any(
             field["name"] == "outlook_rt_inventory"
             for field in providers["outlook_rt"]["fields"]
+        )
+        assert any(
+            field["name"] == "outlook_accounts_file"
+            for field in providers["outlook"]["fields"]
         )
         assert any(
             field["name"] == "inbucket_api_base"

@@ -340,6 +340,24 @@ def test_sso_state_panel_structure():
     assert (ROOT / 'scripts/check_sso_state.py').is_file()
 
 
+def test_outlook_pool_panel_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert 'id="outlook-pool-panel"' in html
+    assert 'id="outlook-pool-summary"' in html
+    assert 'id="outlook-pool-import-text"' in html
+    assert 'id="outlook-pool-body"' in html
+    assert 'function refreshOutlookPool(' in mon
+    assert 'function importOutlookPool(' in mon
+    assert 'function exportOutlookPool(' in mon
+    assert 'function deleteSelectedOutlookRows(' in mon
+    assert 'syncOutlookPoolPanel();' in mon
+    assert '/api/outlook-pool/import' in mon
+    assert '/api/outlook-pool/delete' in mon
+    assert '/api/outlook-pool/export' in mon
+    assert (ROOT / 'webui/outlook_pool_ops.py').is_file()
+
+
 if __name__ == '__main__':
     test_workers_dom_ids_unique()
     test_no_cors_wildcard()
@@ -358,4 +376,5 @@ if __name__ == '__main__':
     test_sso_state_panel_structure()
     test_ip_pool_datacenter_filter_toggle()
     test_mail_cleanup_panel_structure()
+    test_outlook_pool_panel_structure()
     print('OK structure')
