@@ -27,3 +27,6 @@ stickies*.txt
 # 本地 IDE / 计划 / 个人笔记（不上传）
 .zcode/
 wen端启动.md
+
+# 卡池凭据（outlook/hotmail 账号密钥，禁止入库）
+keys/
