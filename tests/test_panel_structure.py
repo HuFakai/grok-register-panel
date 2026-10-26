@@ -207,6 +207,56 @@ def test_ip_pool_datacenter_filter_toggle():
     assert '注册限流' in mon
 
 
+def test_ip_usage_tabs_pagination_and_strategy_structure():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    # 四个功能标签 + 无障碍语义
+    assert 'class="ip-usage-tabs" role="tablist"' in html
+    for key in ('usage', 'pool', 'health', 'settings'):
+        assert f'id="ip-tab-{key}"' in html
+        assert f'id="ip-panel-{key}"' in html
+        assert f'aria-controls="ip-panel-{key}"' in html
+        assert f'id="ip-panel-{key}" role="tabpanel"' in html
+    assert html.count('id="ip-panel-') == 4
+    assert "setIpUsageTab('usage')" in html
+    assert "setIpUsageTab('pool')" in html
+    assert "setIpUsageTab('health')" in html
+    assert "setIpUsageTab('settings')" in html
+    assert 'onkeydown="handleIpTabKey(event)"' in html
+    # 三个列表各自分页
+    for prefix, size in (('ip', 50), ('ip-pool', 25), ('ip-health', 25)):
+        assert f'id="{prefix}-page-status"' in html
+        assert f'id="{prefix}-page-size"' in html
+        assert f'id="{prefix}-page-prev"' in html
+        assert f'id="{prefix}-page-next"' in html
+        assert f'<option value="{size}" selected>' in html
+    # 策略设置项与保存动作
+    for field in (
+        'target', 'low', 'trusted-min', 'success-min',
+        'fail-min', 'failmax-h', 'throttle-h',
+    ):
+        assert f'id="ip-settings-{field}"' in html
+    assert 'id="ip-strategy-save"' in html
+    assert 'function saveIpPoolSettings(' in mon
+    assert 'function fillIpSettings(' in mon
+    assert 'function changeIpPoolPage(' in mon
+    assert 'function changeIpPoolPageSize(' in mon
+    assert 'function changeIpHealthPage(' in mon
+    assert 'function changeIpHealthPageSize(' in mon
+    # 出口健康表含冷静期列，空态列数一致
+    assert '<th>冷静期</th>' in html
+    assert 'id="ip-health-body"><tr><td colspan="7"' in html
+    assert 'id="ip-pool-body"><tr><td colspan="6"' in html
+    # 后端接口与配置键
+    assert '"/api/ip-pool/settings"' in mon
+    assert '"/api/ip-health/verify"' in mon
+    assert 'ip_trusted_priority_min' in mon
+    assert 'ip_pool_low_watermark' in mon
+    assert 'ip_success_cooldown_sec' in mon
+    assert 'ip_fail_cooldown_max_sec' in mon
+    assert 'ip_throttle_cooldown_sec' in mon
+
+
 def test_mail_cleanup_panel_structure():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
     html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
@@ -375,6 +425,7 @@ if __name__ == '__main__':
     test_embedded_scripts_parse()
     test_sso_state_panel_structure()
     test_ip_pool_datacenter_filter_toggle()
+    test_ip_usage_tabs_pagination_and_strategy_structure()
     test_mail_cleanup_panel_structure()
     test_outlook_pool_panel_structure()
     print('OK structure')

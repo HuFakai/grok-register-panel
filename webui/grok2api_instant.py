@@ -51,21 +51,25 @@ class _InstantUploader:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._logger: logging.Logger | None = None
+        self._log_path: Path | None = None
         # 进程内统计（供 instant_status() 展示）
         self._stats = {"processed": 0, "succeeded": 0, "failed": 0}
 
     # ---- logger（懒初始化，写 log/grok2api_instant.log，0o600）----
     def _log(self, level: int, message: str) -> None:
-        if self._logger is None:
+        path = Path(INSTANT_LOG)
+        if self._logger is None or self._log_path != path:
             with self._lock:
-                if self._logger is None:
+                if self._logger is None or self._log_path != path:
                     self._logger = self._make_logger()
+                    self._log_path = path
         if self._logger is not None:
             self._logger.log(level, message)
 
     def _make_logger(self) -> logging.Logger | None:
         try:
             ensure_private_dir(LOG_DIR)
+            ensure_private_dir(Path(INSTANT_LOG).parent)
             handler = logging.FileHandler(INSTANT_LOG, encoding="utf-8")
             try:
                 best_effort_fchmod(handler.stream.fileno(), 0o600)
@@ -76,6 +80,13 @@ class _InstantUploader:
             )
             logger = logging.getLogger("grok2api_instant")
             logger.setLevel(logging.INFO)
+            # 路径切换（测试/多实例）时清掉旧 handler，避免重复写旧文件
+            for old in list(logger.handlers):
+                logger.removeHandler(old)
+                try:
+                    old.close()
+                except Exception:
+                    pass
             logger.addHandler(handler)
             logger.propagate = False
             return logger

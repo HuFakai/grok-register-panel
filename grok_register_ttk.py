@@ -77,6 +77,8 @@ from secure_files import (
 )
 from webui.proxy_store import (
     IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
+    datacenter_filter_enabled as _datacenter_filter_enabled,
+    is_datacenter_org as _is_datacenter_org,
     mark_proxy_used as _mark_managed_proxy_used,
     note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
@@ -347,6 +349,16 @@ DEFAULT_CONFIG = {
     "ip_pool_refresh_interval": 120,  # 后台补池周期（秒）
     "ip_pool_probe_concurrency": 12,  # 每轮并发探测数
     "ip_pool_identity_ttl": 600,   # sticky 会话有效期（秒），过期身份作废
+    # 池内可用数低于该水位时立即补探测（不等后台周期）
+    "ip_pool_low_watermark": 5,
+    # 可信复用出口达到该数量后，取口优先用可信出口；低于则先用可用池
+    "ip_trusted_priority_min": 3,
+    # 成功过的出口冷静期：成功一次休息 15 分钟；失败按 1h/2h/4h/8h/24h
+    # 递增；限流按 24h 处理（不再终身拉黑）。
+    "ip_success_cooldown_sec": 900,
+    "ip_fail_cooldown_sec": 3600,
+    "ip_fail_cooldown_max_sec": 86400,
+    "ip_throttle_cooldown_sec": 86400,
     # 注册提交后的 SSO 获取策略：快速轮询 + 有界的 grok.com 推进重试。
     "sso_wait_timeout": 50,
     "sso_poll_interval": 0.5,
@@ -499,8 +511,9 @@ def record_register_result(
         pass
     # 出口健康档案回写：成功→可信复用+会话归档；失败→黑历史（≥2 且零成功
     # 的出口后续取口直接跳过）。注册失败即弃，不浪费下一槽位。
+    # 限流（throttle）不计失败：出口处置由 handle_signup_throttle 统一负责。
     try:
-        if exit_ip:
+        if exit_ip and status != "throttle":
             from webui.ip_health import record_exit_result
             record_exit_result(
                 exit_ip,
@@ -597,21 +610,31 @@ def handle_signup_throttle(
     """
     active_ip = str(active_ip or "").strip()
     log = log_callback or (lambda _message: None)
+    known_good = False
     if active_ip:
         try:
-            soft_blacklist_ip(active_ip)
+            from webui.ip_health import get_exit_health
+
+            known_good = int(get_exit_health(active_ip).get("successes") or 0) > 0
         except Exception:
-            pass
+            known_good = False
+        if not known_good:
+            # 从无成功记录的出口：确定性拒绝，保持拉黑 + 计数置超限。
+            try:
+                soft_blacklist_ip(active_ip)
+            except Exception:
+                pass
         try:
             from webui.ip_health import ban_exit
 
             ban_exit(active_ip, reason="signup-throttle", log_callback=log)
         except Exception:
             pass
-        try:
-            ip_ready_pool.block_exit(active_ip, reason="signup-throttle")
-        except Exception:
-            pass
+        if not known_good:
+            try:
+                ip_ready_pool.block_exit(active_ip, reason="signup-throttle")
+            except Exception:
+                pass
     if release_email and email:
         try:
             outlook_provider.release(
@@ -635,7 +658,15 @@ def handle_signup_throttle(
         pass
     log(
         "[!] 邮箱注册被限流"
-        + (f"，出口 {active_ip} 已拉黑并置超限" if active_ip else "")
+        + (
+            (
+                f"，出口 {active_ip} 已拉黑并置超限"
+                if not known_good
+                else f"，出口 {active_ip} 成功过，仅进限流冷静期（不终身拉黑）"
+            )
+            if active_ip
+            else ""
+        )
         + "（不计失败、不重试、不等待）"
     )
     return active_ip
@@ -931,12 +962,21 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     rot = max(0, int(rotate_idx))
     by_url = {str(row.get("url") or ""): row for row in details}
     now = datetime.datetime.now(datetime.timezone.utc)
-    # 出口健康档案：失败≥2 且从未成功的 IP 直接跳过（策略是失败即弃）。
+    # 出口健康档案：失败≥2 且从未成功的 IP 直接跳过（策略是失败即弃）；
+    # 冷静期内的成功出口也暂时跳过，冷却结束后自动恢复复用。
     try:
-        from webui.ip_health import bad_ips
-        bad = bad_ips()
+        from webui.ip_health import bad_ips, cooling_ips
+
+        bad = bad_ips() | cooling_ips()
     except Exception:
         bad = set()
+    trusted_first = trusted_priority_active()
+    trusted_candidates = []
+    if trusted_first:
+        try:
+            trusted_candidates = trusted_pick_candidates()
+        except Exception:
+            trusted_candidates = []
 
     def _age(url: str) -> float:
         row = by_url.get(url) or {}
@@ -976,7 +1016,24 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
                 continue
             ranked.append((-_age(cand), offset, cand))
         ranked.sort()
-        selected = ranked[0][2] if ranked else ""
+        selected = ""
+        if trusted_candidates:
+            # 可信复用达到阈值：优先固定成功过的 resin 会话，避开随机抽奖。
+            for e in trusted_candidates:
+                ip = str(e.get("ip") or "")
+                url = str(e.get("best_identity") or "")
+                if not ip or not url or ip in bad:
+                    continue
+                if url in others:
+                    continue
+                if current and url == current:
+                    continue
+                if ip == str((by_url.get(current) or {}).get("exit_ip") or ""):
+                    continue
+                selected = url
+                break
+        if not selected:
+            selected = ranked[0][2] if ranked else ""
         if not selected:
             leftovers = [
                 (-_age(cand), idx, cand)
@@ -989,13 +1046,14 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
             # 池内全空：优先复用注册成功过的可信出口（固定身份）。
             # resin 租期内会话存活即可直接出号，避开随机 sticky 风控抽奖。
             try:
-                from webui.ip_health import trusted_exits
-                for e in trusted_exits():
+                for e in trusted_pick_candidates():
                     ip = str(e.get("ip") or "")
                     url = str(e.get("best_identity") or "")
                     if not ip or not url or ip in bad:
                         continue
-                    if ip in hot_ips or ip == str(
+                    if current and url == current:
+                        continue
+                    if ip == str(
                         (by_url.get(current) or {}).get("exit_ip") or ""
                     ):
                         continue
@@ -1167,6 +1225,14 @@ def precheck_proxy_exit(proxy: str) -> tuple[bool, str, str]:
             return False, exit_ip, "健康档案黑历史（连续失败且从未成功）"
     except Exception:
         pass
+    try:
+        from webui.ip_health import cooldown_remaining
+
+        remain = cooldown_remaining(exit_ip)
+        if remain > 0 and has_alternative_exit(exit_ip):
+            return False, exit_ip, f"出口冷静期剩余 {int(remain)}s"
+    except Exception:
+        pass
     return True, exit_ip, ""
 
 
@@ -1198,6 +1264,98 @@ def proxy_count_for_worker(_worker_id: int) -> int:
     return max(1, len(load_proxy_pool()))
 
 
+def trusted_priority_min() -> int:
+    """可信复用出口达到该数量时优先取可信出口（0=关闭该策略）。
+
+    优先读 config.json 现值，让面板「策略设置」保存后立即生效；文件里没有
+    该键时回退进程内配置（装载时快照）。
+    """
+    raw = config.get("ip_trusted_priority_min", 3)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if "ip_trusted_priority_min" in loaded:
+            raw = loaded["ip_trusted_priority_min"]
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError):
+        value = 3
+    return max(0, min(value, 100))
+
+
+def trusted_priority_active() -> bool:
+    """可信复用池是否已达到优先阈值（达到则先取可信出口，低于先用可用池）。"""
+    threshold = trusted_priority_min()
+    if threshold <= 0:
+        return False
+    return len(trusted_pick_candidates()) >= threshold
+
+
+def trusted_pick_candidates() -> list:
+    """取口用的可信出口候选（与「只用住宅出口」开关保持一致）。
+
+    健康档案来自历史成功记录，可能包含机房出口；面板开启住宅过滤时，
+    可信优先阈值与取口都只统计非机房出口。
+    """
+    try:
+        from webui.ip_health import available_trusted_exits
+
+        exits = available_trusted_exits()
+    except Exception:
+        return []
+    try:
+        if _datacenter_filter_enabled():
+            exits = [
+                e
+                for e in exits
+                if not _is_datacenter_org(
+                    " ".join(
+                        str(e.get(key) or "")
+                        for key in ("asname", "isp", "as")
+                    )
+                )
+            ]
+    except Exception:
+        pass
+    return exits
+
+
+def has_alternative_exit(current_ip: str) -> bool:
+    """是否存在当前出口之外的可立即取用出口（可信池或可用池）。"""
+    current = str(current_ip or "").strip()
+    try:
+        from webui.ip_health import bad_ips, cooling_ips
+
+        blocked = bad_ips() | cooling_ips()
+        for e in trusted_pick_candidates():
+            ip = str(e.get("ip") or "")
+            if ip and ip != current and ip not in blocked:
+                return True
+    except Exception:
+        pass
+    try:
+        if ip_ready_pool.has_usable_alternative(current):
+            return True
+    except Exception:
+        pass
+    try:
+        details = _managed_worker_proxy_details() or []
+    except Exception:
+        details = []
+    for row in details:
+        url = str(row.get("url") or "").strip()
+        if not url:
+            continue
+        ip = str(row.get("exit_ip") or "").strip()
+        # 只认已探测到的不同出口；未知出口不当作可立即替换的备选，
+        # 避免冷静期判定反复拒绝当前口导致空转。
+        if ip and ip != current:
+            return True
+    return False
+
+
 def rotate_browser_to_new_exit(
     worker_id: int,
     rotate_idx: int,
@@ -1218,17 +1376,18 @@ def rotate_browser_to_new_exit(
     tried_ips = {previous_ip} if previous_ip else set()
     # 健康档案黑历史：失败≥2 且从未成功的出口直接跳过（失败即弃策略）。
     try:
-        from webui.ip_health import bad_ips as _bad_ips
-        _bad = _bad_ips()
-        if _bad:
-            tried_ips |= set(_bad)
+        from webui.ip_health import bad_ips as _bad_ips, cooling_ips as _cooling_ips
+
+        tried_ips |= set(_bad_ips()) | set(_cooling_ips())
     except Exception:
         pass
+    prefer_trusted = trusted_priority_active()
     pool_tries = 0
     while pool_tries < 3:
         item = ip_ready_pool.pick_usable(
             f"W{worker_id + 1}",
             frozenset(tried_ips),
+            prefer_trusted=prefer_trusted,
         )
         if not item:
             break
@@ -5720,8 +5879,22 @@ def run_registration_cli(count):
                                     failure_threshold=failure_rotate_threshold,
                                 )
                                 if not reason and throttle_rotate:
-                                    # 注册限流已拉黑该出口：即便上限设为“不限”也强制换口
-                                    reason = "注册限流（出口已拉黑）"
+                                    # 注册限流已锁定该出口（拉黑/冷静期）：即便上限
+                                    # 设为“不限”也强制换口
+                                    reason = "注册限流（出口已锁定）"
+                                if not reason and active_ip:
+                                    # 成功/失败冷静期：有替代出口时强制轮换，让该
+                                    # 出口安静休息；池内无替代则继续用，避免空转。
+                                    try:
+                                        from webui.ip_health import cooldown_remaining
+
+                                        remain = cooldown_remaining(active_ip)
+                                    except Exception:
+                                        remain = 0
+                                    if remain > 0 and has_alternative_exit(active_ip):
+                                        reason = (
+                                            f"出口冷静期剩余 {int(remain)}s"
+                                        )
                             if reason:
                                 cli_log(
                                     f"[W{wid+1}] [*] [IP策略] {reason} 已到，"

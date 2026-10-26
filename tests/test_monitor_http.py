@@ -871,6 +871,105 @@ def test_ip_pool_api_returns_state():
                 os.environ["MONITOR_TOKEN"] = previous_token
 
 
+def test_ip_pool_settings_api_merges_and_clamps():
+    import webui.ip_ready_pool as ip_ready_pool
+
+    token = "test-ip-pool-settings-token-123456"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_root = monitor.ROOT
+    previous_pool_root = ip_ready_pool._ROOT
+    with tempfile.TemporaryDirectory() as temp:
+        base_dir = Path(temp)
+        config_path = base_dir / "config.json"
+        config_path.write_text(
+            json.dumps({"proxy": "http://keep-me@127.0.0.1:1"}),
+            encoding="utf-8",
+        )
+        monitor.ROOT = base_dir
+        ip_ready_pool._ROOT = base_dir
+        os.environ["MONITOR_TOKEN"] = token
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            body = json.dumps(
+                {
+                    "ip_pool_target": 999,
+                    "ip_pool_low_watermark": 4,
+                    "ip_trusted_priority_min": 2,
+                    "ip_success_cooldown_sec": 600,
+                    "ip_fail_cooldown_sec": 1800,
+                    "ip_fail_cooldown_max_sec": 7200,
+                    "ip_throttle_cooldown_sec": 3600,
+                }
+            ).encode()
+            status, _, _ = request(
+                base + "/api/ip-pool/settings", method="POST", body=body
+            )
+            assert status == 401
+            status, _, raw = request(
+                base + "/api/ip-pool/settings",
+                token=token,
+                method="POST",
+                body=body,
+            )
+            assert status == 200
+            payload = json.loads(raw)
+            settings = payload["settings"]
+            assert settings["ip_pool_target"] == 200  # 上限收敛
+            assert settings["ip_pool_low_watermark"] == 4
+            assert settings["ip_trusted_priority_min"] == 2
+            assert settings["ip_success_cooldown_sec"] == 600
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            # 只合并策略键，原有凭据/配置不丢
+            assert saved["proxy"] == "http://keep-me@127.0.0.1:1"
+            assert saved["ip_fail_cooldown_max_sec"] == 7200
+            # 非整数直接拒绝
+            status, _, _ = request(
+                base + "/api/ip-pool/settings",
+                token=token,
+                method="POST",
+                body=b'{"ip_pool_target":"abc"}',
+            )
+            assert status == 400
+
+            # 会话核验接口：只核验到期可信出口，不再误触发补池探测
+            import webui.ip_health as ip_health
+
+            previous_verify = ip_health.verify_due_sessions
+            ip_health.verify_due_sessions = (
+                lambda max_age=0, limit=8: {"checked": 1, "alive": 1, "dead": 0}
+            )
+            try:
+                status, _, _ = request(
+                    base + "/api/ip-health/verify", method="POST", body=b"{}"
+                )
+                assert status == 401
+                status, _, raw = request(
+                    base + "/api/ip-health/verify",
+                    token=token,
+                    method="POST",
+                    body=b"{}",
+                )
+                assert status == 200
+                verify_payload = json.loads(raw)
+                assert verify_payload["ok"] is True
+                assert verify_payload["result"]["alive"] == 1
+            finally:
+                ip_health.verify_due_sessions = previous_verify
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+            monitor.ROOT = previous_root
+            ip_ready_pool._ROOT = previous_pool_root
+            if previous_token is None:
+                os.environ.pop("MONITOR_TOKEN", None)
+            else:
+                os.environ["MONITOR_TOKEN"] = previous_token
+
+
 def test_grok2api_api_auth_and_status():
     import webui.grok2api_upload as g2api_upload
 
@@ -938,5 +1037,6 @@ if __name__ == "__main__":
     test_ip_usage_api_delete_and_per_ip_limit()
     test_ip_usage_api_reset_clears_all()
     test_ip_pool_api_returns_state()
+    test_ip_pool_settings_api_merges_and_clamps()
     test_grok2api_api_auth_and_status()
     print("OK monitor http")

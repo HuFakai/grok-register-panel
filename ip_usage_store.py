@@ -262,6 +262,27 @@ def soft_blacklist_ip(exit_ip: str) -> int:
             return SOFT_BLACKLIST_COUNT
 
 
+def clear_permanent_soft_blacklist(exit_ip: str) -> bool:
+    """清除永久软拉黑哨兵（counts>=99999），保留上限覆盖与元数据。
+
+    仅处置历史限流误伤：注册成功过的出口在旧版本里会被置 99999，新策略
+    下应恢复可用；临时空页冷却（`_KEY_SOFT`）不受影响。
+    """
+    ip = str(exit_ip or "").strip()
+    if not ip:
+        return False
+    with _USAGE_LOCK:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_file_lock(_USAGE_FILE.with_suffix(".lock")):
+            data = _load_all()
+            counts = data[_KEY_COUNTS]
+            if int(counts.get(ip) or 0) < SOFT_BLACKLIST_COUNT:
+                return False
+            counts.pop(ip, None)
+            _write_all(counts, data[_KEY_LIMITS], data[_KEY_META])
+            return True
+
+
 def get_ip_usage(exit_ip: str) -> int:
     """返回某出口 IP 的累计使用次数（无记录为 0）。"""
     ip = str(exit_ip or "").strip()

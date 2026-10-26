@@ -19,7 +19,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir
+from secure_files import (
+    atomic_write_json,
+    best_effort_fchmod,
+    ensure_private_dir,
+    exclusive_file_lock,
+)
 from batch_traffic import (
     read_metrics as read_batch_traffic,
     read_summary as read_batch_traffic_summary,
@@ -840,6 +845,19 @@ def _runtime_config() -> dict:
         return json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {}
+
+
+def _update_runtime_config(updates: dict) -> dict:
+    """只合并指定键写回 config.json（不覆盖其他配置/凭据）。"""
+    path = ROOT / "config.json"
+    with exclusive_file_lock(path.with_suffix(".json.lock")):
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            cfg = {}
+        cfg.update(updates or {})
+        atomic_write_json(path, cfg)
+    return cfg
 
 
 def _proxy_prerequisite_error(workers: int) -> str | None:
@@ -1749,6 +1767,42 @@ HTML = r"""<!DOCTYPE html>
   .ip-pool-table th:nth-child(4) { width: 110px; }
   .ip-pool-table th:nth-child(5) { width: 110px; }
   .ip-pool-table th:nth-child(6) { width: 90px; }
+  .ip-health-table { min-width: 860px; }
+  .ip-usage-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 14px 0 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .ip-usage-tab {
+    appearance: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    background: transparent;
+    color: var(--muted);
+    padding: 8px 14px;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 8px 8px 0 0;
+    cursor: pointer;
+  }
+  .ip-usage-tab:hover { color: var(--text); background: var(--surface); }
+  .ip-usage-tab.is-active {
+    color: var(--text);
+    background: var(--surface-raised);
+    border-color: var(--border);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .ip-usage-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .ip-usage-panel[hidden] { display: none; }
+  .ip-settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px 14px;
+    margin-top: 10px;
+  }
   /* BFS 检测表：4 列自适应（proxy-table 的 min-width:1040px 会撑出横向滚动，这里不适用） */
   .bfs-table { min-width: 0; }
   .bfs-table td { overflow-wrap: anywhere; }
@@ -2745,7 +2799,7 @@ HTML = r"""<!DOCTYPE html>
         <div>
           <div class="mail-source-kicker">IP usage</div>
           <div class="page-title" id="ip-usage-view-title">IP 使用统计</div>
-          <p class="domain-view-subtitle">所有任务累计的出口 IP 使用次数（log/ip_usage.json）</p>
+          <p class="domain-view-subtitle">使用记录、可用池、出口健康与策略参数集中管理</p>
         </div>
         <span class="domain-job" id="ip-usage-heading-label">--</span>
         <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
@@ -2753,28 +2807,69 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="proxy-summary" id="ip-usage-summary"></div>
+      <div class="ip-usage-tabs" role="tablist" aria-label="IP 使用功能">
+        <button type="button" class="ip-usage-tab is-active" id="ip-tab-usage" role="tab"
+                aria-selected="true" aria-controls="ip-panel-usage" data-ip-tab="usage"
+                onclick="setIpUsageTab('usage')" onkeydown="handleIpTabKey(event)">数据统计</button>
+        <button type="button" class="ip-usage-tab" id="ip-tab-pool" role="tab"
+                aria-selected="false" aria-controls="ip-panel-pool" data-ip-tab="pool"
+                tabindex="-1" onclick="setIpUsageTab('pool')" onkeydown="handleIpTabKey(event)">可用 IP 池</button>
+        <button type="button" class="ip-usage-tab" id="ip-tab-health" role="tab"
+                aria-selected="false" aria-controls="ip-panel-health" data-ip-tab="health"
+                tabindex="-1" onclick="setIpUsageTab('health')" onkeydown="handleIpTabKey(event)">出口健康</button>
+        <button type="button" class="ip-usage-tab" id="ip-tab-settings" role="tab"
+                aria-selected="false" aria-controls="ip-panel-settings" data-ip-tab="settings"
+                tabindex="-1" onclick="setIpUsageTab('settings')" onkeydown="handleIpTabKey(event)">策略设置</button>
+      </div>
 
-      <section class="mail-provider-panel" aria-labelledby="ip-pool-label">
-        <div class="mail-provider-toolbar">
-          <div>
-            <div class="mail-source-kicker">Ready IP pool</div>
-            <h2 id="ip-pool-label">可用 IP 池（预筛可用出口，worker 优先取用）</h2>
-            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
-              后台循环扫描 sticky 身份（ip-api hosting 标记 + 已知机房 ASN 双过滤，可只留住宅出口），未超限身份写入池；注册 worker 取口三级优先：池内 trusted（★ 成功 IP 复用）→ 池内普通身份 → 可信出口兜底。会话核验存活的出口自动续期， resin 租期（7 天）内可反复复用。
-            </p>
-          </div>
-          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
-            <label style="display:inline-flex;gap:6px;align-items:center" title="开启后 worker 取口与入池探测都跳过机房/云厂商 ASN 段（Oracle/AWS/Hetzner 等），只用住宅出口">
-              <input type="checkbox" id="ip-pool-filter-dc" onchange="saveIpPoolDatacenterFilter(this.checked)"/> 只用住宅出口（过滤机房 IP）
-            </label>
-            <button class="primary" id="ip-pool-probe-btn" onclick="probeIpPool()">立即探测</button>
-            <span class="mail-provider-meta mono" id="ip-pool-status">--</span>
+      <section class="ip-usage-panel" id="ip-panel-usage" role="tabpanel" aria-labelledby="ip-tab-usage">
+        <div class="proxy-summary" id="ip-usage-summary"></div>
+        <div class="table-scroll" style="margin-top:12px">
+          <table class="proxy-table ip-usage-table">
+            <thead><tr>
+              <th>出口 IP</th>
+              <th>累计次数</th><th>上限占比</th><th>每IP上限</th><th>操作</th>
+            </tr></thead>
+            <tbody id="ip-usage-body"><tr><td colspan="5" class="proxy-empty">正在读取</td></tr></tbody>
+          </table>
+        </div>
+        <div class="proxy-pagination">
+          <span class="proxy-job mono" id="ip-page-status">第 1 / 1 页</span>
+          <div class="proxy-page-controls">
+            <label for="ip-page-size" class="proxy-job">每页</label>
+            <select id="ip-page-size" onchange="changeIpPageSize(this.value)">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+            </select>
+            <button id="ip-page-prev" onclick="changeIpPage(-1)">上一页</button>
+            <button id="ip-page-next" onclick="changeIpPage(1)">下一页</button>
           </div>
         </div>
-        <div class="msg" id="ip-pool-msg" role="status" aria-live="polite"></div>
-        <details class="domain-advanced" id="ip-pool-details">
-          <summary><span class="domain-advanced-title" id="ip-pool-summary-label">查看池详情</span></summary>
+      </section>
+
+      <section class="ip-usage-panel" id="ip-panel-pool" role="tabpanel" aria-labelledby="ip-tab-pool" hidden>
+        <section class="mail-provider-panel" aria-labelledby="ip-pool-label">
+          <div class="mail-provider-toolbar">
+            <div>
+              <div class="mail-source-kicker">Ready IP pool</div>
+              <h2 id="ip-pool-label">可用 IP 池（预筛可用出口，worker 优先取用）</h2>
+              <p class="mail-provider-meta" style="margin:4px 0 0;max-width:680px">
+                后台循环扫描 sticky 身份（ip-api hosting 标记 + 已知机房 ASN 双过滤），未超限身份写入池。
+                池内可用低于低水位会立即补探测，不必等定时周期；取口按「可信优先阈值」在可信复用与普通池项之间切换。
+              </p>
+            </div>
+            <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <label style="display:inline-flex;gap:6px;align-items:center" title="开启后 worker 取口与入池探测都跳过机房/云厂商 ASN 段（Oracle/AWS/Hetzner 等），只用住宅出口">
+                <input type="checkbox" id="ip-pool-filter-dc" onchange="saveIpPoolDatacenterFilter(this.checked)"/> 只用住宅出口
+              </label>
+              <button class="primary" id="ip-pool-probe-btn" onclick="probeIpPool()">立即探测</button>
+            </div>
+          </div>
+          <div class="msg" id="ip-pool-msg" role="status" aria-live="polite"></div>
+          <div class="proxy-summary" id="ip-pool-summary" style="margin-top:8px"></div>
+          <div class="mail-provider-meta mono" id="ip-pool-status" style="margin-top:8px">--</div>
           <div class="table-scroll" style="margin-top:8px">
             <table class="proxy-table ip-pool-table">
               <thead><tr>
@@ -2783,80 +2878,141 @@ HTML = r"""<!DOCTYPE html>
               <tbody id="ip-pool-body"><tr><td colspan="6" class="proxy-empty">暂无数据</td></tr></tbody>
             </table>
           </div>
-        </details>
+          <div class="proxy-pagination">
+            <span class="proxy-job mono" id="ip-pool-page-status">第 1 / 1 页</span>
+            <div class="proxy-page-controls">
+              <label for="ip-pool-page-size" class="proxy-job">每页</label>
+              <select id="ip-pool-page-size" onchange="changeIpPoolPageSize(this.value)">
+                <option value="25" selected>25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+              </select>
+              <button id="ip-pool-page-prev" onclick="changeIpPoolPage(-1)">上一页</button>
+              <button id="ip-pool-page-next" onclick="changeIpPoolPage(1)">下一页</button>
+            </div>
+          </div>
+        </section>
       </section>
 
-      <section class="mail-provider-panel" aria-labelledby="ip-health-label">
-        <div class="mail-provider-toolbar">
-          <div>
-            <div class="mail-source-kicker">Exit health</div>
-            <h2 id="ip-health-label">住宅出口健康（成功 IP 复用 + 会话核验）</h2>
-            <p class="mail-provider-meta" style="margin:4px 0 0;max-width:640px">
-              注册成功/失败自动回写出口档案。成功出口按最近会话身份周期核验 sticky 存活（resin 租期内可长期复用），存活的直接回灌可用池优先消费；连续失败且从未成功的出口自动拉黑不再取用。
-            </p>
+      <section class="ip-usage-panel" id="ip-panel-health" role="tabpanel" aria-labelledby="ip-tab-health" hidden>
+        <section class="mail-provider-panel" aria-labelledby="ip-health-label">
+          <div class="mail-provider-toolbar">
+            <div>
+              <div class="mail-source-kicker">Exit health</div>
+              <h2 id="ip-health-label">住宅出口健康（成功 IP 复用 + 会话核验）</h2>
+              <p class="mail-provider-meta" style="margin:4px 0 0;max-width:680px">
+                注册成功/失败自动回写出口档案。成功过的 IP 不再终身拉黑：成功一次休息 15 分钟，
+                失败按 1h/2h/4h/8h/16h 递增冷静（封顶 24h），限流按 24h；冷静期结束自动回到可信池复用。
+              </p>
+            </div>
+            <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+              <button class="primary" id="ip-health-verify-btn" onclick="verifyIpHealth()">核验会话</button>
+            </div>
           </div>
-          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
-            <button class="primary" id="ip-health-verify-btn" onclick="verifyIpHealth()">核验会话</button>
-            <span class="mail-provider-meta mono" id="ip-health-status">--</span>
+          <div class="msg" id="ip-health-msg" role="status" aria-live="polite"></div>
+          <div class="mail-provider-meta mono" id="ip-health-status" style="margin-top:8px">--</div>
+          <div class="proxy-summary" id="ip-health-summary" style="margin-top:8px"></div>
+          <div class="table-scroll" style="margin-top:8px">
+            <table class="proxy-table ip-pool-table ip-health-table">
+              <thead><tr>
+                <th>出口 IP</th><th>成功</th><th>失败</th><th>归属</th><th>会话状态</th><th>冷静期</th><th>上次成功</th>
+              </tr></thead>
+              <tbody id="ip-health-body"><tr><td colspan="7" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr></tbody>
+            </table>
           </div>
-        </div>
-        <div class="msg" id="ip-health-msg" role="status" aria-live="polite"></div>
-        <div class="proxy-summary" id="ip-health-summary" style="margin-top:8px"></div>
-        <div class="table-scroll" style="margin-top:8px">
-          <table class="proxy-table ip-pool-table">
-            <thead><tr>
-              <th>出口 IP</th><th>成功</th><th>失败</th><th>归属</th><th>会话状态</th><th>上次成功</th>
-            </tr></thead>
-            <tbody id="ip-health-body"><tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr></tbody>
-          </table>
-        </div>
-        <details class="domain-advanced" id="ip-health-bad" style="display:none;margin-top:8px">
-          <summary><span class="domain-advanced-title" id="ip-health-bad-summary">拉黑出口</span></summary>
-          <div class="mail-provider-meta" id="ip-health-bad-list" style="margin-top:6px"></div>
-        </details>
+          <div class="proxy-pagination">
+            <span class="proxy-job mono" id="ip-health-page-status">第 1 / 1 页</span>
+            <div class="proxy-page-controls">
+              <label for="ip-health-page-size" class="proxy-job">每页</label>
+              <select id="ip-health-page-size" onchange="changeIpHealthPageSize(this.value)">
+                <option value="25" selected>25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+              </select>
+              <button id="ip-health-page-prev" onclick="changeIpHealthPage(-1)">上一页</button>
+              <button id="ip-health-page-next" onclick="changeIpHealthPage(1)">下一页</button>
+            </div>
+          </div>
+          <details class="domain-advanced" id="ip-health-bad" style="display:none;margin-top:8px">
+            <summary><span class="domain-advanced-title" id="ip-health-bad-summary">拉黑出口</span></summary>
+            <div class="mail-provider-meta" id="ip-health-bad-list" style="margin-top:6px"></div>
+          </details>
+        </section>
       </section>
 
-      <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
-        <div class="mail-provider-toolbar">
-          <div class="field">
-            <label for="ip-usage-limit-page" id="ip-usage-limit-label">单 IP 累计使用上限（0=不限）</label>
-            <input type="number" id="ip-usage-limit-page" min="0" max="100000" value="0"
-                   title="该出口 IP 在所有任务中的累计账号槽位数（成功/最终失败都计）达到此值后必须换 IP；超限出口被取口/预检/换口三层拒绝"/>
+      <section class="ip-usage-panel" id="ip-panel-settings" role="tabpanel" aria-labelledby="ip-tab-settings" hidden>
+        <section class="mail-provider-panel" aria-labelledby="ip-usage-limit-label">
+          <div class="mail-provider-toolbar">
+            <div class="field">
+              <label for="ip-usage-limit-page" id="ip-usage-limit-label">单 IP 累计使用上限（0=不限）</label>
+              <input type="number" id="ip-usage-limit-page" min="0" max="100000" value="0"
+                     title="该出口 IP 在所有任务中的累计账号槽位数（成功/最终失败都计）达到此值后必须换 IP；超限出口被取口/预检/换口三层拒绝"/>
+            </div>
+            <div class="mail-provider-meta" style="max-width:420px">
+              全局生效的累计槽位上限；也可在数据统计页按 IP 单独覆盖（0=清除覆盖回退全局）。
+            </div>
+            <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+              <button class="primary" id="ip-usage-limit-save" onclick="saveIpUsageLimit()">保存上限</button>
+              <span class="mail-provider-meta mono" id="ip-usage-limit-saved">--</span>
+            </div>
           </div>
-          <div class="mail-provider-meta" style="max-width:420px">
-            全局生效的累计槽位上限；也可在下方表格按 IP 单独覆盖（0=清除覆盖回退全局）。
-          </div>
-          <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
-            <button class="primary" id="ip-usage-limit-save" onclick="saveIpUsageLimit()">保存上限</button>
-            <span class="mail-provider-meta mono" id="ip-usage-limit-saved">--</span>
-          </div>
-        </div>
-        <div class="msg" id="ip-usage-limit-msg" role="status" aria-live="polite"></div>
-      </section>
+          <div class="msg" id="ip-usage-limit-msg" role="status" aria-live="polite"></div>
+        </section>
 
-      <div class="table-scroll" style="margin-top:12px">
-        <table class="proxy-table ip-usage-table">
-          <thead><tr>
-            <th>出口 IP</th>
-            <th>累计次数</th><th>上限占比</th><th>每IP上限</th><th>操作</th>
-          </tr></thead>
-          <tbody id="ip-usage-body"><tr><td colspan="5" class="proxy-empty">正在读取</td></tr></tbody>
-        </table>
-      </div>
-      <div class="proxy-pagination">
-        <span class="proxy-job mono" id="ip-page-status">第 1 / 1 页</span>
-        <div class="proxy-page-controls">
-          <label for="ip-page-size" class="proxy-job">每页</label>
-          <select id="ip-page-size" onchange="changeIpPageSize(this.value)">
-            <option value="25">25</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
-          </select>
-          <button id="ip-page-prev" onclick="changeIpPage(-1)">上一页</button>
-          <button id="ip-page-next" onclick="changeIpPage(1)">下一页</button>
-        </div>
-      </div>
+        <section class="mail-provider-panel" aria-labelledby="ip-strategy-label" style="margin-top:12px">
+          <div class="mail-provider-toolbar">
+            <div>
+              <div class="mail-source-kicker">Pool strategy</div>
+              <h2 id="ip-strategy-label">可信优先与冷静期</h2>
+              <p class="mail-provider-meta" style="margin:4px 0 0;max-width:680px">
+                可信复用数量达到阈值时优先取可信出口，低于阈值时先用可用池探测项；
+                池内可用低于低水位立即补探测。冷静期按出口历史自动分级。
+              </p>
+            </div>
+            <div class="mail-provider-actions" style="display:inline-flex;gap:8px;align-items:center">
+              <button class="primary" id="ip-strategy-save" onclick="saveIpPoolSettings()">保存策略</button>
+              <span class="mail-provider-meta mono" id="ip-strategy-status">--</span>
+            </div>
+          </div>
+          <div class="msg" id="ip-strategy-msg" role="status" aria-live="polite"></div>
+          <div class="ip-settings-grid">
+            <div class="field">
+              <label for="ip-settings-target">池目标可用数</label>
+              <input type="number" id="ip-settings-target" min="1" max="200" value="20"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-low">低水位（低于立即探测）</label>
+              <input type="number" id="ip-settings-low" min="0" max="200" value="5"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-trusted-min">可信优先阈值（0=关闭）</label>
+              <input type="number" id="ip-settings-trusted-min" min="0" max="100" value="3"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-success-min">成功冷静期（分钟）</label>
+              <input type="number" id="ip-settings-success-min" min="0" max="1440" value="15"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-fail-min">失败冷静期基数（分钟）</label>
+              <input type="number" id="ip-settings-fail-min" min="0" max="10080" value="60"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-failmax-h">失败冷静期上限（小时）</label>
+              <input type="number" id="ip-settings-failmax-h" min="0" max="168" value="24"/>
+            </div>
+            <div class="field">
+              <label for="ip-settings-throttle-h">限流冷静期（小时）</label>
+              <input type="number" id="ip-settings-throttle-h" min="0" max="168" value="24"/>
+            </div>
+          </div>
+          <p class="mail-provider-meta" style="margin-top:8px">
+            失败冷静期按连续失败次数翻倍：1h、2h、4h、8h、16h，封顶上限。成功一次即重置失败连击。
+            从无成功记录的出口仍按拉黑策略处理。
+          </p>
+        </section>
+      </section>
     </div>
   </section>
 
@@ -3575,13 +3731,15 @@ function setAppView(view, options = {}) {
   if (isIpUsage) refreshIpUsage();
   if (isIpUsage) refreshIpHealthData();
   if (isIpUsage) refreshIpHealth();
+  if (isIpUsage) refreshIpPool();
+  if (isIpUsage) setIpUsageTab(ipUsageTab, { silent: true });
   if (isSso) refreshSsoState();
   if (isAccounts) refreshAccounts();
   if (options.focus) {
     requestAnimationFrame(() => {
       const target = isHelp
         ? document.querySelector('[data-help-tab][aria-selected="true"]')
-        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-usage-limit-page") : (isSso ? document.getElementById("sso-input") : (isAccounts ? document.getElementById("acc-search") : (view === "dashboard" ? domainToggle : toggle))))));
+        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isIpUsage ? document.getElementById("ip-tab-" + ipUsageTab) : (isSso ? document.getElementById("sso-input") : (isAccounts ? document.getElementById("acc-search") : (view === "dashboard" ? domainToggle : toggle))))));
       if (target) target.focus();
     });
   }
@@ -3953,6 +4111,52 @@ let ipUsageData = null;
 let ipPage = 1;
 let ipPageSize = 50;
 let ipHealthData = null;
+let ipPoolData = null;
+let ipPoolPage = 1;
+let ipPoolPageSize = 25;
+let ipHealthPage = 1;
+let ipHealthPageSize = 25;
+let ipUsageTab = "usage";
+function setIpUsageTab(name, options = {}) {
+  const valid = ["usage", "pool", "health", "settings"];
+  if (!valid.includes(name)) name = "usage";
+  ipUsageTab = name;
+  valid.forEach(key => {
+    const tab = document.getElementById("ip-tab-" + key);
+    const panel = document.getElementById("ip-panel-" + key);
+    const active = key === name;
+    if (tab) {
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+    }
+    if (panel) panel.hidden = !active;
+  });
+  if (options.focus) {
+    const activeTab = document.getElementById("ip-tab-" + name);
+    if (activeTab) activeTab.focus();
+  }
+  if (!options.silent) {
+    if (name === "pool") refreshIpPool(true);
+    else if (name === "health") refreshIpHealth(true);
+    else if (name === "usage") {
+      // 先取健康档案再渲染使用表，保证「冷静/★/拉黑」徽标与统计一致。
+      refreshIpHealthData().then(() => refreshIpUsage(true));
+    }
+  }
+}
+function handleIpTabKey(event) {
+  const keys = ["usage", "pool", "health", "settings"];
+  const idx = keys.indexOf(ipUsageTab);
+  let next = null;
+  if (event.key === "ArrowRight") next = keys[(idx + 1) % keys.length];
+  else if (event.key === "ArrowLeft") next = keys[(idx - 1 + keys.length) % keys.length];
+  else if (event.key === "Home") next = keys[0];
+  else if (event.key === "End") next = keys[keys.length - 1];
+  if (!next) return;
+  event.preventDefault();
+  setIpUsageTab(next, { focus: true, silent: false });
+}
 async function refreshIpUsage(silent = true) {
   try {
     const data = await api("/api/ip-usage" + (silent ? "" : "?_=" + Date.now()));
@@ -4022,9 +4226,12 @@ function renderIpUsage(data) {
     const per = it.limit != null ? Number(it.limit) : 0;
     const hMeta = ((ipHealthData && ipHealthData.trusted) || []).find(e => e.ip === ip);
     const hBad = ipHealthData && (ipHealthData.bad || []).includes(ip);
-    const hBadge = hMeta
+    const hCool = hMeta && hMeta.cooling;
+    const hBadge = hCool
+      ? ` <span class="badge" style="color:var(--accent);padding:1px 6px;min-height:0" title="成功后冷静期，结束自动复用">冷静 ${Math.ceil(Number(hMeta.cooldown_remaining || 0) / 60)}m</span>`
+      : (hMeta
       ? ` <span class="badge" style="color:var(--ok);padding:1px 6px;min-height:0" title="注册成功 ${hMeta.successes} 次，可优先复用">★${hMeta.successes}</span>`
-      : (hBad ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0" title="连续失败且从未成功，已停止取用">拉黑</span>' : "");
+      : (hBad ? ' <span class="badge" style="color:var(--fail);border-color:var(--danger-border);padding:1px 6px;min-height:0" title="连续失败且从未成功，已停止取用">拉黑</span>' : ""));
     const pct = eff > 0 ? Math.min(100, Math.round(100 * count / eff)) : 0;
     const over = eff > 0 && count >= eff;
     return `<tr>
@@ -4053,34 +4260,127 @@ function renderIpUsage(data) {
 async function refreshIpPool(silent) {
   try {
     const j = await api("/api/ip-pool?_=" + Date.now(), { authHelp: !silent });
-    const st = j.stats || {};
-    const label = document.getElementById("ip-pool-status");
-    if (label) label.textContent = "可用 " + (st.usable ?? 0) + " / 总数 " + (st.total ?? 0)
-      + " / 超限 " + (st.over_limit ?? 0) + " / 占用 " + (st.in_use ?? 0)
-      + (j.updated_at ? " / 更新 " + esc(j.updated_at) : "");
-    const rows = (j.items || []).map(it => {
-      const used = Number(it.used) || 0;
-      const limit = Number(it.limit) || 0;
-      let state = '<span class="badge" style="color:var(--ok)">可用</span>';
-      if (it.trusted) state = '<span class="badge" style="color:var(--ok)">★ 可信复用</span>';
-      if (it.consumer) state = '<span class="badge" style="color:var(--accent)">占用中</span>';
-      else if (!it.usable) state = '<span class="badge" style="color:var(--fail)">超限</span>';
-      const ttl = Math.floor(Number(it.ttl_remaining) / 60) + "m" + (Number(it.ttl_remaining) % 60) + "s";
-      return `<tr>
-        <td class="mono">${esc(it.exit_ip || "--")}</td>
-        <td class="mono">${esc(used)}</td>
-        <td class="mono">${limit > 0 ? esc(limit) : "不限"}</td>
-        <td>${state}</td>
-        <td class="mono">${ttl}</td>
-        <td class="mono">${esc(it.consumer || "--")}</td>
-      </tr>`;
-    }).join("");
-    const body = document.getElementById("ip-pool-body");
-    if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">池为空：点击「立即探测」或等待后台补池</td></tr>';
-    document.getElementById("ip-pool-summary-label").textContent = "查看池详情（" + (j.items || []).length + " 条）";
+    ipPoolData = j;
+    renderIpPool(j);
   } catch (e) {
     if (!silent) setMsg("ip-pool-msg", String(e.message || e), "err");
   }
+}
+function fillIpSettings(settings) {
+  if (!settings) return;
+  const pairs = [
+    ["ip-settings-target", settings.ip_pool_target],
+    ["ip-settings-low", settings.ip_pool_low_watermark],
+    ["ip-settings-trusted-min", settings.ip_trusted_priority_min],
+    ["ip-settings-success-min", Math.round(Number(settings.ip_success_cooldown_sec || 0) / 60)],
+    ["ip-settings-fail-min", Math.round(Number(settings.ip_fail_cooldown_sec || 0) / 60)],
+    ["ip-settings-failmax-h", Math.round(Number(settings.ip_fail_cooldown_max_sec || 0) / 3600)],
+    ["ip-settings-throttle-h", Math.round(Number(settings.ip_throttle_cooldown_sec || 0) / 3600)],
+  ];
+  pairs.forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (el && document.activeElement !== el) el.value = value ?? 0;
+  });
+}
+function renderIpPool(j) {
+  const st = j.stats || {};
+  const settings = j.settings || {};
+  fillIpSettings(settings);
+  const low = Number(settings.ip_pool_low_watermark) || 0;
+  const target = Number(settings.ip_pool_target) || 0;
+  const summary = [
+    ["可用", st.usable ?? 0, (st.usable ?? 0) <= low ? "fail" : "ok"],
+    ["可信", st.trusted ?? 0, "ok"],
+    ["冷静", st.cooling ?? 0, (st.cooling ?? 0) > 0 ? "accent" : ""],
+    ["超限", st.over_limit ?? 0, (st.over_limit ?? 0) > 0 ? "fail" : ""],
+    ["占用", st.in_use ?? 0, ""],
+  ];
+  const summaryEl = document.getElementById("ip-pool-summary");
+  if (summaryEl) summaryEl.innerHTML = summary.map(([label, value, cls]) =>
+    `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(label)}</div><div class="proxy-summary-value ${cls}">${esc(value)}</div></div>`
+  ).join("");
+  const label = document.getElementById("ip-pool-status");
+  if (label) {
+    label.textContent = "低水位 " + (low || "自动") + " / 目标 " + (target || "--")
+      + " / 总数 " + (st.total ?? 0)
+      + (j.updated_at ? " / 更新 " + esc(j.updated_at) : "");
+  }
+  const items = j.items || [];
+  const pages = Math.max(1, Math.ceil(items.length / ipPoolPageSize));
+  ipPoolPage = Math.max(1, Math.min(pages, ipPoolPage));
+  const pageItems = items.slice((ipPoolPage - 1) * ipPoolPageSize, ipPoolPage * ipPoolPageSize);
+  const rows = pageItems.map(it => {
+    const used = Number(it.used) || 0;
+    const limit = Number(it.limit) || 0;
+    let state = '<span class="badge" style="color:var(--ok)">可用</span>';
+    if (it.consumer) {
+      state = '<span class="badge" style="color:var(--accent)">占用中</span>';
+    } else if (it.bad) {
+      state = '<span class="badge" style="color:var(--fail)">拉黑</span>';
+    } else if (it.cooling) {
+      const mins = Math.max(1, Math.ceil(Number(it.cooldown_remaining || 0) / 60));
+      state = '<span class="badge" style="color:var(--accent)">冷静 ' + mins + 'm</span>';
+    } else if (!it.usable) {
+      state = '<span class="badge" style="color:var(--fail)">超限</span>';
+    } else if (it.trusted) {
+      state = '<span class="badge" style="color:var(--ok)">★ 可信复用</span>';
+    }
+    const ttl = Math.floor(Number(it.ttl_remaining) / 60) + "m" + (Number(it.ttl_remaining) % 60) + "s";
+    return `<tr>
+      <td class="mono">${esc(it.exit_ip || "--")}</td>
+      <td class="mono">${esc(used)}</td>
+      <td class="mono">${limit > 0 ? esc(limit) : "不限"}</td>
+      <td>${state}</td>
+      <td class="mono">${ttl}</td>
+      <td class="mono">${esc(it.consumer || "--")}</td>
+    </tr>`;
+  }).join("");
+  const body = document.getElementById("ip-pool-body");
+  if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">池为空：点击「立即探测」或等待后台补池</td></tr>';
+  const status = document.getElementById("ip-pool-page-status");
+  if (status) status.textContent = "第 " + ipPoolPage + " / " + pages + " 页，共 " + items.length + " 条";
+  const prev = document.getElementById("ip-pool-page-prev");
+  const next = document.getElementById("ip-pool-page-next");
+  if (prev) prev.disabled = ipPoolPage <= 1;
+  if (next) next.disabled = ipPoolPage >= pages;
+}
+function changeIpPoolPage(delta) {
+  const total = (ipPoolData && ipPoolData.items || []).length;
+  const pages = Math.max(1, Math.ceil(total / ipPoolPageSize));
+  const next = Math.max(1, Math.min(pages, ipPoolPage + Number(delta || 0)));
+  if (next === ipPoolPage) return;
+  ipPoolPage = next;
+  renderIpPool(ipPoolData || {});
+}
+function changeIpPoolPageSize(value) {
+  ipPoolPageSize = Math.max(10, Math.min(200, Number(value || 25)));
+  ipPoolPage = 1;
+  renderIpPool(ipPoolData || {});
+}
+async function saveIpPoolSettings() {
+  const num = id => Math.max(0, Number((document.getElementById(id) || {}).value || 0));
+  const payload = {
+    ip_pool_target: num("ip-settings-target"),
+    ip_pool_low_watermark: num("ip-settings-low"),
+    ip_trusted_priority_min: num("ip-settings-trusted-min"),
+    ip_success_cooldown_sec: Math.round(num("ip-settings-success-min") * 60),
+    ip_fail_cooldown_sec: Math.round(num("ip-settings-fail-min") * 60),
+    ip_fail_cooldown_max_sec: Math.round(num("ip-settings-failmax-h") * 3600),
+    ip_throttle_cooldown_sec: Math.round(num("ip-settings-throttle-h") * 3600),
+  };
+  const btn = document.getElementById("ip-strategy-save");
+  if (btn) { btn.disabled = true; btn.textContent = "保存中…"; }
+  try {
+    const j = await api("/api/ip-pool/settings", { method: "POST", body: JSON.stringify(payload) });
+    fillIpSettings(j.settings || {});
+    setMsg("ip-strategy-msg", "策略已保存：低水位立即补探测，可信优先与冷静期即时生效", "ok");
+    const status = document.getElementById("ip-strategy-status");
+    if (status) status.textContent = "已保存";
+    await refreshIpPool(true);
+  } catch (e) {
+    setMsg("ip-strategy-msg", String(e.message || e), "err");
+  }
+  if (btn) { btn.disabled = false; btn.textContent = "保存策略"; }
 }
 async function probeIpPool() {
   const btn = document.getElementById("ip-pool-probe-btn");
@@ -4098,59 +4398,110 @@ async function probeIpPool() {
 async function refreshIpHealth(silent) {
   try {
     const j = await api("/api/ip-health?_=" + Date.now(), { authHelp: !silent });
-    const st = j.stats || {};
-    const label = document.getElementById("ip-health-status");
-    if (label) label.textContent = "可信 " + (st.trusted ?? 0) + " / 存活 " + (st.alive ?? 0)
-      + " / 待核验 " + (st.due_check ?? 0) + " / 拉黑 " + (j.bad || []).length;
-    const healthSummary = [
-      ["已归档出口", st.total ?? 0, ""],
-      ["可信复用", st.trusted ?? 0, "ok"],
-      ["会话存活", st.alive ?? 0, "ok"],
-      ["待核验", st.due_check ?? 0, (st.due_check ?? 0) > 0 ? "accent" : ""],
-      ["已拉黑", (j.bad || []).length, (j.bad || []).length > 0 ? "fail" : ""],
-    ];
-    const healthSummaryEl = document.getElementById("ip-health-summary");
-    if (healthSummaryEl) healthSummaryEl.innerHTML = healthSummary.map(([h, v, cls]) =>
-      `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(h)}</div><div class="proxy-summary-value ${cls}">${esc(v)}</div></div>`
-    ).join("");
-    const rows = (j.trusted || []).map(e => {
-      const alive = e.session_alive;
-      const state = alive === true
-        ? '<span class="badge" style="color:var(--ok)">存活</span>'
-        : alive === false ? '<span class="badge" style="color:var(--fail)">失效</span>'
-        : '<span class="badge">待核验</span>';
-      const ts = e.last_success_at ? new Date(e.last_success_at * 1000).toLocaleString() : "--";
-      const geo = [e.country, (e.as || "").split(" ")[0]].filter(Boolean).join(" ");
-      return `<tr>
-        <td class="mono">${esc(e.ip)}</td>
-        <td class="mono">${esc(e.successes || 0)}</td>
-        <td class="mono">${esc(e.fails || 0)}</td>
-        <td>${esc(geo || "--")}</td>
-        <td>${state}</td>
-        <td class="mono">${esc(ts)}</td>
-      </tr>`;
-    }).join("");
-    const body = document.getElementById("ip-health-body");
-    if (body) body.innerHTML = rows || '<tr><td colspan="6" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr>';
-    const badCount = (j.bad || []).length;
-    const badSummary = document.getElementById("ip-health-bad-summary");
-    if (badSummary) badSummary.textContent = badCount
-      ? "拉黑出口（" + badCount + " 个，连续失败且从未成功，已停止取用）"
-      : "";
-    const badDetails = document.getElementById("ip-health-bad");
-    if (badDetails) badDetails.style.display = badCount ? "" : "none";
-    const badList = document.getElementById("ip-health-bad-list");
-    if (badList) badList.innerHTML = (j.bad || []).map(b => `<span class="mono" style="margin-right:10px">${esc(b)}</span>`).join("");
+    ipHealthData = j;
+    renderIpHealth(j);
   } catch (e) {
     if (!silent) setMsg("ip-health-msg", String(e.message || e), "err");
   }
+}
+function renderIpHealth(j) {
+  const st = j.stats || {};
+  const label = document.getElementById("ip-health-status");
+  if (label) {
+    label.textContent = "可信 " + (st.trusted ?? 0)
+      + " / 可用 " + (st.available_trusted ?? 0)
+      + " / 冷静 " + (st.cooling ?? 0)
+      + " / 存活 " + (st.alive ?? 0)
+      + " / 待核验 " + (st.due_check ?? 0)
+      + " / 拉黑 " + (j.bad || []).length;
+  }
+  const healthSummary = [
+    ["已归档出口", st.total ?? 0, ""],
+    ["可信复用", st.trusted ?? 0, "ok"],
+    ["当前可用", st.available_trusted ?? 0, (st.available_trusted ?? 0) > 0 ? "ok" : ""],
+    ["冷静期", st.cooling ?? 0, (st.cooling ?? 0) > 0 ? "accent" : ""],
+    ["会话存活", st.alive ?? 0, "ok"],
+    ["待核验", st.due_check ?? 0, (st.due_check ?? 0) > 0 ? "accent" : ""],
+    ["已拉黑", (j.bad || []).length, (j.bad || []).length > 0 ? "fail" : ""],
+  ];
+  const healthSummaryEl = document.getElementById("ip-health-summary");
+  if (healthSummaryEl) healthSummaryEl.innerHTML = healthSummary.map(([h, v, cls]) =>
+    `<div class="proxy-summary-item"><div class="proxy-summary-label">${esc(h)}</div><div class="proxy-summary-value ${cls}">${esc(v)}</div></div>`
+  ).join("");
+  const items = j.trusted || [];
+  const pages = Math.max(1, Math.ceil(items.length / ipHealthPageSize));
+  ipHealthPage = Math.max(1, Math.min(pages, ipHealthPage));
+  const pageItems = items.slice((ipHealthPage - 1) * ipHealthPageSize, ipHealthPage * ipHealthPageSize);
+  const rows = pageItems.map(e => {
+    const alive = e.session_alive;
+    const state = alive === true
+      ? '<span class="badge" style="color:var(--ok)">存活</span>'
+      : alive === false ? '<span class="badge" style="color:var(--fail)">失效</span>'
+      : '<span class="badge">待核验</span>';
+    const remain = Number(e.cooldown_remaining) || 0;
+    const cooling = remain > 0
+      ? '<span class="badge" style="color:var(--accent)">' + Math.max(1, Math.ceil(remain / 60)) + 'm</span>'
+      : '<span style="color:var(--muted)">--</span>';
+    const ts = e.last_success_at ? new Date(e.last_success_at * 1000).toLocaleString() : "--";
+    const geo = [e.country, (e.as || "").split(" ")[0]].filter(Boolean).join(" ");
+    return `<tr>
+      <td class="mono">${esc(e.ip)}</td>
+      <td class="mono">${esc(e.successes || 0)}</td>
+      <td class="mono">${esc(e.fails || 0)}</td>
+      <td>${esc(geo || "--")}</td>
+      <td>${state}</td>
+      <td>${cooling}</td>
+      <td class="mono">${esc(ts)}</td>
+    </tr>`;
+  }).join("");
+  const body = document.getElementById("ip-health-body");
+  if (body) body.innerHTML = rows || '<tr><td colspan="7" class="proxy-empty">暂无数据（注册成功或失败后自动生成）</td></tr>';
+  const status = document.getElementById("ip-health-page-status");
+  if (status) status.textContent = "第 " + ipHealthPage + " / " + pages + " 页，共 " + items.length + " 条";
+  const prev = document.getElementById("ip-health-page-prev");
+  const next = document.getElementById("ip-health-page-next");
+  if (prev) prev.disabled = ipHealthPage <= 1;
+  if (next) next.disabled = ipHealthPage >= pages;
+  const badCount = (j.bad || []).length;
+  const badSummary = document.getElementById("ip-health-bad-summary");
+  if (badSummary) badSummary.textContent = badCount
+    ? "拉黑出口（" + badCount + " 个，连续失败且从未成功，已停止取用）"
+    : "";
+  const badDetails = document.getElementById("ip-health-bad");
+  if (badDetails) badDetails.style.display = badCount ? "" : "none";
+  const badList = document.getElementById("ip-health-bad-list");
+  if (badList) badList.innerHTML = (j.bad || []).map(b => `<span class="mono" style="margin-right:10px">${esc(b)}</span>`).join("");
+}
+function changeIpHealthPage(delta) {
+  const total = (ipHealthData && ipHealthData.trusted || []).length;
+  const pages = Math.max(1, Math.ceil(total / ipHealthPageSize));
+  const next = Math.max(1, Math.min(pages, ipHealthPage + Number(delta || 0)));
+  if (next === ipHealthPage) return;
+  ipHealthPage = next;
+  renderIpHealth(ipHealthData || {});
+}
+function changeIpHealthPageSize(value) {
+  ipHealthPageSize = Math.max(10, Math.min(200, Number(value || 25)));
+  ipHealthPage = 1;
+  renderIpHealth(ipHealthData || {});
 }
 async function verifyIpHealth() {
   const btn = document.getElementById("ip-health-verify-btn");
   if (btn) { btn.disabled = true; btn.textContent = "核验中…"; }
   try {
-    const j = await api("/api/ip-pool/probe", { method: "POST", body: "{}" });
-    setMsg("ip-health-msg", "已触发会话核验 + 补池（池内可用 " + ((j.stats || {}).usable ?? 0) + "）", "ok");
+    const j = await api("/api/ip-health/verify", { method: "POST", body: "{}" });
+    const result = j.result || {};
+    const checked = Number(result.checked) || 0;
+    if (!checked) {
+      setMsg("ip-health-msg", "暂无到期会话（可信出口都已核验过），无需重复检测", "ok");
+    } else {
+      setMsg(
+        "ip-health-msg",
+        "会话核验完成：检查 " + checked + " 个，存活 "
+          + (Number(result.alive) || 0) + "，失效 " + (Number(result.dead) || 0),
+        "ok"
+      );
+    }
     await refreshIpHealth(true);
     await refreshIpPool(true);
   } catch (e) {
@@ -6180,11 +6531,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/ip-health":
             try:
-                from webui.ip_health import stats, trusted_exits, bad_ips
+                from webui.ip_health import (
+                    stats,
+                    trusted_exits,
+                    available_trusted_exits,
+                    bad_ips,
+                    cooling_ips,
+                    cooldown_remaining,
+                )
                 _ = stats
+                trusted = trusted_exits()
+                for row in trusted:
+                    row["cooldown_remaining"] = int(
+                        cooldown_remaining(row.get("ip") or "")
+                    )
+                    row["cooling"] = row["cooldown_remaining"] > 0
                 self._json(200, {
                     "stats": stats(),
-                    "trusted": trusted_exits(),
+                    "trusted": trusted,
+                    "available": sorted(e.get("ip") for e in available_trusted_exits()),
+                    "cooling": sorted(cooling_ips()),
                     "bad": sorted(bad_ips()),
                 })
             except Exception as e:
@@ -6445,6 +6811,50 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     },
                 )
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-pool/settings":
+            try:
+                payload = body or {}
+                updates = {}
+                rules = {
+                    "ip_pool_target": (1, 200),
+                    "ip_pool_low_watermark": (0, 200),
+                    "ip_trusted_priority_min": (0, 100),
+                    "ip_success_cooldown_sec": (0, 86400),
+                    "ip_fail_cooldown_sec": (0, 604800),
+                    "ip_fail_cooldown_max_sec": (0, 604800),
+                    "ip_throttle_cooldown_sec": (0, 604800),
+                }
+                for key, (low, high) in rules.items():
+                    if key not in payload:
+                        continue
+                    try:
+                        value = int(payload.get(key) or 0)
+                    except (TypeError, ValueError):
+                        self._json(
+                            400,
+                            {"ok": False, "error": f"{key} 必须是整数"},
+                        )
+                        return
+                    updates[key] = max(low, min(high, value))
+                if not updates:
+                    self._json(400, {"ok": False, "error": "没有可保存的参数"})
+                    return
+                _update_runtime_config(updates)
+                from webui.ip_ready_pool import runtime_settings
+
+                self._json(200, {"ok": True, "settings": runtime_settings()})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/ip-health/verify":
+            try:
+                from webui.ip_health import stats, verify_due_sessions
+
+                result = verify_due_sessions(max_age=0, limit=8)
+                self._json(200, {"ok": True, "result": result, "stats": stats()})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -6889,47 +7299,100 @@ def main():
     def _ip_pool_loop(stop_event: threading.Event):
         import time as _time
 
+        last_probe_at = 0.0
+        last_refresh_at = 0.0
+        last_session_check = 0.0
+        low = 1
+        target = 20
         while not stop_event.is_set():
             try:
-                from webui.ip_ready_pool import probe_round, refresh_pool
+                from webui.ip_ready_pool import (
+                    get_pool_state,
+                    probe_round,
+                    refresh_pool,
+                )
                 from webui.ip_health import verify_due_sessions
 
                 cfg = _runtime_config()
                 target = max(1, int(cfg.get("ip_pool_target") or 20))
+                low = int(cfg.get("ip_pool_low_watermark") or 0)
+                if low <= 0:
+                    low = max(1, target // 4)
                 interval = max(20.0, float(cfg.get("ip_pool_refresh_interval") or 120))
                 concurrency = max(1, int(cfg.get("ip_pool_probe_concurrency") or 12))
                 ttl = max(30.0, float(cfg.get("ip_pool_identity_ttl") or 600))
-                # 先核验注册成功过出口的 sticky 会话存活（resin 租期内可
-                # 长期复用）：存活回灌 trusted 池，连续失效降级。
-                try:
-                    hs = verify_due_sessions(
-                        max_age=max(300.0, float(cfg.get("ip_pool_session_check_interval") or 1800)),
-                        limit=6,
-                    )
-                    if hs.get("checked"):
+                now = _time.monotonic()
+
+                # 每 5 分钟核验一批成功过出口的 sticky 会话（resin 租期 7 天）；
+                # verify_due_sessions 内部按 last check 过滤，不会重复打同一条。
+                if now - last_session_check >= 300.0:
+                    last_session_check = now
+                    try:
+                        hs = verify_due_sessions(
+                            max_age=max(
+                                300.0,
+                                float(
+                                    cfg.get("ip_pool_session_check_interval")
+                                    or 1800
+                                ),
+                            ),
+                            limit=6,
+                        )
+                        if hs.get("checked"):
+                            print(
+                                f"[monitor] ip-health session check: "
+                                f"alive={hs.get('alive')} dead={hs.get('dead')}",
+                                flush=True,
+                            )
+                    except Exception as exc:
                         print(
-                            f"[monitor] ip-health session check: "
-                            f"alive={hs.get('alive')} dead={hs.get('dead')}",
+                            f"[monitor] ip-health check error: "
+                            f"{redact_log_line(str(exc))}",
                             flush=True,
                         )
-                except Exception as exc:
-                    print(f"[monitor] ip-health check error: {redact_log_line(str(exc))}", flush=True)
-                stats = refresh_pool()
-                if int(stats.get("usable") or 0) < target:
+
+                stats = get_pool_state().get("stats") or {}
+                usable = int(stats.get("usable") or 0)
+                urgent = usable < low
+                need = usable < target
+                # 低水位：最多 20 秒补一轮；常规：按刷新周期补。
+                cooldown = 20.0 if urgent else interval
+                if need and (now - last_probe_at >= cooldown):
+                    if now - last_refresh_at >= 5.0:
+                        stats = refresh_pool()
+                        last_refresh_at = now
+                    if urgent:
+                        print(
+                            f"[monitor] ip-pool low watermark usable={usable}"
+                            f"/{low} target={target}，立即补探测",
+                            flush=True,
+                        )
                     stats = probe_round(
                         target_count=target,
                         concurrency=concurrency,
                         ttl=ttl,
                     )
+                    last_probe_at = _time.monotonic()
                     if stats.get("usable"):
                         print(
                             f"[monitor] ip-pool usable={stats.get('usable')} "
                             f"total={stats.get('total')}",
                             flush=True,
                         )
+                elif now - last_refresh_at >= interval:
+                    refresh_pool()
+                    last_refresh_at = now
             except Exception as exc:
                 print(f"[monitor] ip-pool loop error: {redact_log_line(str(exc))}", flush=True)
-            stop_event.wait(interval)
+
+            # 可用不足时高频唤醒（5s/15s），池满时 30s 一次即可发现消耗。
+            try:
+                stats = get_pool_state().get("stats") or {}
+                usable = int(stats.get("usable") or 0)
+            except Exception:
+                usable = 0
+            wait = 5.0 if usable < low else (15.0 if usable < target else 30.0)
+            stop_event.wait(min(wait, max(5.0, interval)))
 
     _ip_pool_stop = threading.Event()
     threading.Thread(

@@ -83,8 +83,11 @@ def _item_id(expanded_url: str) -> str:
 
 def _stats(items: list[dict], now: float | None = None) -> dict[str, int]:
     now = time.time() if now is None else now
+    cooling = _cooling_ips(now)
     total = len(items)
     usable = 0
+    trusted = 0
+    cooling_count = 0
     over_limit = 0
     in_use = 0
     expired = 0
@@ -92,8 +95,15 @@ def _stats(items: list[dict], now: float | None = None) -> dict[str, int]:
         if float(it.get("expires_at") or 0) <= now:
             expired += 1
             continue
+        if it.get("trusted"):
+            # 可信数按档案口径统计（含冷静/占用），可用数另算，避免面板
+            # 出现「健康页 7 个可信、池页 0 个可信」的误读。
+            trusted += 1
         if it.get("consumer"):
             in_use += 1
+            continue
+        if str(it.get("exit_ip") or "").strip() in cooling:
+            cooling_count += 1
             continue
         if it.get("usable"):
             usable += 1
@@ -102,10 +112,30 @@ def _stats(items: list[dict], now: float | None = None) -> dict[str, int]:
     return {
         "total": total,
         "usable": usable,
+        "trusted": trusted,
+        "cooling": cooling_count,
         "over_limit": over_limit,
         "in_use": in_use,
         "expired": expired,
     }
+
+
+def _cooling_ips(now: float | None = None) -> set:
+    try:
+        from webui.ip_health import cooling_ips
+
+        return cooling_ips(now)
+    except Exception:
+        return set()
+
+
+def _bad_ips() -> set:
+    try:
+        from webui.ip_health import bad_ips
+
+        return bad_ips()
+    except Exception:
+        return set()
 
 
 def _datacenter_filter_enabled() -> bool:
@@ -207,6 +237,10 @@ def probe_one(
             return None
     except Exception:
         pass
+    if exit_ip in _cooling_ips():
+        if log_callback:
+            log_callback(f"[ip-pool] skip cooling {exit_ip}")
+        return None
     try:
         limit = _usage_limit(exit_ip)
         used = get_ip_usage(exit_ip)
@@ -304,6 +338,7 @@ def refresh_pool(now: float | None = None) -> dict:
     from ip_usage_store import get_ip_usage, is_soft_blacklisted
 
     now = time.time() if now is None else now
+    cooling = _cooling_ips(now)
     with _POOL_LOCK:
         items = _read_items()
         kept: list[dict] = []
@@ -318,12 +353,17 @@ def refresh_pool(now: float | None = None) -> dict:
                 try:
                     if is_soft_blacklisted(ip):
                         it["usable"] = False
+                    elif ip in cooling:
+                        # 冷静期即时由 pick_usable 判断，不把 usable 写死；
+                        # 否则冷静期结束后要等下一轮刷新才能恢复取用。
+                        it["cooldown"] = True
                     else:
                         limit = _usage_limit(ip)
                         used = get_ip_usage(ip)
                         it["used"] = int(used)
                         it["limit"] = int(limit)
                         it["usable"] = not (limit > 0 and used >= limit)
+                        it.pop("cooldown", None)
                 except Exception:
                     pass
             kept.append(it)
@@ -334,22 +374,28 @@ def refresh_pool(now: float | None = None) -> dict:
 def pick_usable(
     consumer: str,
     exclude_ips: frozenset[str] = frozenset(),
+    prefer_trusted: bool | None = None,
     now: float | None = None,
 ) -> Optional[dict]:
     """挑一个可用项（未过期、未占用、IP 不在 exclude），标记占用后返回。
 
-    优先返回 trusted=True 的出口（注册成功过的 IP 复用项），其余按入池
-    顺序。返回的项由调用方核验后 remove_item（用完即弃）；无可用项返回
-    None。bad_ips 由调用方在 exclude 中传入。
+    prefer_trusted=True 时优先 trusted 项（成功 IP 复用），False 时优先
+    普通探测项；None 保持历史行为（trusted 优先）。冷静期/拉黑 IP 一律
+    跳过。返回的项由调用方核验后 remove_item（用完即弃）；无可用项返回
+    None。
     """
     now = time.time() if now is None else now
     exclude = set(exclude_ips or ())
+    skip = _cooling_ips(now) | _bad_ips()
     with _POOL_LOCK:
         items = _read_items()
-        ordered = sorted(
-            items,
-            key=lambda it: 0 if it.get("trusted") else 1,
-        )
+        def _rank(it: dict) -> int:
+            trusted = bool(it.get("trusted"))
+            if prefer_trusted is False:
+                return 0 if not trusted else 1
+            return 0 if trusted else 1
+
+        ordered = sorted(items, key=_rank)
         for it in ordered:
             if float(it.get("expires_at") or 0) <= now:
                 continue
@@ -360,11 +406,37 @@ def pick_usable(
             ip = str(it.get("exit_ip") or "").strip()
             if ip in exclude:
                 continue
+            if ip in skip:
+                continue
             it["consumer"] = str(consumer or "")
             it["consumed_at"] = now
             _write_items(items)
             return dict(it)
     return None
+
+
+def has_usable_alternative(
+    current_ip: str,
+    exclude_ips: frozenset[str] = frozenset(),
+    now: float | None = None,
+) -> bool:
+    """池内是否存在当前出口之外、可立即取用的项（冷静期/拉黑不计）。"""
+    now = time.time() if now is None else now
+    current = str(current_ip or "").strip()
+    exclude = set(exclude_ips or ())
+    skip = _cooling_ips(now) | _bad_ips()
+    with _POOL_LOCK:
+        items = _read_items()
+    for it in items:
+        if float(it.get("expires_at") or 0) <= now:
+            continue
+        if it.get("consumer") or not it.get("usable"):
+            continue
+        ip = str(it.get("exit_ip") or "").strip()
+        if not ip or ip == current or ip in exclude or ip in skip:
+            continue
+        return True
+    return False
 
 
 def upsert_trusted_exit(ip: str, *, proxy_url: str = "", meta: dict | None = None) -> bool:
@@ -398,6 +470,10 @@ def upsert_trusted_exit(ip: str, *, proxy_url: str = "", meta: dict | None = Non
         target["trusted"] = True
         target["usable"] = True
         target["expires_at"] = now + 604800.0  # resin sticky 租期 7 天
+        target["consumer"] = ""
+        target["consumed_at"] = 0.0
+        target.pop("blocked_reason", None)
+        target.pop("cooldown", None)
         if proxy_url:
             target["expanded_url"] = proxy_url
         if meta:
@@ -463,25 +539,62 @@ def remove_item(item_id: str) -> bool:
         return True
 
 
+def runtime_settings() -> dict:
+    """面板展示/编辑的池策略参数（config.json，缺失回退默认值）。"""
+    defaults = {
+        "ip_pool_target": 20,
+        "ip_pool_low_watermark": 5,
+        "ip_trusted_priority_min": 3,
+        "ip_success_cooldown_sec": 900,
+        "ip_fail_cooldown_sec": 3600,
+        "ip_fail_cooldown_max_sec": 86400,
+        "ip_throttle_cooldown_sec": 86400,
+    }
+    try:
+        cfg = json.loads((_ROOT / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    out = {}
+    for key, default in defaults.items():
+        try:
+            out[key] = int(cfg.get(key, default) or 0)
+        except (TypeError, ValueError):
+            out[key] = default
+    return out
+
+
 def get_pool_state() -> dict:
     """面板展示：公开字段 items + 统计。"""
     items = _read_items()
     now = time.time()
+    bad = _bad_ips()
+    try:
+        from webui.ip_health import cooldown_map
+
+        cooldowns = cooldown_map(now)
+    except Exception:
+        cooldowns = {}
+    cooling = set(cooldowns)
     public = []
     for it in items:
+        ip = str(it.get("exit_ip") or "")
+        remain = int(cooldowns.get(ip, 0))
         public.append(
             {
                 "id": it.get("id", ""),
-                "exit_ip": it.get("exit_ip", ""),
+                "exit_ip": ip,
                 "used": it.get("used", 0),
                 "limit": it.get("limit", 0),
                 "usable": bool(it.get("usable")),
-                    "trusted": bool(it.get("trusted")),
-                    "health": it.get("health") or {},
+                "trusted": bool(it.get("trusted")),
+                "health": it.get("health") or {},
                 "consumer": it.get("consumer", ""),
                 "checked_at": it.get("checked_at", 0),
                 "expires_at": it.get("expires_at", 0),
                 "ttl_remaining": max(0, int(float(it.get("expires_at") or 0) - now)),
+                "cooling": ip in cooling,
+                "cooldown_remaining": remain,
+                "bad": ip in bad,
             }
         )
     try:
@@ -493,5 +606,6 @@ def get_pool_state() -> dict:
     return {
         "items": public,
         "stats": _stats(items, now),
+        "settings": runtime_settings(),
         "updated_at": updated,
     }
