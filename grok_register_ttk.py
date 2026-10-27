@@ -410,6 +410,8 @@ FAIL_SSO = "sso_timeout"
 FAIL_TURNSTILE = "turnstile"
 FAIL_PROFILE = "profile_fill"
 FAIL_PAGE_LOAD = "page_load"
+FAIL_REGION = "region_block"
+FAIL_ABUSIVE = "abusive_traffic"
 FAIL_OTHER = "other"
 
 
@@ -457,8 +459,35 @@ FAIL_LABELS = {
     FAIL_TURNSTILE: "资料页Turnstile",
     FAIL_PROFILE: "资料填写",
     FAIL_PAGE_LOAD: "页面加载超时",
+    FAIL_REGION: "区域不可用",
+    FAIL_ABUSIVE: "IP滥用封禁",
     FAIL_OTHER: "其它",
 }
+
+
+# accounts.x.ai 直接返回的拒绝页（不是 Cloudflare 挑战，也不是限流文案）。
+# 两者都是出口 IP 级别的确定性拒绝，换邮箱、换指纹都无效。
+_REGION_BLOCK_MARKERS = (
+    "not available in your region",
+    "service is not available in your country",
+    "region is not supported",
+)
+_ABUSIVE_BLOCK_MARKERS = (
+    "abusive traffic",
+    "blocked due to abusive",
+)
+
+
+def is_region_block(error) -> bool:
+    """页面是否直接回报「本区域不可用」（地理/ASN 级拒绝）。"""
+    low = str(error or "").lower()
+    return any(marker in low for marker in _REGION_BLOCK_MARKERS)
+
+
+def is_abusive_block(error) -> bool:
+    """页面是否直接回报「Blocked due to abusive traffic patterns」。"""
+    low = str(error or "").lower()
+    return any(marker in low for marker in _ABUSIVE_BLOCK_MARKERS)
 
 
 
@@ -521,6 +550,15 @@ def record_register_result(
                 proxy_url=proxy if status == "ok" else "",
                 log_callback=log_callback,
             )
+            if kind in (FAIL_REGION, FAIL_ABUSIVE):
+                # 这两种是出口 IP 级确定性拒绝：本次就拉黑/长冷静，不再用同一口重试。
+                from webui.ip_health import ban_exit
+
+                ban_exit(exit_ip, reason=kind, log_callback=log_callback)
+                try:
+                    ip_ready_pool.block_exit(exit_ip, reason=kind)
+                except Exception:
+                    pass
     except Exception:
         pass
     # 从 proxy URL 抽端口
@@ -679,6 +717,10 @@ def classify_failure(exc) -> str:
         return FAIL_RISK
     msg = str(exc or "")
     low = msg.lower()
+    if is_abusive_block(msg):
+        return FAIL_ABUSIVE
+    if is_region_block(msg):
+        return FAIL_REGION
     if isinstance(exc, AccountRetryNeeded) or "达到最大重试" in msg or "流程卡住" in msg:
         return FAIL_STUCK
     if "sso_timeout" in low or "未获取到 sso" in msg or "未获取到 sso cookie" in msg:
@@ -5830,7 +5872,13 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                         mark_slot_completed()
-                        if kind == FAIL_PAGE_LOAD:
+                        if kind in (FAIL_REGION, FAIL_ABUSIVE):
+                            rotate_idx += 1
+                            cli_log(
+                                f"[W{wid+1}] [*] [IP策略] 出口被站点直接拒绝"
+                                f"（{FAIL_LABELS.get(kind, kind)}），立即换口"
+                            )
+                        elif kind == FAIL_PAGE_LOAD:
                             # 页面加载超时：计作失败并立即换 IP，不等待连续失败阈值
                             rotate_idx += 1
                             cli_log(f"[W{wid+1}] [*] [IP策略] 页面加载超时，切换 sticky #{rotate_idx}")
@@ -5843,6 +5891,8 @@ def run_registration_cli(count):
                             blank_ui or proxy_dead or pipe_dead or turnstile_stuck or profile_soft or kind in (
                             FAIL_TURNSTILE,
                             FAIL_PROFILE,
+                            FAIL_REGION,
+                            FAIL_ABUSIVE,
                             )
                         ):
                             rotate_idx += 1
@@ -6326,7 +6376,13 @@ def run_registration_cli(count):
                     kind == FAIL_RISK
                     or proxy_dead
                     or pipe_dead
-                    or kind in (FAIL_TURNSTILE, FAIL_PROFILE, FAIL_PAGE_LOAD)
+                    or kind in (
+                        FAIL_TURNSTILE,
+                        FAIL_PROFILE,
+                        FAIL_PAGE_LOAD,
+                        FAIL_REGION,
+                        FAIL_ABUSIVE,
+                    )
                 ):
                     single_rotate_idx += 1
                 cli_log(

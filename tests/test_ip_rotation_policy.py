@@ -136,6 +136,25 @@ def test_page_load_timeout_classified_as_failure():
     assert app.classify_failure(Exception("sso_timeout：等待超时")) == app.FAIL_SSO
 
 
+def test_site_level_exit_blocks_classified():
+    region = Exception(
+        "打开注册页后页面空白: url=https://accounts.x.ai/sign-up?redirect=grok-com; "
+        "inputs=none; buttons=none; text=This service is not available in your region."
+    )
+    abusive = Exception(
+        "打开注册页后页面空白: url=https://accounts.x.ai/sign-up?redirect=grok-com; "
+        "inputs=none; buttons=none; text=Blocked due to abusive traffic patterns"
+    )
+    assert app.classify_failure(region) == app.FAIL_REGION
+    assert app.classify_failure(abusive) == app.FAIL_ABUSIVE
+    assert app.is_region_block(str(region)) is True
+    assert app.is_abusive_block(str(abusive)) is True
+    # 限流文案不能被判成区域封禁
+    throttle = Exception("Email sign-up isn't available（邮箱注册被限流，稍后重试）")
+    assert app.is_region_block(str(throttle)) is False
+    assert app.classify_failure(throttle) == app.FAIL_OTHER
+
+
 def test_verified_rotation_retries_until_ip_changes():
     originals = {
         name: getattr(app, name)
@@ -416,6 +435,7 @@ if __name__ == "__main__":
     test_ip_usage_limit_rotation_reason()
     test_get_ip_usage_limit_bounds()
     test_page_load_timeout_classified_as_failure()
+    test_site_level_exit_blocks_classified()
     test_verified_rotation_retries_until_ip_changes()
     test_worker_proxy_assignments_do_not_collide_during_rotation()
     test_ip_quota_is_shared_and_exclusive_across_workers()

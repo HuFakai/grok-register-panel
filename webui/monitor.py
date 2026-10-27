@@ -517,9 +517,14 @@ def parse_log(path, max_tail=400_000):
             fm = RE_FAIL_KIND.search(line)
             kind = fm.group(1) if fm else "其它"
             msg = fm.group(2) if fm else line[-120:]
-            if "Email sign-up isn't available" in msg or "邮箱注册被限流" in msg:
+            low_msg = msg.lower()
+            if "email sign-up isn't available" in low_msg or "邮箱注册被限流" in msg:
                 kind = "注册限流"
-            if "inputs=none" in msg:
+            elif "not available in your region" in low_msg:
+                kind = "区域不可用"
+            elif "abusive traffic" in low_msg:
+                kind = "IP滥用封禁"
+            elif "inputs=none" in msg:
                 kind = "空页UI"
             if "Turnstile" in msg or "Turnstile" in kind:
                 kind = "资料页Turnstile" if "Turnstile" in msg else kind
